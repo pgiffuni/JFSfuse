@@ -1,0 +1,27 @@
+[package]
+name = "jfsfuse"
+version = "0.1.0"
+edition = "2024"
+description = "JFS for FUSE on Rust"
+license = "MIT OR GPL-2.0-or-later"
+
+[features]
+default = ["std"]
+std = []
+# Enable writable (journaled) mount support.
+# Until the transaction layer is fully validated, writable mounting
+# remains disabled even when this feature is active.
+writable = []
+
+[dependencies]
+byteorder = "1.5"
+bitflags = "2.6"
+lru = "0.12"
+log = "0.4"
+thiserror = "1.0"
+uuid = { version = "1.10", features = ["v4"] }
+fuse3 = { version = "0.7", optional = true }
+
+[[bin]]
+name = "jfsfuse-mount"
+path = "src/bin/mount.rs"

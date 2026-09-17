@@ -48,7 +48,7 @@ fn test_transaction_commit_writes_journal_and_metadata() {
 
     // 1. Write a valid LogSuper to block 1.
     let ls = make_log_super(LOGPAGES as u32);
-    let mut lm = LogManager::new(storage.clone(), ls);
+    let mut lm = LogManager::new(storage.clone(), ls, 0);
     lm.write_super(&ls).unwrap();
 
     // 2. Initialize a page cache and load the metadata block (inode 1, block META_BLOCK).
@@ -87,7 +87,7 @@ fn test_transaction_commit_writes_journal_and_metadata() {
     );
 
     // 7. Verify the logsuper end was advanced.
-    let ls_after = LogManager::read_super(&*storage).unwrap();
+    let ls_after = LogManager::read_super(&*storage, 0).unwrap();
     assert!(ls_after.end() > 0, "log end should be advanced after commit");
     assert!(ls_after.end() as usize <= 36 + BLOCK_SIZE, "log end should contain at least one LRD + data");
 

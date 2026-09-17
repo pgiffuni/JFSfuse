@@ -53,14 +53,21 @@ pub struct LogManager {
     buffer_dirty: bool,
     /// Number of log pages in the journal.
     log_pages: u32,
+    /// Byte offset where the log area begins within the backing storage.
+    /// For an external log device this is 0; for an inline log it is the
+    /// PXD address from the filesystem superblock.
+    log_base: u64,
 }
 
 /// Effective write-buffer size: two log page sizes so a single record
 /// (LRD + full block) always fits.
 const LOG_BUFFER_SIZE: usize = LOGPSIZE * 2;
 
+/// Log record header size in bytes.
+const LRD_SIZE: usize = 36;
+
 impl LogManager {
-    pub fn new(storage: Arc<dyn Storage>, logsuper: LogSuper) -> Self {
+    pub fn new(storage: Arc<dyn Storage>, logsuper: LogSuper, log_base: u64) -> Self {
         let inline = logsuper.flag().wrapping_shr(9) & 1 != 0;
         let log_pages = logsuper.page_size();
         Self {
@@ -72,12 +79,17 @@ impl LogManager {
             log_buffer: vec![0u8; LOG_BUFFER_SIZE],
             buffer_dirty: false,
             log_pages,
+            log_base,
         }
     }
 
-    /// Read the logsuper from the log device (block 1).
-    pub fn read_super(storage: &dyn Storage) -> StorageResult<LogSuper> {
-        let mut data = storage.read_bytes((BLOCK_SIZE as u64) * 1, 4096)?;
+    /// Read the logsuper from the log device.
+    ///
+    /// `log_base` is the byte offset where the log area begins. The logsuper
+    /// is stored at `log_base + BLOCK_SIZE` (after a reserved boot block).
+    pub fn read_super(storage: &dyn Storage, log_base: u64) -> StorageResult<LogSuper> {
+        let offset = log_base + (BLOCK_SIZE as u64);
+        let data = storage.read_bytes(offset, BLOCK_SIZE)?;
         let mut logsuper = LogSuper::default();
 
         if data.len() >= 4 {
@@ -134,27 +146,25 @@ impl LogManager {
 
     /// Read a log page at the given page index (0-based, after logsuper).
     pub fn read_page(&self, page_num: u32) -> StorageResult<Vec<u8>> {
-        let offset = (BLOCK_SIZE as u64) * 1
-            + (BLOCK_SIZE as u64)
-            + (page_num as u64) * (LOGPSIZE as u64);
+        let offset = self.log_base + (BLOCK_SIZE as u64) * 2 + (page_num as u64) * (LOGPSIZE as u64);
         self.storage.read_bytes(offset, LOGPSIZE)
     }
 
     /// Write a log page at the given page index.
     pub fn write_page(&self, page_num: u32, data: &[u8]) -> StorageResult<()> {
         let offset =
-            (BLOCK_SIZE as u64) * 1 + (BLOCK_SIZE as u64) + (page_num as u64) * (LOGPSIZE as u64);
+            self.log_base + (BLOCK_SIZE as u64) * 2 + (page_num as u64) * (LOGPSIZE as u64);
         self.storage.write_bytes(offset, data)
     }
 
     /// Compute the byte offset of a log page.
     pub fn page_offset(&self, page_num: u32) -> u64 {
-        (BLOCK_SIZE as u64) * 2 + (page_num as u64) * (LOGPSIZE as u64)
+        self.log_base + (BLOCK_SIZE as u64) * 2 + (page_num as u64) * (LOGPSIZE as u64)
     }
 
     /// Byte offset of the start of log data (after logsuper).
     pub fn data_start(&self) -> u64 {
-        (BLOCK_SIZE as u64) * 2
+        self.log_base + (BLOCK_SIZE as u64) * 2
     }
 
     /// Log page size.
@@ -195,7 +205,7 @@ impl LogManager {
             }
         }
 
-        let offset = BLOCK_SIZE as u64;
+        let offset = self.log_base + BLOCK_SIZE as u64;
         self.storage.write_bytes(offset, &buf)?;
         Ok(())
     }
@@ -215,14 +225,18 @@ impl LogManager {
         // Write any buffered log data to log pages.
         if self.buffer_dirty && self.write_offset > 0 {
             let bytes_per_page = LOGPSIZE as u64;
-            // Number of pages of buffer data to write.
-            let dirty_pages =
-                (self.write_offset + bytes_per_page - 1) / bytes_per_page;
-            // Starting page number within the log data area.
-            let start_page = (self.write_offset / (bytes_per_page * 2)) * 2;
+            // The buffer holds one buffer-unit (LOG_BUFFER_SIZE bytes) of data.
+            // Compute how much is actually in the current buffer.
+            let buffer_start =
+                self.write_offset - (self.write_offset % (LOG_BUFFER_SIZE as u64));
+            let bytes_in_buffer = self.write_offset - buffer_start;
+            // Number of pages (complete or partial) with buffered data.
+            let dirty_pages = (bytes_in_buffer + bytes_per_page - 1) / bytes_per_page;
+            // Starting log page number within the log data area.
+            let start_page = (buffer_start / bytes_per_page) as u32;
 
             for i in 0..dirty_pages {
-                let page_num = (start_page + i) as u32;
+                let page_num = start_page + i as u32;
                 let buf_start = (i * bytes_per_page) as usize;
                 let buf_end = (buf_start + LOGPSIZE).min(self.log_buffer.len());
                 let chunk = &self.log_buffer[buf_start..buf_end];
@@ -254,19 +268,16 @@ impl LogManager {
 
         let buf_size = LOG_BUFFER_SIZE as u64;
         let offset_in_buf = self.write_offset % buf_size;
-        let record_total = 36 + data.len() as u64; // LRD (36) + data
+        let record_total = LRD_SIZE as u64 + data.len() as u64;
 
         // If this record won't fit in the current buffer, flush and advance.
         if offset_in_buf + record_total > buf_size {
             self.flush_journal()?;
             self.log_buffer.fill(0);
             self.buffer_dirty = false;
-            // write_offset already advanced past the previous buffer full;
-            // align to the next buffer boundary.
-            let pages_used = (self.write_offset + LOGPSIZE as u64 - 1) / (LOGPSIZE as u64);
-            let buf_pages = buf_size / (LOGPSIZE as u64);
-            let buffer_index = (pages_used + buf_pages - 1) / buf_pages;
-            self.write_offset = buffer_index * buf_size;
+            // Align write_offset to the next buffer-unit boundary.
+            self.write_offset =
+                ((self.write_offset + buf_size - 1) / buf_size) * buf_size;
         }
 
         let offset_in_buf = self.write_offset % buf_size;

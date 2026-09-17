@@ -21,7 +21,7 @@ use crate::storage::{
 use crate::transaction::{CommitResult, TransactionId, TransactionManager};
 use crate::types::{
     self, AGGREGATE_I, BMAP_I, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JFS_MAGIC, JfsSuperblock, LOG_I,
-    LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_B,
+    LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_B, SUPER1_OFF,
 };
 
 /// A mounted JFS volume.
@@ -118,8 +118,13 @@ impl Volume {
     }
 
     /// Read the primary superblock from disk.
+    ///
+    /// In JFS, the superblock sits at byte offset SUPER1_OFF (0x8000),
+    /// i.e. sector 64 (SUPER1_B) * PBSIZE (512). We use the byte offset
+    /// directly rather than `SUPER1_B * BLOCK_SIZE` since SUPER1_B is
+    /// expressed in 512-byte sectors, not 4 KiB blocks.
     fn read_super(storage: &dyn Storage) -> StorageResult<JfsSuperblock> {
-        let offset = SUPER1_B * (BLOCK_SIZE as u64);
+        let offset = SUPER1_OFF;
         let data = storage.read_bytes(offset, PSIZE)?;
 
         let mut sb = JfsSuperblock::default();
@@ -165,6 +170,9 @@ impl Volume {
         if data.len() >= 64 {
             sb.s_aim2 = types::Pxd::from_bytes(&data[56..64]);
         }
+        if data.len() >= 80 {
+            sb.s_logpxd = types::Pxd::from_bytes(&data[72..80]);
+        }
 
         Ok(sb)
     }
@@ -174,7 +182,7 @@ impl Volume {
         if !sb.is_valid_magic() {
             return Err(StorageError::InvalidSuperblock);
         }
-        if sb.version() != 2 {
+        if sb.version() < 1 || sb.version() > 2 {
             return Err(StorageError::Other(format!(
                 "unsupported JFS version: {}",
                 sb.version()
@@ -190,7 +198,16 @@ impl Volume {
     /// Initialize the log manager from the log superblock.
     fn init_log(&mut self) -> StorageResult<()> {
         if let Some(ls) = &self.log_storage {
-            let logsuper = LogManager::read_super(&**ls)?;
+            // For inline logs, the log area is at the PXD address specified
+            // in the filesystem superblock. For external logs, the log device
+            // starts at offset 0.
+            let log_base = if self.sb.has_inline_log() {
+                (self.sb.inline_log_pxd().address() * (BLOCK_SIZE as u64)) as u64
+            } else {
+                0
+            };
+
+            let logsuper = LogManager::read_super(&**ls, log_base)?;
             if logsuper.magic_val() != LOGMAGIC {
                 return Err(StorageError::Other(
                     "invalid log superblock magic".to_string(),
@@ -202,7 +219,7 @@ impl Volume {
                     logsuper.version()
                 )));
             }
-            let lm = LogManager::new(ls.clone(), logsuper);
+            let lm = LogManager::new(ls.clone(), logsuper, log_base);
             self.log = Some(lm);
         }
         Ok(())

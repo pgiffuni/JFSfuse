@@ -33,7 +33,7 @@ fn test_journal_survives_restart() {
 
     // Phase 1: write a transaction to the journal.
     let ls = make_log_super(LOGPAGES as u32);
-    let mut lm = LogManager::new(storage.clone(), ls);
+    let mut lm = LogManager::new(storage.clone(), ls, 0);
     lm.write_super(&ls).unwrap();
 
     let txid = 42u64;
@@ -43,11 +43,11 @@ fn test_journal_survives_restart() {
     lm.flush_journal().unwrap();
 
     // Verify logsuper end was persisted.
-    let ls_after = LogManager::read_super(&*storage).unwrap();
+    let ls_after = LogManager::read_super(&*storage, 0).unwrap();
     assert_eq!(ls_after.end(), 36 + BLOCK_SIZE as u32, "end should cover LRD + data");
 
     // Phase 2: simulate restart — read logsuper from storage.
-    let ls_reloaded = LogManager::read_super(&*storage).unwrap();
+    let ls_reloaded = LogManager::read_super(&*storage, 0).unwrap();
     assert_eq!(ls_reloaded.magic_val(), LOGMAGIC);
     assert_eq!(ls_reloaded.version(), LOGVERSION);
     assert_eq!(ls_reloaded.end(), 36 + BLOCK_SIZE as u32);
@@ -79,7 +79,7 @@ fn test_transaction_abort_leaves_no_journal_record() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(NUM_BLOCKS));
 
     let ls = make_log_super(LOGPAGES as u32);
-    let mut lm = LogManager::new(storage.clone(), ls);
+    let mut lm = LogManager::new(storage.clone(), ls, 0);
     lm.write_super(&ls).unwrap();
 
     let mut cache = jfsfuse::storage::PageCache::new(16);
@@ -91,12 +91,12 @@ fn test_transaction_abort_leaves_no_journal_record() {
     }
 
     let mut tm = TransactionManager::new();
-    let txid = tm.begin().unwrap();
+    let _txid = tm.begin().unwrap();
     tm.mark_dirty(&mut cache, 1, 18).unwrap();
     tm.abort(&mut cache);
 
     // Abort should not have written anything to the journal.
-    let ls_after = LogManager::read_super(&*storage).unwrap();
+    let ls_after = LogManager::read_super(&*storage, 0).unwrap();
     assert_eq!(ls_after.end(), 0, "journal end should be unchanged after abort");
 
     // Storage should still be zeros at block 18.

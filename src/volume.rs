@@ -18,17 +18,21 @@ use crate::journal::{JournalRecovery, LogManager};
 use crate::storage::{
     BLOCK_SIZE, FileStorage, PageCache, Result as StorageResult, Storage, StorageError,
 };
+use crate::transaction::{CommitResult, TransactionId, TransactionManager};
 use crate::types::{
     self, AGGREGATE_I, BMAP_I, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JFS_MAGIC, JfsSuperblock, LOG_I,
-    LOGMAGIC, LOGREDONE, LOGVERSION, LogSuper, PSIZE, ROOT_I, SUPER1_B,
+    LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_B,
 };
 
 /// A mounted JFS volume.
 pub struct Volume {
     /// Filesystem superblock.
     pub sb: JfsSuperblock,
-    /// Log manager (for journal I/O).
-    pub log: Option<Arc<LogManager>>,
+    /// Log manager (for journal I/O). Owned because the volume is the sole
+    /// writer in the single-writer model.
+    pub log: Option<LogManager>,
+    /// Transaction manager — gateway for all journaled metadata writes.
+    pub tx_mgr: TransactionManager,
     /// Filesystem block storage (the main device).
     pub storage: Arc<dyn Storage>,
     /// Log storage (may be separate device or inline).
@@ -95,6 +99,7 @@ impl Volume {
         let mut volume = Self {
             sb,
             log: None,
+            tx_mgr: TransactionManager::new(),
             storage,
             log_storage,
             page_cache: PageCache::new(256),
@@ -197,7 +202,7 @@ impl Volume {
                     logsuper.version()
                 )));
             }
-            let lm = Arc::new(LogManager::new(ls.clone(), logsuper));
+            let lm = LogManager::new(ls.clone(), logsuper);
             self.log = Some(lm);
         }
         Ok(())
@@ -205,8 +210,8 @@ impl Volume {
 
     /// Run journal recovery (logredo) if the log state is not LOGREDONE.
     fn recover_journal(&mut self) -> StorageResult<()> {
-        let log = match &self.log {
-            Some(l) => l.clone(),
+        let log = match &mut self.log {
+            Some(l) => l,
             None => {
                 log::info!("no log found; skipping journal recovery");
                 return Ok(());
@@ -224,12 +229,8 @@ impl Volume {
             recovery.replay(&**ls, &*self.storage, log.data_start())?;
 
             let new_super = recovery.finalize();
-            let mut lm = Arc::try_unwrap(log).unwrap_or_else(|_| {
-                log::warn!("could not unwrap log manager for final write");
-                panic!("log manager still has references");
-            });
-            lm.write_super(&new_super)?;
-            lm.sync()?;
+            log.write_super(&new_super)?;
+            log.sync()?;
         }
 
         Ok(())
@@ -243,6 +244,33 @@ impl Volume {
     /// Get the root inode.
     pub fn root_inode(&mut self) -> StorageResult<crate::inode::Inode> {
         crate::inode::Inode::read(self, self.root_ino)
+    }
+
+    /// Start a journaled write transaction (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn begin_transaction(&mut self) -> StorageResult<TransactionId> {
+        self.tx_mgr.begin()
+    }
+
+    /// Commit the active transaction, flushing the journal then metadata
+    /// to stable storage (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn commit_transaction(&mut self) -> StorageResult<CommitResult> {
+        let journal = self.log.as_mut();
+        self.tx_mgr
+            .commit(&*self.storage, &mut self.page_cache, journal)
+    }
+
+    /// Abort the active transaction and discard dirty pages (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn abort_transaction(&mut self) {
+        self.tx_mgr.abort(&mut self.page_cache)
+    }
+
+    /// Mark a cached page dirty under the current transaction (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn mark_page_dirty(&mut self, inode: u32, block: crate::types::BlockNo) -> StorageResult<()> {
+        self.tx_mgr.mark_dirty(&mut self.page_cache, inode, block)
     }
 
     pub fn block_size(&self) -> u32 {

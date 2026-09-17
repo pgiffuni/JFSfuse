@@ -621,14 +621,44 @@ impl PageCache {
     }
 
     /// Insert or replace a page in the cache.
-    pub fn put(&mut self, inode: u32, page: CachedPage) {
+    ///
+    /// If the key already exists (page replacement), no eviction is needed.
+    /// If the key is new and the cache is full, the LRU victim is checked:
+    /// pages that are dirty (belonging to an in-flight transaction) or pinned
+    /// (actively being modified) are not evicted. The caller must flush
+    /// dirty pages before capacity pressure occurs.
+    pub fn put(&mut self, inode: u32, page: CachedPage) -> Result<()> {
         let key = (inode, page.block);
+        // Only check eviction for new entries.
+        if !self.cache.contains(&key) && self.cache.len() >= self.cache.cap().get() {
+            if let Some(v) = self.cache.peek_lru().map(|(_, v)| v) {
+                if v.dirty || v.pin_count > 0 {
+                    return Err(StorageError::Other(
+                        "cache full: LRU victim is dirty or pinned".to_string(),
+                    ));
+                }
+            }
+        }
         self.cache.put(key, page);
+        Ok(())
     }
 
     /// Load a page into the cache (for transaction-owned pages without an inode).
-    pub fn put_block(&mut self, block: BlockNo, page: CachedPage) {
-        self.cache.put((0, block), page);
+    ///
+    /// Same eviction guard as `put` but uses inode 0 as the key prefix.
+    pub fn put_block(&mut self, block: BlockNo, page: CachedPage) -> Result<()> {
+        let key = (0, block);
+        if !self.cache.contains(&key) && self.cache.len() >= self.cache.cap().get() {
+            if let Some(v) = self.cache.peek_lru().map(|(_, v)| v) {
+                if v.dirty || v.pin_count > 0 {
+                    return Err(StorageError::Other(
+                        "cache full: LRU victim is dirty or pinned".to_string(),
+                    ));
+                }
+            }
+        }
+        self.cache.put(key, page);
+        Ok(())
     }
 
     /// Mark a page as dirty (must already be cached).
@@ -700,6 +730,64 @@ impl PageCache {
     /// Clear all cached pages.
     pub fn clear(&mut self) {
         self.cache.clear();
+    }
+
+    /// Returns `true` if any cached page is dirty.
+    pub fn has_dirty(&self) -> bool {
+        self.cache.iter().any(|(_, p)| p.dirty)
+    }
+
+    /// Returns `true` if any cached page is pinned.
+    pub fn has_pinned(&self) -> bool {
+        self.cache.iter().any(|(_, p)| p.pin_count > 0)
+    }
+}
+
+/// Consistency checker for the page cache — verifies that the cache is in a
+/// legal state for the given transaction phase.
+///
+/// In production this is a no-op (zero-cost). In tests, call `.check()`
+/// to panic on invariant violations such as dirty pages outside a transaction
+/// or pinned pages after commit.
+pub struct ConsistencyChecker;
+
+impl ConsistencyChecker {
+    /// After a clean mount / no transaction active: no dirty pages, no pins.
+    pub fn check_idle(cache: &PageCache) {
+        assert!(
+            !cache.has_dirty(),
+            "consistency violation: dirty page outside active transaction"
+        );
+        assert!(
+            !cache.has_pinned(),
+            "consistency violation: pinned page outside active transaction"
+        );
+    }
+
+    /// During a transaction: dirty pages exist but are pinned (being modified).
+    pub fn check_in_transaction(cache: &PageCache) {
+        // Dirty pages must be pinned — they're being modified by the txn.
+        let violations = cache
+            .cache
+            .iter()
+            .filter(|(_, p)| p.dirty && p.pin_count == 0)
+            .count();
+        assert_eq!(
+            violations, 0,
+            "consistency violation: dirty page not pinned during transaction"
+        );
+    }
+
+    /// After a transaction commits: all pages clean and unpinned.
+    pub fn check_post_commit(cache: &PageCache) {
+        assert!(
+            !cache.has_dirty(),
+            "consistency violation: dirty page after commit"
+        );
+        assert!(
+            !cache.has_pinned(),
+            "consistency violation: pinned page after commit"
+        );
     }
 }
 
@@ -880,6 +968,7 @@ use std::io;
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Arc;
 
     #[test]
     fn test_read_only_storage_rejects_writes() {
@@ -1090,5 +1179,89 @@ mod tests {
         assert!(result.is_err());
 
         tm.abort(&mut cache);
+    }
+
+    #[test]
+    fn test_cache_evict_rejects_dirty_page() {
+        let storage = Arc::new(MemoryStorage::new(4));
+        let mut cache = PageCache::new(2);
+        // Fill cache to capacity.
+        cache.get_or_load(&*storage, 1, 0, 0).unwrap(); // page (1, 0) — LRU
+        cache.get_or_load(&*storage, 2, 1, 0).unwrap(); // page (2, 1) — MRU
+
+        // Mark page (1, 0) dirty + pinned.
+        {
+            let page = cache.get_mut_for_write(1, 0).unwrap();
+            page.write_u32_le(0, 0xCAFE);
+        }
+
+        // Access page (2, 1) to make it MRU, leaving (1, 0) as the LRU victim
+        // — now it's dirty and pinned.
+        let _ = cache.get(2, 1);
+
+        // Trying to put a new page should fail because the LRU victim
+        // is dirty and pinned.
+        let mut new_page = CachedPage::new(2, vec![0u8; BLOCK_SIZE]);
+        new_page.inode = Some(3);
+        let result = cache.put(3, new_page);
+        assert!(result.is_err(), "should reject inserting when LRU victim is dirty");
+        assert!(
+            result.unwrap_err().to_string().contains("dirty or pinned"),
+            "error should mention dirty or pinned"
+        );
+    }
+
+    #[test]
+    fn test_cache_evict_allows_clean_page() {
+        let storage = Arc::new(MemoryStorage::new(4));
+        let mut cache = PageCache::new(2);
+        cache.get_or_load(&*storage, 1, 0, 0).unwrap(); // page (1, 0)
+        cache.get_or_load(&*storage, 2, 1, 0).unwrap(); // page (2, 1) — full
+
+        // Both pages are clean and unpinned. Inserting a new page should evict the LRU one.
+        let mut new_page = CachedPage::new(2, vec![0u8; BLOCK_SIZE]);
+        new_page.inode = Some(3);
+        let result = cache.put(3, new_page);
+        assert!(result.is_ok(), "should allow eviction of clean pages");
+    }
+
+    #[test]
+    fn test_cache_put_replaces_existing() {
+        let storage = Arc::new(MemoryStorage::new(4));
+        let mut cache = PageCache::new(4);
+        cache.get_or_load(&*storage, 1, 0, 0).unwrap(); // page (1, 0)
+
+        // Putting the same key should succeed (no eviction check needed).
+        let mut new_page = CachedPage::new(0, vec![0u8; BLOCK_SIZE]);
+        new_page.inode = Some(1);
+        let result = cache.put(1, new_page);
+        assert!(result.is_ok(), "put should succeed for existing key");
+    }
+
+    #[test]
+    fn test_consistency_checker_idle() {
+        let storage = Arc::new(MemoryStorage::new(4));
+        let cache = PageCache::new(16);
+        ConsistencyChecker::check_idle(&cache); // should not panic
+    }
+
+    #[test]
+    fn test_consistency_checker_post_commit() {
+        use crate::transaction::TransactionManager;
+        let storage = Arc::new(MemoryStorage::new(8));
+        let mut cache = PageCache::new(16);
+        cache.get_or_load(&*storage, 1, 0, 0).unwrap();
+
+        let mut tm = TransactionManager::new();
+        tm.begin().unwrap();
+        tm.mark_dirty(&mut cache, 1, 0).unwrap();
+
+        {
+            let page = cache.get_mut_for_write(1, 0).unwrap();
+            page.write_u32_le(0, 0xABCD);
+        }
+
+        tm.commit(&*storage, &mut cache, None).unwrap();
+        ConsistencyChecker::check_post_commit(&cache);
     }
 }

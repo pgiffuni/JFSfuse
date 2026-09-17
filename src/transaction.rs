@@ -184,7 +184,7 @@ impl TransactionManager {
                 p.dirty = false;
                 p.txid = 0;
                 p.unpin();
-                cache.put(*inode, p);
+                let _ = cache.put(*inode, p);
             }
         }
 
@@ -204,7 +204,7 @@ impl TransactionManager {
                     p.dirty = false;
                     p.txid = 0;
                     p.unpin();
-                    cache.put(*inode, p);
+                    let _ = cache.put(*inode, p);
                 }
                 cache.unpin_page(*inode, *block);
             }

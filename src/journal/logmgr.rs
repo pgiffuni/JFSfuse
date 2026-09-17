@@ -30,6 +30,10 @@ pub const LOG_WRITE_DIRTY: u32 = 0x01;
 /// - Log scanning for recovery (read path)
 /// - Log record appending (write path)
 /// - Sync point management
+///
+/// The internal log buffer spans two log pages so that a single journal
+/// record (LRD header + full metadata block data) — up to 36 + 4096 =
+/// 4132 bytes — always fits without splitting across page boundaries.
 pub struct LogManager {
     /// Log superblock.
     logsuper: LogSuper,
@@ -41,12 +45,19 @@ pub struct LogManager {
     inline: bool,
     /// Current write offset within the log data area (in bytes).
     write_offset: u64,
-    /// Buffered log page currently being filled.
-    /// `None` when the page is empty or has been flushed.
+    /// Buffered log data currently being filled. Spans two log pages so
+    /// that a single LRD + 4096-byte metadata block fits without crossing
+    /// a page boundary mid-record.
     log_buffer: Vec<u8>,
+    /// Whether the log buffer has unflushed data.
+    buffer_dirty: bool,
     /// Number of log pages in the journal.
     log_pages: u32,
 }
+
+/// Effective write-buffer size: two log page sizes so a single record
+/// (LRD + full block) always fits.
+const LOG_BUFFER_SIZE: usize = LOGPSIZE * 2;
 
 impl LogManager {
     pub fn new(storage: Arc<dyn Storage>, logsuper: LogSuper) -> Self {
@@ -58,7 +69,8 @@ impl LogManager {
             log_id: String::new(),
             inline,
             write_offset: 0,
-            log_buffer: vec![0u8; LOGPSIZE],
+            log_buffer: vec![0u8; LOG_BUFFER_SIZE],
+            buffer_dirty: false,
             log_pages,
         }
     }
@@ -195,21 +207,32 @@ impl LogManager {
 
     /// Flush the journal specifically.
     ///
-    /// This writes any buffered log page to storage and then calls
-    /// `flush_metadata()` on the underlying storage. The journal must be
-    /// durable before any metadata blocks can be safely written.
+    /// This writes any buffered log data to storage as one or more log pages
+    /// and then calls `flush_metadata()` on the underlying storage. The
+    /// journal must be durable before any metadata blocks can be safely
+    /// written.
     pub fn flush_journal(&mut self) -> StorageResult<()> {
-        // Write the current log buffer page.
-        if self.write_offset > 0 {
-            let current_page = (self.write_offset / (LOGPSIZE as u64)) as u32;
-            self.write_page(current_page, &self.log_buffer)?;
+        // Write any buffered log data to log pages.
+        if self.buffer_dirty && self.write_offset > 0 {
+            let bytes_per_page = LOGPSIZE as u64;
+            // Number of pages of buffer data to write.
+            let dirty_pages =
+                (self.write_offset + bytes_per_page - 1) / bytes_per_page;
+            // Starting page number within the log data area.
+            let start_page = (self.write_offset / (bytes_per_page * 2)) * 2;
+
+            for i in 0..dirty_pages {
+                let page_num = (start_page + i) as u32;
+                let buf_start = (i * bytes_per_page) as usize;
+                let buf_end = (buf_start + LOGPSIZE).min(self.log_buffer.len());
+                let chunk = &self.log_buffer[buf_start..buf_end];
+                self.write_page(page_num, chunk)?;
+            }
         }
         self.storage.flush_metadata()?;
         self.sync()?;
 
         // Update logsuper end-of-log pointer.
-        let data_start = self.data_start();
-        let end = data_start + self.write_offset;
         self.logsuper.set_end(self.write_offset as u32);
         let logsuper_clone = self.logsuper;
         self.write_super(&logsuper_clone)?;
@@ -219,8 +242,8 @@ impl LogManager {
     /// Append a log record for a metadata block update.
     ///
     /// Serializes an LRD (log record descriptor) followed by the page data,
-    /// writing it into the current log page buffer. If the current page is
-    /// full, it is flushed and a new page is started.
+    /// writing it into the current log buffer. If the current buffer is
+    /// full, it is flushed and a new buffer segment is started.
     pub fn append_log_record(
         &mut self,
         txid: u64,
@@ -229,22 +252,24 @@ impl LogManager {
     ) -> StorageResult<()> {
         use byteorder::{ByteOrder, LittleEndian};
 
-        let page_size = LOGPSIZE as u64;
-        let offset_in_page = self.write_offset % page_size;
+        let buf_size = LOG_BUFFER_SIZE as u64;
+        let offset_in_buf = self.write_offset % buf_size;
         let record_total = 36 + data.len() as u64; // LRD (36) + data
 
-        // If this record won't fit in the current page, flush and wrap.
-        if offset_in_page + record_total > page_size {
-            let current_page = (self.write_offset / page_size) as u32;
-            self.write_page(current_page, &self.log_buffer)?;
-            self.write_offset = ((current_page as u64) + 1) * page_size % self.log_size_bytes();
-            if self.write_offset == 0 {
-                self.write_offset = page_size; // start of first data page offset
-            }
+        // If this record won't fit in the current buffer, flush and advance.
+        if offset_in_buf + record_total > buf_size {
+            self.flush_journal()?;
             self.log_buffer.fill(0);
+            self.buffer_dirty = false;
+            // write_offset already advanced past the previous buffer full;
+            // align to the next buffer boundary.
+            let pages_used = (self.write_offset + LOGPSIZE as u64 - 1) / (LOGPSIZE as u64);
+            let buf_pages = buf_size / (LOGPSIZE as u64);
+            let buffer_index = (pages_used + buf_pages - 1) / buf_pages;
+            self.write_offset = buffer_index * buf_size;
         }
 
-        let offset_in_page = self.write_offset % page_size;
+        let offset_in_buf = self.write_offset % buf_size;
 
         // Build the LRD.
         let mut lrd = crate::types::Lrd::default();
@@ -262,8 +287,9 @@ impl LogManager {
         LittleEndian::write_u32(&mut lrd.redopage_inode, block as u32);
 
         // Write LRD into the buffer.
-        let buf_off = offset_in_page as usize;
+        let buf_off = offset_in_buf as usize;
         self.log_buffer[buf_off..buf_off + 36].copy_from_slice(&lrd_bytes(&lrd));
+        self.buffer_dirty = true;
 
         // Write data after the LRD.
         let data_off = buf_off + 36;

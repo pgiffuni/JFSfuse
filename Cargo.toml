@@ -25,3 +25,6 @@ fuse3 = { version = "0.7", optional = true }
 [[bin]]
 name = "jfsfuse-mount"
 path = "src/bin/mount.rs"
+
+[dev-dependencies]
+byteorder = "1.5"

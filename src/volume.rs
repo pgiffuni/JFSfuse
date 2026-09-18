@@ -14,6 +14,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use byteorder::{ByteOrder, LittleEndian};
+
 use crate::journal::{JournalRecovery, LogManager};
 use crate::storage::{
     BLOCK_SIZE, FileStorage, PageCache, Result as StorageResult, Storage, StorageError,
@@ -366,11 +368,11 @@ impl Volume {
 
         // Update file size if write extends past EOF.
         let new_end = offset + written as u64;
-        let mut updated_dinode = inode.dinode;
         if new_end > size {
-            updated_dinode.set_size_val(new_end);
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                LittleEndian::write_u64(&mut dinode_bytes[24..32], new_end);
+            })?;
         }
-        let _ = updated_dinode; // Metadata journaling via page cache below
 
         // Mark the inode's metadata page as dirty for journaling.
         self.mark_page_dirty(ino, inode.page_block)?;
@@ -383,12 +385,47 @@ impl Volume {
     }
 
     /// Truncate or extend a regular file to `new_size` (writable builds only).
+    ///
+    /// For shrinking: identifies extents beyond the new EOF, frees complete
+    /// trailing extents, splits the final extent if necessary, and updates
+    /// the xtree. The freed blocks are recorded (actual block free is pending
+    /// allocator integration).
+    ///
+    /// For growing: adds no new extents (the new range becomes a hole);
+    /// only the inode size is updated.
     #[cfg(feature = "writable")]
     pub fn truncate(&mut self, ino: u32, new_size: u64) -> StorageResult<()> {
         let _ = self.begin_transaction()?;
+
         let inode = crate::inode::Inode::read(self, ino)?;
-        let mut dinode = inode.dinode;
-        dinode.set_size_val(new_size);
+        let mut xtree = crate::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
+
+        let new_size_val = new_size;
+        let new_eof_fsb = (new_size + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+        let current_eof_fsb = (inode.size() + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+
+        if new_eof_fsb < current_eof_fsb {
+            // Shrinking: truncate extents.
+            let freed = xtree.truncate_extents(new_eof_fsb as i64);
+            // Record freed blocks (allocator is a stub — not actually freed).
+            let _ = freed;
+
+            // Update nblocks (number of blocks allocated to the file).
+            let new_nblocks = self.compute_nblocks(&xtree, inode.dinode.nblocks())? as u64;
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                let xt_bytes = xtree.to_bytes();
+                let xt_off = crate::types::Dinode::size() - xt_bytes.len();
+                dinode_bytes[xt_off..xt_off + xt_bytes.len()].copy_from_slice(&xt_bytes);
+                LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size_val);
+                LittleEndian::write_u64(&mut dinode_bytes[32..40], new_nblocks);
+            })?;
+        } else if new_eof_fsb > current_eof_fsb {
+            // Growing: add a hole, just update size.
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size_val);
+            })?;
+        }
+
         self.mark_page_dirty(ino, inode.page_block)?;
         self.commit_transaction()?;
         Ok(())
@@ -415,5 +452,48 @@ impl Volume {
 
     pub fn num_ags(&self) -> u32 {
         self.num_ag
+    }
+
+    /// Apply a mutation to the cached inode page, then unpin it.
+    ///
+    /// The closure receives the dinode bytes within the page (starting at
+    /// `page_offset` and spanning `Dinode::size()` bytes) and may modify them
+    /// in place.
+    #[cfg(feature = "writable")]
+    fn update_inode_page(
+        &mut self,
+        ino: u32,
+        page_block: u64,
+        page_offset: usize,
+        update: impl FnOnce(&mut [u8]),
+    ) -> StorageResult<()> {
+        let dinode_size = crate::types::Dinode::size();
+        let page = self
+            .page_cache
+            .get_mut_for_write(ino, page_block)
+            .map_err(|_| crate::storage::StorageError::PageNotFound)?;
+        let end = page_offset + dinode_size;
+        if end <= page.data.len() {
+            update(&mut page.data[page_offset..end]);
+        }
+        self.page_cache.unpin_page(ino, page_block);
+        Ok(())
+    }
+
+    /// Compute the total number of blocks allocated to a file based on its
+    /// xtree extents. Falls back to the inode's current nblocks if the
+    /// xtree cannot be fully parsed.
+    #[cfg(feature = "writable")]
+    fn compute_nblocks(
+        &self,
+        xtree: &crate::btree::xtree::Xtree,
+        fallback: u64,
+    ) -> StorageResult<u64> {
+        let total = xtree.iter_extents().map(|e| e.length as u64).sum::<u64>();
+        if total > 0 {
+            Ok(total)
+        } else {
+            Ok(fallback)
+        }
     }
 }

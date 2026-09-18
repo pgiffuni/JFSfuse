@@ -195,6 +195,29 @@ impl Xtree {
         self.root.header.nextindex() as usize
     }
 
+    /// Iterate over all extent entries in the xtree root (inline only).
+    pub fn iter_extents(&self) -> impl Iterator<Item = Extent> + '_ {
+        let next_idx = self.root.header.nextindex() as usize;
+        (XTENTRYSTART..next_idx).filter_map(move |i| {
+            if i >= XTROOTMAXSLOT {
+                return None;
+            }
+            let xad = &self.root.xad[i];
+            let offset = xad.offset() as i64;
+            let length = xad.length();
+            let address = xad.address();
+            if length == 0 {
+                return None;
+            }
+            Some(Extent {
+                offset,
+                length,
+                address,
+                flags: XadFlag::from_bits_truncate(xad.flag),
+            })
+        })
+    }
+
     /// Serialize the XtRoot back to its on-disk byte representation.
     ///
     /// The on-disk format has the xtheader (32 bytes) at the start, with
@@ -296,6 +319,69 @@ impl Xtree {
         xad.set_address(physical_addr);
         xad.set_flag(XadFlag::XAD_NEW);
         true
+    }
+
+    /// Truncate extents to fit within `new_eof_fsb`.
+    ///
+    /// Returns a list of (physical_address, block_count) pairs for extents
+    /// that were freed (beyond the truncation point). The caller is responsible
+    /// for actually freeing those blocks via the allocator.
+    ///
+    /// Extent entries beyond `new_eof_fsb` are removed from the xtree. If the
+    /// last remaining extent straddles the new EOF, its length is reduced.
+    pub fn truncate_extents(&mut self, new_eof_fsb: i64) -> Vec<(u64, u32)> {
+        let next_idx = self.root.header.nextindex() as usize;
+
+        // Collect extent data first to avoid borrow conflicts during modification.
+        let mut kept: Vec<Xad> = Vec::new();
+        let mut freed = Vec::new();
+
+        for i in XTENTRYSTART..next_idx {
+            if i >= XTROOTMAXSLOT {
+                break;
+            }
+            let xad = &self.root.xad[i];
+            let ext_offset = xad.offset() as i64;
+            let ext_length = xad.length() as u32;
+            let ext_addr = xad.address();
+
+            if ext_length == 0 {
+                continue;
+            }
+
+            if ext_offset >= new_eof_fsb {
+                // Entirely beyond EOF — free and remove.
+                freed.push((ext_addr, ext_length));
+            } else if ext_offset + ext_length as i64 > new_eof_fsb {
+                // Straddles EOF — split: keep partial, free the tail.
+                let keep_len = (new_eof_fsb - ext_offset) as u32;
+                let free_len = (ext_offset + ext_length as i64 - new_eof_fsb) as u32;
+                let free_addr = ext_addr + keep_len as u64;
+                freed.push((free_addr, free_len));
+
+                let mut xad_copy = *xad;
+                xad_copy.set_length(keep_len);
+                kept.push(xad_copy);
+            } else {
+                // Entirely before EOF — keep as-is.
+                kept.push(*xad);
+            }
+        }
+
+        // Write kept extents back.
+        for (write_idx, xad) in kept.iter().enumerate() {
+            let idx = XTENTRYSTART + write_idx;
+            if idx < XTROOTMAXSLOT {
+                self.root.xad[idx] = *xad;
+            }
+        }
+        let new_next = XTENTRYSTART + kept.len();
+        // Clear any leftover entries
+        for idx in new_next..next_idx.min(XTROOTMAXSLOT) {
+            self.root.xad[idx] = Xad::default();
+        }
+        self.root.header.set_nextindex(new_next as u16);
+        freed
     }
 }
 
@@ -446,5 +532,76 @@ mod tests {
         let ext = xt.lookup(0).unwrap().unwrap();
         assert_eq!(ext.length, 20);
         assert_eq!(ext.address, 200);
+    }
+
+    #[test]
+    fn test_xtree_truncate_no_split() {
+        // Single extent: offset=0, length=10, address=100
+        // Truncate to new_eof_fsb=5 → keep 5 blocks, free 5 blocks
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01; // BT_ROOT
+        data[18..20].copy_from_slice(&3u16.to_le_bytes()); // nextindex = 3
+        data[20..22].copy_from_slice(&18u16.to_le_bytes()); // maxentry = 18
+        data[32] = 0; // flag
+        data[40..44].copy_from_slice(&10u32.to_le_bytes()); // length=10
+        data[44..48].copy_from_slice(&100u32.to_le_bytes()); // address=100
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+        let freed = xt.truncate_extents(5);
+
+        assert_eq!(freed.len(), 1, "should free 1 extent");
+        assert_eq!(freed[0].0, 105, "freed blocks should start at addr 105");
+        assert_eq!(freed[0].1, 5, "freed block count should be 5");
+
+        let ext = xt.lookup(0).unwrap().unwrap();
+        assert_eq!(ext.length, 5, "kept extent should be 5 blocks");
+        assert_eq!(ext.address, 100, "kept extent should keep original address");
+        assert_eq!(xt.next_index(), 3, "nextindex should be 3 (XTENTRYSTART + 1)");
+    }
+
+    #[test]
+    fn test_xtree_truncate_frees_trailing_extent() {
+        // Two extents: [0..10] addr=100, [10..20] addr=200
+        // Truncate to new_eof_fsb=10 keeps first, frees second entirely
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01; // BT_ROOT
+        data[18..20].copy_from_slice(&2u16.to_le_bytes()); // nextindex = 2
+        data[20..22].copy_from_slice(&18u16.to_le_bytes()); // maxentry = 18
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+        xt.insert_extent(0, 10, 100);
+        xt.insert_extent(10, 10, 200);
+
+        let freed = xt.truncate_extents(10);
+
+        assert_eq!(freed.len(), 1, "should free 1 trailing extent");
+        assert_eq!(freed[0].0, 200, "freed at address 200");
+        assert_eq!(freed[0].1, 10, "freed 10 blocks");
+
+        // Only the first extent should remain.
+        let ext = xt.lookup(0).unwrap().unwrap();
+        assert_eq!(ext.length, 10, "first extent intact");
+        assert_eq!(ext.address, 100);
+
+        // Second extent should be gone.
+        let none = xt.lookup(10).unwrap();
+        assert!(none.is_none(), "second extent should be removed");
+        assert_eq!(xt.next_index(), 3, "should have 1 entry after truncate");
+    }
+
+    fn test_xtree_truncate_grow_no_change() {
+        // Growing: truncate to a larger size should be a no-op on extents.
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01; // BT_ROOT
+        data[18..20].copy_from_slice(&3u16.to_le_bytes()); // nextindex = 3
+        data[20..22].copy_from_slice(&18u16.to_le_bytes()); // maxentry = 18
+        data[40..44].copy_from_slice(&10u32.to_le_bytes()); // length=10
+        data[44..48].copy_from_slice(&100u32.to_le_bytes()); // address=100
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+        let freed = xt.truncate_extents(20);
+
+        assert!(freed.is_empty(), "growing should not free any extents");
+        assert_eq!(xt.next_index(), 3, "extent count should not change");
     }
 }

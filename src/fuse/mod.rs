@@ -334,6 +334,47 @@ impl FuseFs {
         Err(EOPNOTSUPP)
     }
 
+    /// Create a symbolic link (writable builds only).
+    ///
+    /// Stores the target path inline in the new symlink inode if it fits
+    /// within 128 bytes. Longer paths are not yet supported.
+    #[cfg(feature = "writable")]
+    pub fn symlink(&mut self, parent_ino: u32, name: &str, target: &str) -> FuseResult<u32> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.symlink(parent_ino, name, target).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                EEXIST
+            } else if msg.contains("invalid filename") {
+                EINVAL
+            } else if msg.contains("no free inode") {
+                ENOSPC
+            } else if msg.contains("long symlinks not yet supported") {
+                EOPNOTSUPP
+            } else {
+                EIO
+            }
+        })
+    }
+
+    /// Read the target of a symbolic link (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn readlink(&mut self, ino: u32) -> FuseResult<Vec<u8>> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.read_symlink(ino).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not a symbolic link") {
+                ENOENT
+            } else {
+                EIO
+            }
+        })
+    }
+
     /// Create a hard link (writable builds only).
     ///
     /// Increments the target inode's link count and inserts a new directory

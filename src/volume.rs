@@ -1134,6 +1134,107 @@ impl Volume {
         self.open_handles.get(&page_block).copied().unwrap_or(0) > 0
     }
 
+    /// Create a symbolic link (Phase 11).
+    ///
+    /// 1. Allocate inode.
+    /// 2. Initialize inode (symlink mode, inline path if short).
+    /// 3. Insert directory entry in parent.
+    /// 4. Update parent metadata.
+    /// 5. Commit.
+    ///
+    /// Short symlinks (path < 128 bytes) are stored inline in the inode's
+    /// union area. Long symlinks would use allocated data blocks (not yet
+    /// implemented).
+    #[cfg(feature = "writable")]
+    pub fn symlink(&mut self, parent_ino: u32, name: &str, target: &str) -> StorageResult<u32> {
+        let _ = self.begin_transaction()?;
+
+        // 1. Allocate a new inode.
+        let (child_ino, _child_block, _child_off) = self.allocate_inode()?;
+
+        // 2. Validate name.
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        if name_u16.is_empty() || name_u16.len() > 11 {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid filename length".to_string()));
+        }
+
+        // 3. Initialize the child inode as a symlink.
+        let target_bytes = target.as_bytes();
+        let use_inline = target_bytes.len() < 128;
+
+        if !use_inline {
+            self.abort_transaction();
+            return Err(StorageError::Other("long symlinks not yet supported".to_string()));
+        }
+
+        self.update_inode_page(child_ino, _child_block, _child_off, |dinode_bytes| {
+            // Set mode to symlink (S_IFLNK | 0777 = 0xA1FF)
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0xA1FF);
+            // Set size to the target path length.
+            LittleEndian::write_u64(&mut dinode_bytes[24..32], target_bytes.len() as u64);
+            // Set nblocks to 0 (inline symlink uses no data blocks).
+            LittleEndian::write_u64(&mut dinode_bytes[32..40], 0);
+            // Set nlink to 1.
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
+            // Set fileset and ino number.
+            LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+
+            // Store the target path inline in the union area (u[0..target_len]).
+            // The union starts at offset 128 in the dinode.
+            let target_offset = 128;
+            let end = target_offset + target_bytes.len();
+            if end <= dinode_bytes.len() {
+                dinode_bytes[target_offset..end].copy_from_slice(target_bytes);
+            }
+        })?;
+        self.mark_page_dirty(child_ino, _child_block)?;
+
+        // 4. Insert directory entry in parent.
+        let index = {
+            let parent = crate::inode::Inode::read(self, parent_ino)?;
+            let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+            dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+        };
+        let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
+        if !inserted {
+            self.abort_transaction();
+            return Err(StorageError::Other("directory entry already exists".to_string()));
+        }
+
+        // 5. Mark parent dirty.
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
+
+        // 6. Commit.
+        self.commit_transaction()?;
+
+        Ok(child_ino)
+    }
+
+    /// Read the target of a symbolic link (Phase 11).
+    ///
+    /// For inline symlinks, reads the path from the inode's union area.
+    /// For block-based symlinks, reads through the xtree (not yet implemented).
+    #[cfg(feature = "writable")]
+    pub fn read_symlink(&mut self, ino: u32) -> StorageResult<Vec<u8>> {
+        let inode = crate::inode::Inode::read(self, ino)?;
+
+        if !inode.is_symlink() {
+            return Err(StorageError::Other("not a symbolic link".to_string()));
+        }
+
+        let size = inode.size() as usize;
+        if size > 0 && size < 128 {
+            // Inline fast symlink — read from the union area.
+            let target = &inode.dinode.u[0..size.min(inode.dinode.u.len())];
+            return Ok(target.to_vec());
+        }
+
+        Err(StorageError::Other("symlink target not available".to_string()))
+    }
+
     /// Release an open file handle — decrements the open-handle count.
     /// If the inode is in pending-deletion state (nlink == 0) and this was
     /// the last handle, the inode's blocks are freed.

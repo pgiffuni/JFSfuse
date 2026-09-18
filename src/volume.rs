@@ -137,6 +137,91 @@ impl Volume {
         Ok(volume)
     }
 
+    /// Mount the filesystem in writable mode (Phase 13).
+    ///
+    /// Performs the full mount safety sequence:
+    /// 1. Read and validate the superblock.
+    /// 2. Identify the journal.
+    /// 3. Check journal state.
+    /// 4. Replay committed transactions (recovery).
+    /// 5. Rebuild or validate allocation summaries (bmap).
+    /// 6. Validate root inode.
+    /// 7. Validate root directory.
+    /// 8. Mark the filesystem dirty (FM_DIRTY) to indicate a writer is active.
+    ///
+    /// If any step fails, the mount is refused.
+    #[cfg(feature = "writable")]
+    pub fn mount(path: &str) -> StorageResult<Self> {
+        let storage = Arc::new(FileStorage::open(Path::new(path))?);
+        Self::mount_from_storage(storage)
+    }
+
+    /// Mount in writable mode from an already-open storage backend (Phase 13).
+    #[cfg(feature = "writable")]
+    pub fn mount_from_storage(storage: Arc<dyn Storage>) -> StorageResult<Self> {
+        // Steps 1-2: Read and validate superblock, identify journal.
+        let mut volume = Self::open_from_storage(storage)?;
+
+        // Step 3-4: Journal recovery already ran in open_from_storage().
+        // Step 5: Allocation map already initialized.
+
+        // Step 6: Validate root inode exists and is a directory.
+        let root_ino = volume.root_ino;
+        let root = crate::inode::Inode::read(&mut volume, root_ino)?;
+        if !root.is_dir() {
+            return Err(StorageError::Other(
+                "root inode is not a directory".to_string(),
+            ));
+        }
+
+        // Step 7: Validate root directory is readable (dtree parses).
+        let _dtree = crate::btree::dtree::Dtree::from_inode_data(root.dtroot_bytes())?;
+
+        // Step 8: Mark filesystem dirty (FM_DIRTY) before allowing writes.
+        volume.set_fs_state(crate::types::FM_DIRTY)?;
+
+        Ok(volume)
+    }
+
+    /// Remount read-only after a crash, marking the filesystem dirty (Phase 13).
+    #[cfg(feature = "writable")]
+    fn set_fs_state(&mut self, state: u32) -> StorageResult<()> {
+        // Write the new filesystem state to the superblock at offset 40.
+        let sb_bytes = self.storage.read_bytes(crate::types::SUPER1_OFF, PSIZE)?;
+        let mut buf = sb_bytes.to_vec();
+        LittleEndian::write_u32(&mut buf[40..44], state);
+        self.storage.write_bytes(crate::types::SUPER1_OFF, &buf)?;
+        self.storage.flush_metadata()?;
+        self.sb.s_state = buf[40..44].try_into().unwrap_or([0; 4]);
+        Ok(())
+    }
+
+    /// Cleanly unmount the filesystem (Phase 13).
+    ///
+    /// Flushes all dirty pages and the journal, then marks the filesystem
+    /// clean (FM_CLEAN). Should only be called after all writes are done.
+    #[cfg(feature = "writable")]
+    pub fn umount(&mut self) -> StorageResult<()> {
+        // Flush any remaining dirty pages.
+        self.page_cache.flush_all(&*self.storage)?;
+
+        // Flush the journal.
+        if let Some(log) = &mut self.log {
+            log.sync()?;
+        }
+
+        // Flush the allocation map.
+        if let Some(bmap) = &mut self.bmap {
+            bmap.commit()?;
+        }
+
+        // Mark the filesystem clean.
+        self.set_fs_state(crate::types::FM_CLEAN)?;
+
+        log::info!("JFS filesystem cleanly unmounted");
+        Ok(())
+    }
+
     /// Read the primary superblock from disk.
     ///
     /// In JFS, the superblock sits at byte offset SUPER1_OFF (0x8000),

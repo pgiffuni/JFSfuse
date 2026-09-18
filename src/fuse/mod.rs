@@ -17,6 +17,24 @@ use crate::inode::Inode;
 use crate::types::Dinode;
 use crate::volume::Volume;
 
+/// POSIX errno constants used by the FUSE adapter to report errors.
+/// Maps internal JFS conditions to FUSE results per the Phase 9 table.
+pub const ENOENT: i32 = 2;
+pub const EEXIST: i32 = 17;
+pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
+pub const ENOTEMPTY: i32 = 39;
+pub const ENOSPC: i32 = 28;
+pub const EROFS: i32 = 30;
+pub const EINVAL: i32 = 22;
+pub const EACCES: i32 = 13;
+pub const EBUSY: i32 = 16;
+pub const EOPNOTSUPP: i32 = 95;
+pub const EIO: i32 = 5;
+
+/// Result type for FUSE operations that may carry an errno value.
+pub type FuseResult<T> = Result<T, i32>;
+
 /// FUSE filesystem operations.
 pub struct FuseFs {
     /// Mounted volume.
@@ -201,5 +219,116 @@ impl FuseFs {
             return None;
         }
         Some(self.volume.unlink_file(parent_ino, name).unwrap_or(false))
+    }
+
+    /// Create a directory (write-supported, gated behind `writable`).
+    ///
+    /// Allocates a new directory inode, initializes it with `.` and `..`
+    /// entries, inserts a directory entry in the parent, and increments the
+    /// parent's link count.
+    #[cfg(feature = "writable")]
+    pub fn mkdir(&mut self, parent_ino: u32, name: &str, _mode: u32) -> FuseResult<u32> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.mkdir(parent_ino, name).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                EEXIST
+            } else if msg.contains("invalid filename") {
+                EINVAL
+            } else if msg.contains("no free inode") {
+                ENOSPC
+            } else {
+                EIO
+            }
+        })
+    }
+
+    /// Remove a directory (write-supported, gated behind `writable`).
+    ///
+    /// Fails if the child is not a directory or is not empty
+    /// (only `.` and `..` entries are allowed).
+    #[cfg(feature = "writable")]
+    pub fn rmdir(&mut self, parent_ino: u32, name: &str) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        match self.volume.rmdir(parent_ino, name) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ENOENT),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not a directory") {
+                    Err(ENOTDIR)
+                } else if msg.contains("not empty") {
+                    Err(ENOTEMPTY)
+                } else {
+                    Err(EIO)
+                }
+            }
+        }
+    }
+
+    /// Open a file or directory (writable builds only).
+    ///
+    /// Validates that the inode exists. The return value is the inode number,
+    /// which can be used as a FUSE file handle. No data is read.
+    #[cfg(feature = "writable")]
+    pub fn open(&mut self, ino: u32) -> FuseResult<()> {
+        let result = Inode::read(&mut self.volume, ino);
+        match result {
+            Ok(_) => Ok(()),
+            Err(_) => Err(ENOENT),
+        }
+    }
+
+    /// Release an open file handle (writable builds only).
+    ///
+    /// In the current design, there is no per-file state to free — each
+    /// operation is stateless. This is a no-op provided for FUSE semantics.
+    #[cfg(feature = "writable")]
+    pub fn release(&mut self, _ino: u32) -> FuseResult<()> {
+        Ok(())
+    }
+
+    /// Set file attributes (writable builds only).
+    ///
+    /// Supports chmod (mode), chown (uid/gid), and utimens (atime/mtime).
+    /// Unspecified attributes are left unchanged.
+    #[cfg(feature = "writable")]
+    pub fn setattr(
+        &mut self,
+        ino: u32,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume
+            .setattr(ino, mode, uid, gid, atime, mtime)
+            .map_err(|_| EIO)
+    }
+
+    /// Rename or move a file/directory (writable builds only).
+    ///
+    /// Unlinks the old name from the source parent and creates a new entry
+    /// in the destination parent. Not yet implemented.
+    #[cfg(feature = "writable")]
+    pub fn rename(
+        &mut self,
+        _old_parent: u32,
+        _old_name: &str,
+        _new_parent: u32,
+        _new_name: &str,
+    ) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        Err(EOPNOTSUPP)
     }
 }

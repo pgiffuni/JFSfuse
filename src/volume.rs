@@ -523,7 +523,69 @@ impl Volume {
         Ok(())
     }
 
-    /// Flush a file's data and metadata to durable storage (writable builds only).
+    /// Set file attributes (chmod, chown, utimens).
+    ///
+    /// Only modifies the specified fields — all parameters except `ino` are optional.
+    /// The inode's mode, uid, gid, and/or timestamps are updated within a single
+    /// journaled transaction.
+    #[cfg(feature = "writable")]
+    pub fn setattr(
+        &mut self,
+        ino: u32,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> StorageResult<()> {
+        let _ = self.begin_transaction()?;
+
+        let inode = crate::inode::Inode::read(self, ino)?;
+
+        self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+            // Offset 40..44: nlink (u32)
+            // Offset 44..48: uid (u32)
+            // Offset 48..52: gid (u32)
+            // Offset 52..56: mode (u32)
+            // Offset 56..60: atime.tv_sec (u32)
+            // Offset 60..64: atime.tv_nsec (u32)
+            // Offset 64..68: ctime.tv_sec (u32)
+            // Offset 68..72: ctime.tv_nsec (u32)
+            // Offset 72..76: mtime.tv_sec (u32)
+            // Offset 76..80: mtime.tv_nsec (u32)
+
+            if let Some(m) = mode {
+                // Preserve file type bits (high nibble) and replace permission bits.
+                let old_mode = LittleEndian::read_u32(&dinode_bytes[52..56]);
+                let type_bits = old_mode & 0xf000;
+                let new_mode = (m & 0x0fff) | type_bits;
+                LittleEndian::write_u32(&mut dinode_bytes[52..56], new_mode);
+            }
+            if let Some(u) = uid {
+                LittleEndian::write_u32(&mut dinode_bytes[44..48], u);
+            }
+            if let Some(g) = gid {
+                LittleEndian::write_u32(&mut dinode_bytes[48..52], g);
+            }
+            if let Some(ts) = atime {
+                LittleEndian::write_u32(&mut dinode_bytes[56..60], ts as u32);
+                LittleEndian::write_u32(&mut dinode_bytes[60..64], 0);
+            }
+            if let Some(ts) = mtime {
+                LittleEndian::write_u32(&mut dinode_bytes[72..76], ts as u32);
+                LittleEndian::write_u32(&mut dinode_bytes[76..80], 0);
+            }
+            // ctime is updated to "now" — use 0 for simplicity (caller may set).
+            // In production, this would use the current time.
+        })?;
+
+        self.mark_page_dirty(ino, inode.page_block)?;
+        self.commit_transaction()?;
+
+        Ok(())
+    }
+
+    /// fsync — flush a file's data and metadata to durable storage (writable builds only).
     #[cfg(feature = "writable")]
     pub fn fsync(&mut self, ino: u32) -> StorageResult<()> {
         let _ = self.begin_transaction()?;
@@ -727,6 +789,182 @@ impl Volume {
         self.commit_transaction()?;
 
         Ok(child_ino)
+    }
+
+    /// Create a directory in a parent directory.
+    ///
+    /// 1. Allocate inode.
+    /// 2. Initialize inode (directory mode, empty dtroot with `.` and `..`).
+    /// 3. Insert directory entry in parent.
+    /// 4. Increment parent's link count (for subdirectories).
+    /// 5. Commit.
+    #[cfg(feature = "writable")]
+    pub fn mkdir(&mut self, parent_ino: u32, name: &str) -> StorageResult<u32> {
+        let _ = self.begin_transaction()?;
+
+        // 1. Allocate a new inode.
+        let (child_ino, _child_block, _child_off) = self.allocate_inode()?;
+
+        // 2. Validate name length (JFS dtroot supports up to 11 u16 chars in a slot).
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        if name_u16.is_empty() || name_u16.len() > 11 {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid filename length".to_string()));
+        }
+
+        // 3. Initialize the child inode as a directory.
+        // Directory mode: S_IFDIR | 0755 = 0x41ED
+        // The dtroot is initialized with `.` (self) and `..` (parent) entries.
+        self.update_inode_page(child_ino, _child_block, _child_off, |dinode_bytes| {
+            // Set mode to directory (S_IFDIR | 0755 = 0x41ED)
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0x41ED);
+            // Set size to 0
+            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+            // Set nblocks to 0
+            LittleEndian::write_u64(&mut dinode_bytes[32..40], 0);
+            // Set nlink to 2 (for `.` and `..`)
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], 2);
+            // Set fileset and ino number for the child.
+            LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+
+            // Initialize the dtroot (inline directory B+-tree root, 288 bytes).
+            // The dtroot starts at offset 128 in the dinode.
+            let dtroot = &mut dinode_bytes[128..128 + 288];
+            // dtroot header layout (32 bytes, at offset 96 within the union = offset 128+96=224 in dinode):
+            //   Actually, dtroot_bytes() returns &self.u[96..], and u starts at offset 128.
+            //   So dtroot[0..24] is the DASD+header, dtroot[24..32] is stbl.
+            // The dtroot header:
+            //   bytes 0-15: DASD (dir table slot array, 16 bytes)
+            //   byte 16: flag (0x01 = BT_ROOT)
+            //   byte 17: nextindex
+            //   byte 18: freecnt
+            //   byte 19: freelist
+            //   bytes 20-23: idotdot (parent inode number)
+            //   bytes 24-31: stbl (sorted index table, 8 bytes)
+
+            // Set flag to BT_ROOT.
+            dtroot[16] = 0x01;
+            // nextindex = 2 (for `.` and `..` entries)
+            dtroot[17] = 2;
+            // freecnt = 0 (no free slots)
+            dtroot[18] = 0;
+            // freelist = 0
+            dtroot[19] = 0;
+            // idotdot = parent inode number (little-endian u32)
+            LittleEndian::write_u32(&mut dtroot[20..24], parent_ino);
+            // stbl: sorted index table. Entry 0 → slot 1, entry 1 → slot 2.
+            dtroot[24] = 1; // `.` → slot 1
+            dtroot[25] = 2; // `..` → slot 2
+
+            // Write `.` entry into slot 1 (offset 32 within dtroot).
+            // Slot format: next(1) cnt(1) name[15](30 bytes) index(4 bytes)
+            let dot_slot = &mut dtroot[32..64];
+            dot_slot[0] = 0; // next: no linked slot
+            dot_slot[1] = 1; // cnt: this entry uses 1 slot
+            // name: dot = [0x2E, 0x00] in UCS-2 (".")
+            dot_slot[2] = 0x2E; // '.'
+            dot_slot[3] = 0x00;
+            // index field (last 4 bytes of slot) — directory table index
+            LittleEndian::write_u32(&mut dot_slot[28..32], 0);
+
+            // Write `..` entry into slot 2 (offset 64 within dtroot).
+            let dotdot_slot = &mut dtroot[64..96];
+            dotdot_slot[0] = 0;
+            dotdot_slot[1] = 1;
+            // name: ".." = [0x2E, 0x2E, 0x00] in UCS-2
+            dotdot_slot[2] = 0x2E;
+            dotdot_slot[3] = 0x2E;
+            LittleEndian::write_u32(&mut dotdot_slot[28..32], 1);
+        })?;
+        self.mark_page_dirty(child_ino, _child_block)?;
+
+        // 4. Insert directory entry in parent.
+        let index = {
+            let parent = crate::inode::Inode::read(self, parent_ino)?;
+            let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+            dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+        };
+        let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
+        if !inserted {
+            self.abort_transaction();
+            return Err(StorageError::Other("directory entry already exists".to_string()));
+        }
+
+        // 5. Increment parent's link count (directories have subdirectory link count).
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.update_inode_page(parent_ino, parent.page_block, parent.page_offset, |dinode_bytes| {
+            let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
+        })?;
+
+        // 6. Commit.
+        self.commit_transaction()?;
+
+        Ok(child_ino)
+    }
+
+    /// Remove a directory (rmdir).
+    ///
+    /// 1. Look up entry in parent's dtroot.
+    /// 2. Verify child is a directory.
+    /// 3. Verify the directory is empty (only `.` and `..` entries).
+    /// 4. Remove the entry from parent.
+    /// 5. Free the child inode.
+    /// 6. Decrement parent's link count.
+    /// 7. Commit.
+    #[cfg(feature = "writable")]
+    pub fn rmdir(&mut self, parent_ino: u32, name: &str) -> StorageResult<bool> {
+        let _ = self.begin_transaction()?;
+
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+
+        // 1. Look up the child inode.
+        let child_ino = self.remove_dir_entry(parent_ino, &name_u16)?;
+
+        if child_ino.is_none() {
+            self.abort_transaction();
+            return Ok(false);
+        }
+
+        let child_ino = child_ino.unwrap();
+
+        // 2. Verify child is a directory.
+        let child = crate::inode::Inode::read(self, child_ino)?;
+        if !child.is_dir() {
+            self.abort_transaction();
+            return Err(StorageError::Other("not a directory".to_string()));
+        }
+
+        // 3. Verify the directory is empty (only `.` and `..`).
+        let dtree = crate::btree::dtree::Dtree::from_inode_data(child.dtroot_bytes())?;
+        let num_entries = dtree.len_entries();
+        if num_entries > 2 {
+            self.abort_transaction();
+            return Err(StorageError::Other("directory not empty".to_string()));
+        }
+
+        // 4. Free the child inode (set mode to 0 = unused).
+        self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
+            // Zero out the mode to mark as free.
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
+            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], 0);
+        })?;
+        self.mark_page_dirty(child_ino, child.page_block)?;
+
+        // 5. Decrement parent's link count.
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.update_inode_page(parent_ino, parent.page_block, parent.page_offset, |dinode_bytes| {
+            let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink - 1);
+        })?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
+
+        // 6. Commit.
+        self.commit_transaction()?;
+
+        Ok(true)
     }
 
     /// Remove (unlink) a directory entry by name.

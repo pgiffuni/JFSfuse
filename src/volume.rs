@@ -468,6 +468,8 @@ impl Volume {
         update: impl FnOnce(&mut [u8]),
     ) -> StorageResult<()> {
         let dinode_size = crate::types::Dinode::size();
+        // Ensure the page is in the cache.
+        let _ = self.page_cache.get_or_load(&*self.storage, ino, page_block, 0)?;
         let page = self
             .page_cache
             .get_mut_for_write(ino, page_block)
@@ -495,5 +497,185 @@ impl Volume {
         } else {
             Ok(fallback)
         }
+    }
+
+    /// Find the first free inode in the aggregate inode table.
+    /// Returns (inode_number, page_block, page_offset) for the first dinode
+    /// that has a zero mode (unused).
+    #[cfg(feature = "writable")]
+    fn allocate_inode(&mut self) -> StorageResult<(u32, u64, usize)> {
+        let pxd = &self.sb.s_ait2;
+        let table_start = pxd.address();
+        let table_len = pxd.length() as u64;
+        let max_scan = table_len + 32;
+
+        for block_offset in 0..max_scan {
+            let block_num = table_start + block_offset;
+            if block_num >= self.agg_size {
+                continue;
+            }
+            let data = self.storage.read_block(block_num)?;
+            for i in 0..crate::types::INOSPERPAGE {
+                let off = (i as usize) * crate::types::DISIZE;
+                if off + crate::types::DISIZE > data.len() {
+                    break;
+                }
+                let mode = LittleEndian::read_u32(&data[off + 52..off + 56]);
+                if mode == 0 {
+                    // Found a free inode. Its inode number is determined by
+                    // its position in the table. We compute a virtual ino.
+                    let ino = FILESYSTEM_I + (block_offset * crate::types::INOSPERPAGE as u64 + i as u64) as u32;
+                    return Ok((ino, block_num, off));
+                }
+            }
+        }
+
+        Err(StorageError::Other("no free inode found".to_string()))
+    }
+
+    /// Insert a directory entry for `child_ino` with the given name in the
+    /// directory at `parent_ino`. The parent's inode page is updated and
+    /// marked dirty. Does NOT commit the transaction — the caller must do so.
+    #[cfg(feature = "writable")]
+    fn insert_dir_entry(
+        &mut self,
+        parent_ino: u32,
+        name: &[u16],
+        child_ino: u32,
+        index: u32,
+    ) -> StorageResult<bool> {
+        let inode = crate::inode::Inode::read(self, parent_ino)?;
+        let mut dtree = crate::btree::dtree::Dtree::from_inode_data(inode.dtroot_bytes())?;
+        let inserted = dtree.insert(name, child_ino, index)?;
+
+        if inserted {
+            let dt_bytes = dtree.to_bytes().to_vec();
+            self.update_inode_page(parent_ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                let dt_off = crate::types::Dinode::size() - dt_bytes.len();
+                dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
+            })?;
+        }
+
+        Ok(inserted)
+    }
+
+    /// Remove a directory entry by name from the directory at `parent_ino`.
+    /// Returns the child inode number if found. Does NOT commit.
+    #[cfg(feature = "writable")]
+    fn remove_dir_entry(&mut self, parent_ino: u32, name: &[u16]) -> StorageResult<Option<u32>> {
+        let inode = crate::inode::Inode::read(self, parent_ino)?;
+        let mut dtree = crate::btree::dtree::Dtree::from_inode_data(inode.dtroot_bytes())?;
+        let removed = dtree.remove(name)?;
+
+        if removed.is_some() {
+            let dt_bytes = dtree.to_bytes().to_vec();
+            self.update_inode_page(parent_ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                let dt_off = crate::types::Dinode::size() - dt_bytes.len();
+                dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
+            })?;
+        }
+
+        Ok(removed)
+    }
+
+    /// Create a regular file in a directory.
+    ///
+    /// Follows the Phase 8 plan:
+    /// 1. Allocate inode
+    /// 2. Initialize inode (regular file, empty)
+    /// 3. Insert directory entry
+    /// 4. Update parent metadata (link count, timestamps)
+    /// 5. Commit
+    #[cfg(feature = "writable")]
+    pub fn create_file(&mut self, parent_ino: u32, name: &str) -> StorageResult<u32> {
+        let _ = self.begin_transaction()?;
+
+        // 1. Allocate a new inode.
+        let (child_ino, _child_block, _child_off) = self.allocate_inode()?;
+
+        // 2. Initialize the new inode (zero-mode dinode is already free;
+        //    write a minimal regular file dinode).
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        if name_u16.is_empty() || name_u16.len() > 11 {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid filename length".to_string()));
+        }
+
+        // Initialize the child inode: regular file mode (0x81a4), empty size.
+        self.update_inode_page(child_ino, _child_block, _child_off, |dinode_bytes| {
+            // Set mode to regular file (S_IFREG | 0644 = 0x81a4)
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0x81a4);
+            // Set size to 0
+            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+            // Set nblocks to 0
+            LittleEndian::write_u64(&mut dinode_bytes[32..40], 0);
+            // Set nlink to 1
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
+        })?;
+        self.mark_page_dirty(child_ino, _child_block)?;
+
+        // 3. Insert directory entry in parent.
+        let index = {
+            let parent = crate::inode::Inode::read(self, parent_ino)?;
+            let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+            dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+        };
+        let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
+        if !inserted {
+            self.abort_transaction();
+            return Err(StorageError::Other("directory entry already exists".to_string()));
+        }
+
+        // 4. Update parent link count (directories have link counts; regular
+        //    files don't, but we mark the parent page dirty regardless).
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
+
+        // 5. Commit.
+        self.commit_transaction()?;
+
+        Ok(child_ino)
+    }
+
+    /// Remove (unlink) a directory entry by name.
+    ///
+    /// 1. Look up entry in parent's dtroot.
+    /// 2. Remove entry.
+    /// 3. Free child inode (mark as unused).
+    /// 4. Update parent metadata.
+    /// 5. Commit.
+    #[cfg(feature = "writable")]
+    pub fn unlink_file(&mut self, parent_ino: u32, name: &str) -> StorageResult<bool> {
+        let _ = self.begin_transaction()?;
+
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+
+        // 1. Look up and remove the entry.
+        let child_ino = self.remove_dir_entry(parent_ino, &name_u16)?;
+
+        if child_ino.is_none() {
+            self.abort_transaction();
+            return Ok(false);
+        }
+
+        let child_ino = child_ino.unwrap();
+
+        // 2. Free the child inode (set mode to 0 = unused).
+        let child = crate::inode::Inode::read(self, child_ino)?;
+        self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
+            // Zero out the mode to mark as free.
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
+            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+        })?;
+        self.mark_page_dirty(child_ino, child.page_block)?;
+
+        // 3. Mark parent dirty (dtroot already updated via remove_dir_entry).
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
+
+        // 4. Commit.
+        self.commit_transaction()?;
+
+        Ok(true)
     }
 }

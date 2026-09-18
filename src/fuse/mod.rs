@@ -148,13 +148,15 @@ impl FuseFs {
     }
 
     /// Create a file (write-supported, gated behind `writable`).
+    ///
+    /// Allocates a new inode, inserts a directory entry in the parent,
+    /// and returns the new inode number.
     #[cfg(feature = "writable")]
-    pub fn create(&mut self, parent_ino: u32, name: &str, mode: u32) -> Option<u32> {
+    pub fn create(&mut self, parent_ino: u32, name: &str, _mode: u32) -> Option<u32> {
         if !self.writable {
             return None;
         }
-        let _ = (parent_ino, name, mode);
-        None
+        self.volume.create_file(parent_ino, name).ok()
     }
 
     /// Write data to an open file (write-supported, gated behind `writable`).
@@ -194,11 +196,10 @@ impl FuseFs {
 
     /// Remove a file (write-supported, gated behind `writable`).
     #[cfg(feature = "writable")]
-    pub fn unlink(&mut self, parent_ino: u32, name: &str) -> Option<()> {
+    pub fn unlink(&mut self, parent_ino: u32, name: &str) -> Option<bool> {
         if !self.writable {
             return None;
         }
-        let _ = (parent_ino, name);
-        None
+        Some(self.volume.unlink_file(parent_ino, name).unwrap_or(false))
     }
 }

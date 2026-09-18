@@ -9,7 +9,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use jfsfuse::journal::LogManager;
 use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
 use jfsfuse::transaction::TransactionManager;
-use jfsfuse::types::{LOGMAGIC, LOGPSIZE, LOG_UPDATEMAP, LOGVERSION, LOGWRAP, LOGPAGES};
+use jfsfuse::types::{LOGMAGIC, LOGPSIZE, LOG_REDOPAGE, LOG_INODE, LOGVERSION, LOGWRAP, LOGPAGES};
 
 const NUM_BLOCKS: u64 = 20;
 
@@ -61,13 +61,18 @@ fn test_journal_survives_restart() {
     assert_eq!(logtid, txid as u32);
 
     let rec_type = LittleEndian::read_u16(&log_bytes[8..10]);
-    assert_eq!(rec_type, LOG_UPDATEMAP);
+    assert_eq!(rec_type, LOG_REDOPAGE);
 
     let length = LittleEndian::read_u16(&log_bytes[10..12]);
     assert_eq!(length as usize, BLOCK_SIZE);
 
-    let redo_inode = LittleEndian::read_u32(&log_bytes[20..24]);
-    assert_eq!(redo_inode, block as u32);
+    let redopage_type = LittleEndian::read_u16(&log_bytes[24..26]);
+    assert_eq!(redopage_type, LOG_INODE);
+
+    // Block number is stored in the redopage_pxd (PXD address field).
+    // PXD addr2 is at LRD offset 28+4 = [32..36].
+    let pxd_addr2 = LittleEndian::read_u32(&log_bytes[32..36]);
+    assert_eq!(pxd_addr2, block as u32);
 
     // Verify page data in log matches what was written.
     let page_data = &log_bytes[36..36 + BLOCK_SIZE];

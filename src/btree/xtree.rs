@@ -6,7 +6,7 @@
 //!
 //! Root can be inline in the inode (`xtroot_t`) or in external pages (`xtpage_t`).
 
-use crate::storage::{BLOCK_SIZE, NullStorage, Result as StorageResult, Storage};
+use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
 use crate::types::{BlockLength, BlockNo, Pxd, XTENTRYSTART, XTROOTMAXSLOT, Xad, XadFlag, XtRoot};
 
 /// An extent in the file's block map.
@@ -22,10 +22,6 @@ pub struct Extent {
 pub struct Xtree {
     /// Root is inline in the inode (xtroot_t).
     root: XtRoot,
-    /// Storage backend for external pages.
-    storage: Box<dyn Storage>,
-    /// Block number of the inode (for page I/O).
-    inode_block: u64,
 }
 
 impl Xtree {
@@ -38,12 +34,7 @@ impl Xtree {
         }
 
         let root = Self::parse_xtroot(&data[..])?;
-        let storage: Box<dyn Storage> = Box::new(crate::storage::NullStorage);
-        Ok(Self {
-            root,
-            storage,
-            inode_block: 0,
-        })
+        Ok(Self { root })
     }
 
     fn parse_xtroot(data: &[u8]) -> StorageResult<XtRoot> {
@@ -203,6 +194,109 @@ impl Xtree {
     pub fn next_index(&self) -> usize {
         self.root.header.nextindex() as usize
     }
+
+    /// Serialize the XtRoot back to its on-disk byte representation.
+    ///
+    /// The on-disk format has the xtheader (32 bytes) at the start, with
+    /// xad entries beginning at offset 32 (overlapping the first 2 slots
+    /// that are part of the header). Returns 288 bytes matching
+    /// `Dinode::xtroot_bytes()` length.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; 288];
+
+        // Header (32 bytes on-disk, but XtHeader is 24 bytes — the extra
+        // 8 bytes come from alignment in the packed layout).
+        buf[0..8].copy_from_slice(&self.root.header.next);
+        buf[8..16].copy_from_slice(&self.root.header.prev);
+        buf[16] = self.root.header.flag;
+        buf[17] = self.root.header.rsrvd1;
+        buf[18..20].copy_from_slice(&self.root.header.nextindex);
+        buf[20..22].copy_from_slice(&self.root.header.maxentry);
+        buf[22..24].copy_from_slice(&self.root.header.rsrvd2);
+        buf[24..28].copy_from_slice(&self.root.header.self_pxd.len_addr);
+        buf[28..32].copy_from_slice(&self.root.header.self_pxd.addr2);
+
+        // Xad entries starting at offset 32 in the data, stored at indices
+        // XTENTRYSTART..XTROOTMAXSLOT in the xad array.
+        let xad_base = 32;
+        for i in 0..XTROOTMAXSLOT.saturating_sub(XTENTRYSTART) {
+            let idx = XTENTRYSTART + i;
+            if idx >= XTROOTMAXSLOT {
+                break;
+            }
+            let xad = &self.root.xad[idx];
+            let base = xad_base + i * 16;
+            if base + 16 > buf.len() {
+                break;
+            }
+            buf[base] = xad.flag;
+            buf[base + 1..base + 3].copy_from_slice(&xad.rsvrd);
+            buf[base + 3] = xad.off1;
+            buf[base + 4..base + 8].copy_from_slice(&xad.off2);
+            buf[base + 8..base + 12].copy_from_slice(&xad.loc.len_addr);
+            buf[base + 12..base + 16].copy_from_slice(&xad.loc.addr2);
+        }
+
+        buf
+    }
+
+    /// Insert a new extent into the xtroot.
+    ///
+    /// If the last extent is contiguous (same physical address range),
+    /// it is extended in place. Otherwise, a new xad entry is appended.
+    /// Returns true if the extent was inserted/extended, false if the
+    /// xtroot is full and needs an external page (not yet implemented).
+    pub fn insert_extent(&mut self, logical_offset: i64, length: u32, physical_addr: u64) -> bool {
+        let next_idx = self.root.header.nextindex();
+
+        // Check if we can extend the last extent (contiguous physical blocks).
+        if next_idx > XTENTRYSTART as u16 {
+            let last_idx = (next_idx - 1) as usize;
+            if last_idx >= XTROOTMAXSLOT {
+                return false;
+            }
+            let last = &self.root.xad[last_idx];
+            let last_offset = last.offset();
+            let last_length = last.length();
+            let last_addr = last.address();
+
+            // Check if this is a contiguous extension of the last extent.
+            if last_offset as i64 + last_length as i64 == logical_offset
+                && last_addr + last_length as u64 == physical_addr
+            {
+                self.root.xad[last_idx].set_length(last_length + length);
+                return true;
+            }
+        }
+
+        // Need a new slot.
+        if next_idx as usize >= XTROOTMAXSLOT {
+            return false;
+        }
+
+        let idx = next_idx as usize;
+        let xad = &mut self.root.xad[idx];
+        xad.set_offset(logical_offset);
+        xad.set_length(length);
+        xad.set_address(physical_addr);
+        xad.set_flag(XadFlag::XAD_NEW);
+
+        self.root.header.set_nextindex(next_idx + 1);
+        true
+    }
+
+    /// Replace an extent at the given index.
+    pub fn set_extent(&mut self, idx: usize, logical_offset: i64, length: u32, physical_addr: u64) -> bool {
+        if idx < XTENTRYSTART || idx >= XTROOTMAXSLOT {
+            return false;
+        }
+        let xad = &mut self.root.xad[idx];
+        xad.set_offset(logical_offset);
+        xad.set_length(length);
+        xad.set_address(physical_addr);
+        xad.set_flag(XadFlag::XAD_NEW);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +351,100 @@ mod tests {
         let data = vec![0u8; 30];
         let result = Xtree::from_inode_data(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_xtree_to_bytes_roundtrip() {
+        let mut data = vec![0u8; 288];
+        // Set up an xtroot with one extent.
+        data[16] = 0x01; // flag: BT_ROOT
+        data[18..20].copy_from_slice(&3u16.to_le_bytes()); // nextindex = 3
+        data[20..22].copy_from_slice(&18u16.to_le_bytes()); // maxentry = 18
+
+        // First xad at offset 32 (index XTENTRYSTART=2)
+        // offset = 0, length = 10, address = 100
+        data[32] = 0; // flag
+        data[40..44].copy_from_slice(&10u32.to_le_bytes()); // loc.len_addr (length=10)
+        data[44..48].copy_from_slice(&100u32.to_le_bytes()); // loc.addr2 (address=100)
+
+        let xt = Xtree::from_inode_data(&data).unwrap();
+        let bytes = xt.to_bytes();
+
+        // The serialized bytes should match the original (for this simple case).
+        assert_eq!(bytes.len(), 288);
+        assert_eq!(bytes[16], 0x01);
+        assert_eq!(bytes[18..20], 3u16.to_le_bytes());
+        assert_eq!(bytes[20..22], 18u16.to_le_bytes());
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 100);
+
+        // Round-trip: parse the serialized bytes back.
+        let xt2 = Xtree::from_inode_data(&bytes).unwrap();
+        assert_eq!(xt2.next_index(), xt.next_index());
+    }
+
+    #[test]
+    fn test_xtree_insert_extent() {
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01; // BT_ROOT
+        data[18..20].copy_from_slice(&2u16.to_le_bytes()); // nextindex = 2 (no entries yet)
+        data[20..22].copy_from_slice(&18u16.to_le_bytes()); // maxentry = 18
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+        assert_eq!(xt.next_index(), 2);
+
+        // Insert first extent: logical offset 0, length 5, physical addr 1000.
+        let result = xt.insert_extent(0, 5, 1000);
+        assert!(result);
+        assert_eq!(xt.next_index(), 3);
+
+        // Verify lookup finds it.
+        let ext = xt.lookup(0).unwrap().unwrap();
+        assert_eq!(ext.offset, 0);
+        assert_eq!(ext.length, 5);
+        assert_eq!(ext.address, 1000);
+
+        // Insert second extent: contiguous with first (same physical address).
+        let result = xt.insert_extent(5, 3, 1005);
+        assert!(result);
+        assert_eq!(xt.next_index(), 3); // Should have extended, not added new
+
+        // Verify the first extent was extended.
+        let ext = xt.lookup(0).unwrap().unwrap();
+        assert_eq!(ext.length, 8);
+
+        // Insert non-contiguous extent.
+        let result = xt.insert_extent(10, 2, 2000);
+        assert!(result);
+        assert_eq!(xt.next_index(), 4);
+
+        // Verify lookup by offset.
+        let ext = xt.lookup(10).unwrap().unwrap();
+        assert_eq!(ext.offset, 10);
+        assert_eq!(ext.length, 2);
+        assert_eq!(ext.address, 2000);
+    }
+
+    #[test]
+    fn test_xtree_set_extent() {
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01;
+        data[18..20].copy_from_slice(&4u16.to_le_bytes()); // nextindex = 4 (2 entries)
+        data[20..22].copy_from_slice(&18u16.to_le_bytes());
+
+        // First xad at index 2
+        data[32] = 0;
+        data[40..44].copy_from_slice(&10u32.to_le_bytes()); // length=10
+        data[44..48].copy_from_slice(&100u32.to_le_bytes()); // address=100
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+
+        // Replace extent at index 2.
+        let result = xt.set_extent(2, 0, 20, 200);
+        assert!(result);
+
+        let ext = xt.lookup(0).unwrap().unwrap();
+        assert_eq!(ext.length, 20);
+        assert_eq!(ext.address, 200);
     }
 }

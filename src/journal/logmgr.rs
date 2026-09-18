@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::storage::{BLOCK_SIZE, FileStorage, Result as StorageResult, Storage};
+use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
 use crate::types::{
     LOGMAGIC, LOGPSIZE, LOGREDONE, LOGVERSION, LOGWRAP, LogSuper, Logpage, MAX_ACTIVE,
 };
@@ -45,6 +45,10 @@ pub struct LogManager {
     inline: bool,
     /// Current write offset within the log data area (in bytes).
     write_offset: u64,
+    /// Byte offset of the previous log record within the log data area.
+    /// Used to set `backchain` in the next record. 0 = no previous record
+    /// (first in a transaction). After a commit, reset to 0.
+    prev_record_offset: u64,
     /// Buffered log data currently being filled. Spans two log pages so
     /// that a single LRD + 4096-byte metadata block fits without crossing
     /// a page boundary mid-record.
@@ -76,6 +80,7 @@ impl LogManager {
             log_id: String::new(),
             inline,
             write_offset: 0,
+            prev_record_offset: 0,
             log_buffer: vec![0u8; LOG_BUFFER_SIZE],
             buffer_dirty: false,
             log_pages,
@@ -256,8 +261,12 @@ impl LogManager {
     /// Append a log record for a metadata block update.
     ///
     /// Serializes an LRD (log record descriptor) followed by the page data,
-    /// writing it into the current log buffer. If the current buffer is
-    /// full, it is flushed and a new buffer segment is started.
+    /// writing it into the current log buffer. Records within the same
+    /// transaction are chained via `backchain`, which stores the byte
+    /// offset of the previous record (0 for the first record).
+    ///
+    /// If the current buffer is full, it is flushed and a new buffer
+    /// segment is started.
     pub fn append_log_record(
         &mut self,
         txid: u64,
@@ -286,27 +295,84 @@ impl LogManager {
         let mut lrd = crate::types::Lrd::default();
         // logtid: transaction ID
         LittleEndian::write_u32(&mut lrd.logtid, txid as u32);
-        // backchain: 0 = last record in transaction
-        LittleEndian::write_u32(&mut lrd.backchain, 0);
-        // type: LOG_UPDATEMAP (0x0008) — metadata update record
-        LittleEndian::write_u16(&mut lrd.r#type, crate::types::LOG_UPDATEMAP);
+        // backchain: offset of previous record in this transaction (0 if first)
+        LittleEndian::write_u32(&mut lrd.backchain, self.prev_record_offset as u32);
+        // type: LOG_REDOPAGE (0x0800) — metadata after-image record
+        LittleEndian::write_u16(&mut lrd.r#type, crate::types::LOG_REDOPAGE);
         // length: data payload size
         LittleEndian::write_u16(&mut lrd.length, data.len() as u16);
         // aggregate: 0 (single aggregate)
         LittleEndian::write_u32(&mut lrd.aggregate, 0);
-        // redopage_inode: the target block number as a u32
-        LittleEndian::write_u32(&mut lrd.redopage_inode, block as u32);
+        // redopage_type: LOG_INODE (inode metadata)
+        LittleEndian::write_u16(&mut lrd.redopage_type, crate::types::LOG_INODE);
+        // redopage_pxd: encode the block number as on-disk page location
+        lrd.redopage_pxd.set_address(block);
+        // Set length to 1 block (4KB / 4KB = 1 fsblock)
+        lrd.redopage_pxd.set_length(1);
 
         // Write LRD into the buffer.
         let buf_off = offset_in_buf as usize;
-        self.log_buffer[buf_off..buf_off + 36].copy_from_slice(&lrd_bytes(&lrd));
+        self.log_buffer[buf_off..buf_off + LRD_SIZE].copy_from_slice(&lrd_bytes(&lrd));
         self.buffer_dirty = true;
 
         // Write data after the LRD.
-        let data_off = buf_off + 36;
+        let data_off = buf_off + LRD_SIZE;
         self.log_buffer[data_off..data_off + data.len()].copy_from_slice(data);
 
+        // Record offset for backchain chaining.
+        let record_offset = self.write_offset;
         self.write_offset += record_total;
+        self.prev_record_offset = record_offset;
+
+        Ok(())
+    }
+
+    /// Append a LOG_COMMIT record to end the current transaction.
+    ///
+    /// This writes a zero-length commit record with backchain pointing
+    /// to the last data record (or 0 if no data records), then flushes
+    /// the journal to durable storage.
+    pub fn commit_transaction(&mut self, txid: u64) -> StorageResult<()> {
+        use byteorder::{ByteOrder, LittleEndian};
+
+        let buf_size = LOG_BUFFER_SIZE as u64;
+        let offset_in_buf = self.write_offset % buf_size;
+
+        // If the LRD won't fit, flush first.
+        if offset_in_buf + LRD_SIZE as u64 > buf_size {
+            self.flush_journal()?;
+            self.log_buffer.fill(0);
+            self.buffer_dirty = false;
+            self.write_offset =
+                ((self.write_offset + buf_size - 1) / buf_size) * buf_size;
+        }
+
+        let offset_in_buf = self.write_offset % buf_size;
+
+        // Build the COMMIT LRD.
+        let mut lrd = crate::types::Lrd::default();
+        LittleEndian::write_u32(&mut lrd.logtid, txid as u32);
+        // backchain: offset of last record, or 0 if this is the only record
+        LittleEndian::write_u32(&mut lrd.backchain, self.prev_record_offset as u32);
+        // type: LOG_COMMIT (0x8000)
+        LittleEndian::write_u16(&mut lrd.r#type, crate::types::LOG_COMMIT);
+        // length: 0 (no data for commit)
+        LittleEndian::write_u16(&mut lrd.length, 0);
+        // aggregate: 0
+        LittleEndian::write_u32(&mut lrd.aggregate, 0);
+
+        // Write LRD into the buffer.
+        let buf_off = offset_in_buf as usize;
+        self.log_buffer[buf_off..buf_off + LRD_SIZE].copy_from_slice(&lrd_bytes(&lrd));
+        self.buffer_dirty = true;
+
+        self.write_offset += LRD_SIZE as u64;
+
+        // Flush everything to durable storage.
+        self.flush_journal()?;
+
+        // Reset backchain tracking for the next transaction.
+        self.prev_record_offset = 0;
 
         Ok(())
     }

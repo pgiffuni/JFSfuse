@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Phase 6: Write operations on a JFS filesystem image.
+//!
+//! Loads the test image into MemoryStorage (a writable backend) and verifies:
+//! - `write_at` can overwrite existing data blocks within a file
+//! - `truncate` can change the file size
+//! - `fsync` triggers a journal commit
+//!
+//! Requires the test image at `/tmp/kilo/test_jfs.img`.
+//! Runs only with `cargo test --features writable`.
+
+use std::sync::Arc;
+
+use jfsfuse::fuse::FuseFs;
+use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+use jfsfuse::volume::Volume;
+
+/// Load the test image into a writable MemoryStorage-backed Volume.
+fn load_image_to_memory() -> Option<Volume> {
+    let path = "/tmp/kilo/test_jfs.img";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
+        return None;
+    }
+
+    let data = std::fs::read(path).ok()?;
+    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+    let mem = MemoryStorage::new(num_blocks);
+
+    let storage: Arc<dyn Storage> = Arc::new(mem);
+
+    let vol_blocks = data.len() / BLOCK_SIZE as usize;
+    for i in 0..vol_blocks {
+        let start = i * BLOCK_SIZE as usize;
+        let end = start + BLOCK_SIZE as usize;
+        let _ = storage.write_block(i as u64, &data[start..end]);
+    }
+
+    let vol = Volume::open_from_storage(storage).expect("should mount JFS image from memory");
+    Some(vol)
+}
+
+/// Find the first non-dot file entry in the root directory.
+fn find_test_file(fs: &mut FuseFs) -> Option<u32> {
+    let entries = fs.readdir(fs.volume.root_ino, 0)?;
+    entries
+        .iter()
+        .find(|(name, _, _)| name != "." && name != ".." && !name.is_empty())
+        .map(|(_, ino, _)| *ino)
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_write_at_overwrites_existing_blocks() {
+    let vol = match load_image_to_memory() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let ino = match find_test_file(&mut fs) {
+        Some(i) => i,
+        None => {
+            eprintln!("no test file found in root directory");
+            return;
+        }
+    };
+
+    // Read existing data at offset 0.
+    let before = fs.read(ino, 0, 32).expect("should read file");
+    assert!(!before.is_empty(), "file should have data");
+
+    // Modify bytes at offset 0.
+    let old_byte = before[0];
+    let new_byte = if old_byte == 0xFF { 0x01 } else { old_byte + 1 };
+    let write_data = [new_byte, b'W', b'R', b'I', b'T', b'E', b'_', b'O'];
+
+    let written = fs.write(ino, 0, &write_data);
+    assert!(written.is_some(), "write should return Some");
+    assert_eq!(written.unwrap(), 8, "should write 8 bytes");
+
+    // Read back and verify.
+    let after = fs.read(ino, 0, 32).expect("should read file after write");
+    assert_eq!(after[0], new_byte, "byte 0 mismatch");
+    assert_eq!(&after[1..8], b"WRITE_O", "bytes 1-7 mismatch");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_truncate_changes_size() {
+    let vol = match load_image_to_memory() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let ino = match find_test_file(&mut fs) {
+        Some(i) => i,
+        None => return,
+    };
+
+    let before_data = fs.read(ino, 0, BLOCK_SIZE).expect("should read file");
+    let before_size = before_data.len() as u64;
+    assert!(before_size > 0, "file should have non-zero size before truncate");
+
+    let new_size = std::cmp::max(1, before_size / 2);
+    let result = fs.truncate(ino, new_size);
+    assert!(result.is_some(), "truncate should return Some on success");
+
+    // Verify the file's size attribute changed.
+    let dinode = fs.getattr(ino).expect("should getattr after truncate");
+    let after_size = u64::from_le_bytes(dinode.di_size);
+    assert_eq!(
+        after_size, new_size,
+        "inode size should be {} after truncate",
+        new_size
+    );
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_fsync_succeeds() {
+    let vol = match load_image_to_memory() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let ino = match find_test_file(&mut fs) {
+        Some(i) => i,
+        None => return,
+    };
+
+    let result = fs.flush(ino);
+    assert!(result.is_some(), "fsync should return Some on success");
+    assert!(result.is_some(), "fsync should return Some on success");
+
+    // Verify a transaction was committed.
+    let txid = fs.volume.tx_mgr.current_txid();
+    assert!(txid.is_some(), "transaction should be committed after fsync");
+}

@@ -312,6 +312,11 @@ impl<'a> LogReader<'a> {
     pub fn new(log_storage: &'a dyn Storage, logsuper: &LogSuper, log_start: u64) -> Self {
         let log_size = logsuper.page_size() as u64;
         let log_end = logsuper.end() as u64;
+        let pos = if log_end > 0 {
+            log_start + log_end
+        } else {
+            log_start
+        };
         Self {
             log_storage,
             log_end,
@@ -319,7 +324,7 @@ impl<'a> LogReader<'a> {
             log_data_start: log_start,
             log_size,
             wrapped: false,
-            pos: log_end,
+            pos,
         }
     }
 
@@ -328,56 +333,41 @@ impl<'a> LogReader<'a> {
         self.log_start = syncpt_addr;
     }
 
-    /// Read the next log record descriptor (backward).
+    /// Read the next log record forward, returning the LRD and data.
     ///
-    /// This reads backward from the current position, finding the start
-    /// of the next `lrd` + data record. Returns the LRD and the data bytes.
-    pub fn next_backward(&mut self) -> StorageResult<Option<(Lrd, Vec<u8>)>> {
-        if self.pos <= self.log_data_start {
+    /// Log records are laid out as `[LRD (36 bytes)][data (lrd.length bytes)]`.
+    /// This method reads forward from the current position, advancing `pos`
+    /// past the entire record.
+    pub fn next_forward(&mut self) -> StorageResult<Option<(Lrd, Vec<u8>)>> {
+        if self.pos >= self.log_data_start + self.log_size * (LOGPSIZE as u64) {
             return Ok(None);
         }
 
-        // We need to read backward. The log record format is: [data][lrd]
-        // Records are packed sequentially. We read backward by:
-        // 1. Read the lrd from just before the end of the current record
-        // 2. Use lrd.length to find the start of the data
-
-        // Simplified approach: we read forward from the syncpt to the end,
-        // collecting records, then process them backward.
-        // A more efficient implementation would traverse backward directly.
-
-        if self.pos < (self.log_data_start + 4) {
+        // Check for zero page (end of written records).
+        let peek = self.log_storage.read_bytes(self.pos, 4)?;
+        if peek.len() < 4 || (peek[0] == 0 && peek[1] == 0 && peek[2] == 0 && peek[3] == 0) {
             return Ok(None);
         }
 
-        self.pos = self.pos.saturating_sub(4);
-        let lrd_bytes = self.log_storage.read_bytes(self.pos, 36)?;
-
-        let mut lrd = Lrd::default();
-        if lrd_bytes.len() >= 36 {
-            lrd.logtid = [lrd_bytes[0], lrd_bytes[1], lrd_bytes[2], lrd_bytes[3]];
-            lrd.backchain = [lrd_bytes[4], lrd_bytes[5], lrd_bytes[6], lrd_bytes[7]];
-            lrd.r#type = [lrd_bytes[8], lrd_bytes[9]];
-            lrd.length = [lrd_bytes[10], lrd_bytes[11]];
-            lrd.aggregate = [lrd_bytes[12], lrd_bytes[13], lrd_bytes[14], lrd_bytes[15]];
-            lrd.redopage_fileset = [lrd_bytes[16], lrd_bytes[17], lrd_bytes[18], lrd_bytes[19]];
-            lrd.redopage_inode = [lrd_bytes[20], lrd_bytes[21], lrd_bytes[22], lrd_bytes[23]];
-            lrd.redopage_type = [lrd_bytes[24], lrd_bytes[25]];
-            lrd.redopage_l2linesize = [lrd_bytes[26], lrd_bytes[27]];
-            lrd.redopage_pxd.len_addr =
-                [lrd_bytes[28], lrd_bytes[29], lrd_bytes[30], lrd_bytes[31]];
-            lrd.redopage_pxd.addr2 = [lrd_bytes[32], lrd_bytes[33], lrd_bytes[34], lrd_bytes[35]];
-        }
-
-        let rec_len = lrd.length() as u64;
-        let data_start = self.pos.saturating_sub(rec_len);
-
-        if data_start < self.log_data_start {
+        // Read the LRD.
+        let lrd_bytes = self.log_storage.read_bytes(self.pos, LRD_SIZE)?;
+        if lrd_bytes.len() < LRD_SIZE {
             return Ok(None);
         }
 
-        let data = self.log_storage.read_bytes(data_start, rec_len as usize)?;
-        self.pos = data_start;
+        let lrd = parse_lrd(&lrd_bytes);
+
+        let data_len = lrd.length() as u64;
+        let data_start = self.pos + LRD_SIZE as u64;
+        let data = if data_len > 0 {
+            self.log_storage.read_bytes(data_start, data_len as usize)?
+        } else {
+            Vec::new()
+        };
+
+        // Advance past LRD + data, rounded up to 4-byte boundary.
+        let rec_total = ((LRD_SIZE as u64 + data_len + 3) / 4) * 4;
+        self.pos += rec_total;
 
         Ok(Some((lrd, data)))
     }
@@ -385,8 +375,8 @@ impl<'a> LogReader<'a> {
     /// Scan forward to find the actual end of log (findEndOfLog).
     /// Returns the byte offset of the last valid record.
     pub fn find_end(&mut self) -> StorageResult<u64> {
-        let mut pos = self.log_data_start + (LOGPSIZE as u64);
         let log_total_bytes = self.log_size * (LOGPSIZE as u64);
+        let mut pos = self.log_data_start;
 
         loop {
             if pos >= self.log_data_start + log_total_bytes {
@@ -394,18 +384,19 @@ impl<'a> LogReader<'a> {
             }
 
             let lrd_bytes = self.log_storage.read_bytes(pos, 4)?;
-
-            // Check for empty/zero page (end of written records)
-            if lrd_bytes[0] == 0 && lrd_bytes[1] == 0 && lrd_bytes[2] == 0 && lrd_bytes[3] == 0 {
+            if lrd_bytes.len() < 4
+                || (lrd_bytes[0] == 0 && lrd_bytes[1] == 0 && lrd_bytes[2] == 0 && lrd_bytes[3] == 0)
+            {
                 break;
             }
 
-            // Read full lrd
-            let lrd_full = self.log_storage.read_bytes(pos, 36)?;
-            let length = LittleEndian::read_u16(&[lrd_full[10], lrd_full[11]]) as u64;
-
-            // Round up to 4-byte boundary
-            let rec_total = ((length + 36 + 3) / 4) * 4;
+            let lrd_full = self.log_storage.read_bytes(pos, LRD_SIZE)?;
+            if lrd_full.len() < LRD_SIZE {
+                break;
+            }
+            let lrd = parse_lrd(&lrd_full);
+            let length = lrd.length() as u64;
+            let rec_total = ((LRD_SIZE as u64 + length + 3) / 4) * 4;
             pos += rec_total;
         }
 
@@ -423,6 +414,26 @@ impl<'a> LogReader<'a> {
     pub fn set_wrapped(&mut self) {
         self.wrapped = true;
     }
+}
+
+const LRD_SIZE: usize = 36;
+
+fn parse_lrd(buf: &[u8]) -> Lrd {
+    let mut lrd = Lrd::default();
+    if buf.len() >= LRD_SIZE {
+        lrd.logtid = buf[0..4].try_into().unwrap();
+        lrd.backchain = buf[4..8].try_into().unwrap();
+        lrd.r#type = buf[8..10].try_into().unwrap();
+        lrd.length = buf[10..12].try_into().unwrap();
+        lrd.aggregate = buf[12..16].try_into().unwrap();
+        lrd.redopage_fileset = buf[16..20].try_into().unwrap();
+        lrd.redopage_inode = buf[20..24].try_into().unwrap();
+        lrd.redopage_type = buf[24..26].try_into().unwrap();
+        lrd.redopage_l2linesize = buf[26..28].try_into().unwrap();
+        lrd.redopage_pxd.len_addr = buf[28..32].try_into().unwrap();
+        lrd.redopage_pxd.addr2 = buf[32..36].try_into().unwrap();
+    }
+    lrd
 }
 
 // ──────────────────────── XOR integrity validation ────────────────────────
@@ -542,55 +553,70 @@ impl JournalRecovery {
             self.logsuper.end()
         );
 
-        let mut reader = LogReader::new(log_storage, &self.logsuper, log_data_start);
-
+        // Determine the end of log data.
         let log_end = if self.logsuper.end() > 0 {
             self.logsuper.end() as u64
         } else {
+            let mut reader = LogReader::new(log_storage, &self.logsuper, log_data_start);
             reader.find_end()?
         };
 
-        // Scan forward to find syncpt (stop point for backward replay)
-        let syncpt_addr = self.find_syncpt(log_storage, log_data_start, log_end)?;
-        if syncpt_addr > 0 {
-            reader.set_syncpt(syncpt_addr);
-        }
+        // Phase 1: Forward scan — collect all log records in order.
+        let mut reader = LogReader::new(log_storage, &self.logsuper, log_data_start);
+        reader.pos = log_data_start;
+        let mut records: Vec<(Lrd, Vec<u8>)> = Vec::new();
 
-        // Phase 1: Backward replay — encounter commit records first,
-        // then apply REDOPAGE records for committed transactions.
-        let mut last_addr = syncpt_addr;
-
-        while reader.pos > reader.log_data_start {
-            // Backward traversal — read previous record
-            match reader.next_backward()? {
+        loop {
+            match reader.next_forward()? {
                 Some((lrd, data)) => {
-                    // Check for wrap-around
-                    if reader.pos > log_end && !reader.wrapped() {
-                        reader.set_wrapped();
-                        log::warn!("log wrapped during recovery");
-                    }
-
-                    self.process_record(&lrd, &data, fs_storage, last_addr)?;
-
-                    // If this is a LOG_SYNCPT, set the stop point
-                    if lrd.r#type() & LOG_SYNCPT != 0 {
-                        let sync = lrd.syncpt_sync();
-                        if sync > 0 {
-                            last_addr = log_data_start + (sync as u64 * LOGPSIZE as u64);
-                        }
-                    }
-
-                    // Stop if we've reached the syncpt
-                    if reader.pos <= last_addr {
+                    let rec_end = reader.pos - log_data_start;
+                    if rec_end > log_end {
                         break;
                     }
+                    records.push((lrd, data));
                 }
                 None => break,
             }
         }
 
-        // Phase 2: Finalization — flush all dirty pages
+        // Phase 2: Backward replay — process records in reverse order.
+        // LOG_COMMIT records appear last (at end of log) and are encountered
+        // first during backward traversal, which lets us mark transactions
+        // as committed before processing their REDOPAGE data records.
+        let mut last_addr = 0u64;
+
+        for (lrd, data) in records.iter().rev() {
+            self.process_record(lrd, data, fs_storage, last_addr)?;
+
+            if lrd.r#type() & LOG_SYNCPT != 0 {
+                let sync = lrd.syncpt_sync();
+                if sync > 0 {
+                    last_addr = log_data_start + (sync as u64 * LOGPSIZE as u64);
+                }
+            }
+
+            if last_addr > 0 && reader.pos <= last_addr {
+                break;
+            }
+        }
+
+        // Phase 3: Finalization — update logsuper state to LOGREDONE and
+        // write it back to storage to mark the log as replayed.
         log::info!("journal recovery: applying finalization");
+        self.logsuper.set_state(LOGREDONE);
+        let logsuper_offset = log_data_start.saturating_sub(BLOCK_SIZE as u64);
+        let mut buf = [0u8; 128];
+        // Write key logsuper fields at their on-disk offsets.
+        buf[0..4].copy_from_slice(&self.logsuper.magic);
+        buf[4..8].copy_from_slice(&self.logsuper.version);
+        buf[8..12].copy_from_slice(&self.logsuper.serial);
+        buf[12..16].copy_from_slice(&self.logsuper.size);
+        buf[16..20].copy_from_slice(&self.logsuper.bsize);
+        buf[20..24].copy_from_slice(&self.logsuper.l2bsize);
+        buf[24..28].copy_from_slice(&self.logsuper.flag);
+        buf[28..32].copy_from_slice(&self.logsuper.state);
+        buf[32..36].copy_from_slice(&self.logsuper.end);
+        log_storage.write_bytes(logsuper_offset, &buf)?;
 
         Ok(())
     }
@@ -627,8 +653,10 @@ impl JournalRecovery {
             return Ok(());
         }
 
-        // End of transaction marker
-        if lrd.backchain() == 0 {
+        // End of transaction marker: backchain == 0 on a LOG_COMMIT means
+        // we've reached the end of the backward chain. For data records,
+        // backchain == 0 means "first record" but we must still process it.
+        if rec_type & LOG_COMMIT != 0 && lrd.backchain() == 0 {
             if self.commits.end_of_transaction(lrd.logtid()) {
                 log::debug!("transaction {} committed and complete", lrd.logtid());
             }
@@ -665,10 +693,16 @@ impl JournalRecovery {
     }
 
     /// Apply a page update based on the REDOPAGE record type.
+    ///
+    /// In jfsutils the backward pass collects pages into a buffer pool and
+    /// the forward pass applies them. Here we write the after-image directly
+    /// to `fs_storage`, guarded by the `PageTrackerTable` so each page is
+    /// only written once (backward replay gives us the newest after-image first).
     fn update_page(&mut self, lrd: &Lrd, data: &[u8], storage: &dyn Storage) -> StorageResult<()> {
         let pxd = lrd.redopage_pxd();
         let page_addr = pxd.address();
 
+        // Skip if this page has already been fully replayed.
         let tracker = self.pages.find_mut(page_addr);
         if let Some(t) = tracker {
             if t.is_complete() {
@@ -676,26 +710,30 @@ impl JournalRecovery {
             }
         }
 
+        // Write the after-image (page data) to its on-disk location.
+        let block = page_addr;
         let page_type = lrd.redopage_type();
 
         match page_type {
             t if t == LOG_INODE => {
-                self.update_inode_page(lrd, data, storage)?;
+                storage.write_block(block, data)?;
+                if let Some(t) = self.pages.find_mut(page_addr) {
+                    t.inode_slots = 0x07;
+                    if t.inode_slots == 0x07 {
+                        t.summary |= 0x07;
+                    }
+                    if t.summary == 0xff {
+                        t.summary = 0xff;
+                    }
+                } else {
+                    let mut t = PageTracker::new(*pxd, LOG_INODE, lrd.aggregate());
+                    t.inode_slots = 0x07;
+                    t.summary |= 0x07;
+                    self.pages.find_or_create(*pxd, LOG_INODE, lrd.aggregate());
+                }
             }
-            t if t == LOG_BTROOT | LOG_XTREE => {
-                self.update_xtree_root(lrd, lrd.inode(), data)?;
-            }
-            t if t == LOG_BTROOT | LOG_DTREE => {
-                self.update_dtree_root(lrd, lrd.inode(), data)?;
-            }
-            t if t == LOG_XTREE => {
-                self.update_xtree_node(lrd, data)?;
-            }
-            t if t == LOG_DTREE => {
-                self.update_dtree_node(lrd, data)?;
-            }
-            t if t == LOG_DATA => {
-                self.update_data_page(lrd, data, storage)?;
+            t if t & LOG_DATA != 0 => {
+                storage.write_block(block, data)?;
             }
             _ => {
                 log::warn!("unknown redopage type: {:#x}", page_type);
@@ -886,20 +924,50 @@ impl JournalRecovery {
     }
 
     /// Find the syncpt record (stop point for backward replay).
+    ///
+    /// Scans backward from the end of the log looking for a LOG_SYNCPT record.
+    /// If none is found, returns 0 (replay from the beginning of the log).
     fn find_syncpt(
         &self,
-        _storage: &dyn Storage,
+        log_storage: &dyn Storage,
         log_data_start: u64,
         log_end: u64,
     ) -> StorageResult<u64> {
-        // In a full implementation, we'd scan backward for the first LOG_SYNCPT record.
-        // If none found, replay from the last syncpt in logsuper.end.
-        if self.logsuper.end() > 0 && self.logsuper.end() < log_end as u32 {
-            Ok(log_data_start + (self.logsuper.end() as u64))
-        } else {
-            // Default: replay everything (start at beginning of log data)
-            Ok(log_data_start)
+        // Scan backward from log_end, looking for a LOG_SYNCPT record.
+        // A LOG_SYNCPT LRD has the SYNC flag (0x2000) in its type field.
+        let lrd_size = 36u64;
+        let syncpt_flag = crate::types::LOG_SYNCPT;
+
+        let mut pos = log_end;
+        while pos > log_data_start.saturating_add(lrd_size) {
+            // Read backward: we need to find LRDs. Since records are
+            // variable-length, we scan backward by trying to read a 4-byte
+            // LRD start marker, then decode. A simpler approach: scan
+            // forward from log_data_start and find all syncpt records,
+            // keeping the last one before log_end.
+            let lrd_bytes = log_storage.read_bytes(pos.saturating_sub(lrd_size), lrd_size as usize)?;
+            if lrd_bytes.len() < 8 {
+                break;
+            }
+            let rec_type = LittleEndian::read_u16(&lrd_bytes[8..10]);
+            if rec_type & syncpt_flag != 0 {
+                // Found a syncpt — its forward-link gives the absolute log page
+                let sync_val = LittleEndian::read_u32(&lrd_bytes[16..20]);
+                if sync_val > 0 {
+                    let syncpt_addr = log_data_start + (sync_val as u64 * LOGPSIZE as u64);
+                    if syncpt_addr < log_end {
+                        return Ok(log_data_start + syncpt_addr);
+                    }
+                }
+                // Syncpt found but points to invalid address — treat as no syncpt
+                break;
+            }
+            // Move backward by LRD_SIZE for next attempt
+            pos = pos.saturating_sub(lrd_size);
         }
+
+        // No syncpt found — replay from the beginning of the log
+        Ok(0)
     }
 
     fn get_or_create_volume(&mut self, idx: usize) -> &mut RecoveryVolume {

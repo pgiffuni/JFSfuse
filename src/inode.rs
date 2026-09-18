@@ -4,8 +4,10 @@
 //! Provides read/write access to disk inodes (dinode structures) and
 //! translates between on-disk and runtime representations.
 
-use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
-use crate::types::{Dinode, INOSPERIAG, INOSPERPAGE, L2INOSPERPAGE, PSIZE};
+use byteorder::{ByteOrder, LittleEndian};
+
+use crate::storage::{Result as StorageResult, StorageError};
+use crate::types::{Dinode, DISIZE, FILESYSTEM_I, INOSPERPAGE};
 
 /// Runtime inode representation.
 ///
@@ -29,17 +31,8 @@ impl Inode {
     /// Maps the inode number to its location on disk via the IAG/imap,
     /// then reads the dinode structure.
     pub fn read(volume: &mut crate::volume::Volume, ino: u32) -> StorageResult<Self> {
-        // Calculate IAG number and extent index
-        let iag_num = ino >> 12; // INOSPERIAG = 4096, L2INOSPERIAG = 12
-        let ext_idx = (ino % INOSPERIAG) >> 5; // INOSPEREXT = 32, L2INOSPEREXT = 5
-
-        // For the aggregate inode table, we need to walk the imap.
-        // Simplified: compute block address directly for common reserved inodes.
-        let block = Self::inode_block(volume, ino)?;
-
+        let (block, offset) = Self::find_inode_page(volume, ino)?;
         let data = volume.read_page(block)?;
-
-        let offset = Self::inode_offset_in_page(ino);
 
         let mut dinode = Dinode::default();
         let dinode_bytes = &data[offset..offset + std::mem::size_of::<Dinode>()];
@@ -53,29 +46,56 @@ impl Inode {
         })
     }
 
-    /// Compute the block number containing a given inode.
-    fn inode_block(volume: &crate::volume::Volume, ino: u32) -> StorageResult<u64> {
-        use crate::types::AGGR_INODE_TABLE_START;
+    /// Find the (block, offset) of an inode by scanning the aggregate inode
+    /// table. Returns the physical disk location of the dinode.
+    ///
+    /// The scan starts at the `s_ait2` PXD address and extends through
+    /// `s_ait2.length()` blocks, plus additional blocks that may belong
+    /// to different filesets' inode tables.
+    fn find_inode_page(
+        volume: &crate::volume::Volume,
+        ino: u32,
+    ) -> StorageResult<(u64, usize)> {
+        // Map VFS inode number to (fileset, number) pair.
+        let (target_fs, target_num) = if ino >= FILESYSTEM_I {
+            (FILESYSTEM_I, ino - FILESYSTEM_I)
+        } else {
+            (1, ino)
+        };
 
-        let bytes_per_ino = std::mem::size_of::<Dinode>();
-        let inos_per_page = (PSIZE / bytes_per_ino) as u32;
+        // The aggregate inode table starts at the s_ait2 PXD address.
+        let pxd = &volume.sb.s_ait2;
+        let table_start = pxd.address();
+        let table_len = pxd.length() as u64;
 
-        // For reserved inodes, they are in the inline inode table at AITBL_OFF
-        // The inode table starts at AGGR_INODE_TABLE_START
-        let byte_offset =
-            (AGGR_INODE_TABLE_START + (ino as u64) * (bytes_per_ino as u64)) % (PSIZE as u64);
-        let block =
-            (AGGR_INODE_TABLE_START + (ino as u64) * (bytes_per_ino as u64)) / (PSIZE as u64);
+        // Scan the AIT extent plus additional blocks for fileset-table entries.
+        // The root inode and other filesystem inodes may be stored in blocks
+        // immediately following the AIT2 extent.
+        let max_scan = table_len + 32;
 
-        let _ = byte_offset;
-        let _ = inos_per_page;
-        Ok(block)
-    }
+        for block_offset in 0..max_scan {
+            let block_num = table_start + block_offset;
+            if block_num >= volume.agg_size {
+                continue;
+            }
+            let data = volume.read_page(block_num)?;
 
-    /// Compute offset of an inode within its page.
-    fn inode_offset_in_page(ino: u32) -> usize {
-        let page_ino_offset = ino % (INOSPERPAGE);
-        (page_ino_offset as usize) * (PSIZE / INOSPERPAGE as usize)
+            for i in 0..INOSPERPAGE {
+                let off = (i as usize) * DISIZE;
+                let dinode_bytes = &data[off..off + DISIZE];
+                let fs = LittleEndian::read_u32(&dinode_bytes[4..8]);
+                let num = LittleEndian::read_u32(&dinode_bytes[8..12]);
+
+                if fs == target_fs && num == target_num {
+                    return Ok((block_num, off));
+                }
+            }
+        }
+
+        Err(StorageError::Other(format!(
+            "inode {} (fileset={}, number={}) not found in inode table",
+            ino, target_fs, target_num
+        )))
     }
 
     /// Parse a dinode from raw bytes.

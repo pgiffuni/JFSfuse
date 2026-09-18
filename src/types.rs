@@ -331,6 +331,10 @@ impl Xad {
     pub fn set_address(&mut self, addr: u64) {
         self.loc.set_address(addr);
     }
+
+    pub fn set_flag(&mut self, flag: XadFlag) {
+        self.flag = flag.bits();
+    }
 }
 
 // ──────────────────────── pxdlist ────────────────────────
@@ -460,8 +464,16 @@ impl Dinode {
         LittleEndian::read_u64(&self.di_size)
     }
 
+    pub fn set_size_val(&mut self, val: u64) {
+        LittleEndian::write_u64(&mut self.di_size, val);
+    }
+
     pub fn nblocks(&self) -> u64 {
         LittleEndian::read_u64(&self.di_nblocks)
+    }
+
+    pub fn set_nblocks(&mut self, val: u64) {
+        LittleEndian::write_u64(&mut self.di_nblocks, val);
     }
 
     pub fn nlink(&self) -> u32 {
@@ -501,10 +513,11 @@ impl Dinode {
         &self.u[96..]
     }
 
-    /// Dtree root bytes (dtroot_t) — the full 384-byte union area.
+    /// Dtree root bytes (dtroot_t) — at offset 96 within the 384-byte union,
+    /// after the 96-byte inline directory table (`dir_table_slot[12]`).
     /// Valid for directories.
     pub fn dtroot_bytes(&self) -> &[u8] {
-        &self.u
+        &self.u[96..]
     }
 
     /// Parse a raw 512-byte dinode from disk into the struct fields.

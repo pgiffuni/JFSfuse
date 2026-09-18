@@ -161,7 +161,8 @@ impl TransactionManager {
                     jm.append_log_record(txid, *block, &page.data)?;
                 }
             }
-            jm.flush_journal()?;
+            // Write LOG_COMMIT record and flush the journal.
+            jm.commit_transaction(txid)?;
         }
 
         // 3. Write dirty metadata pages to disk.

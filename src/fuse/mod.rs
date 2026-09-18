@@ -334,6 +334,46 @@ impl FuseFs {
         Err(EOPNOTSUPP)
     }
 
+    /// Set an extended attribute (writable builds only).
+    ///
+    /// `flags` follows Linux semantics: XATTR_CREATE (1) fails if the
+    /// attribute already exists, XATTR_REPLACE (2) fails if it does not.
+    #[cfg(feature = "writable")]
+    pub fn setxattr(
+        &mut self,
+        ino: u32,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.setxattr(ino, name, value, flags).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                EEXIST
+            } else if msg.contains("does not exist") {
+                ENOENT
+            } else if msg.contains("too long") || msg.contains("too large") {
+                EOPNOTSUPP
+            } else {
+                EIO
+            }
+        })
+    }
+
+    /// Get an extended attribute value (writable builds only).
+    ///
+    /// Returns `Ok(None)` if the attribute does not exist.
+    #[cfg(feature = "writable")]
+    pub fn getxattr(&mut self, ino: u32, name: &str) -> FuseResult<Option<Vec<u8>>> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.getxattr(ino, name).map_err(|_| EIO)
+    }
+
     /// Create a symbolic link (writable builds only).
     ///
     /// Stores the target path inline in the new symlink inode if it fits
@@ -373,6 +413,30 @@ impl FuseFs {
                 EIO
             }
         })
+    }
+
+    /// Remove an extended attribute (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn removexattr(&mut self, ino: u32, name: &str) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.removexattr(ino, name).map_err(|_| EIO).and_then(|ok| {
+            if ok {
+                Ok(())
+            } else {
+                Err(ENOENT)
+            }
+        })
+    }
+
+    /// List xattr names (writable builds only).
+    #[cfg(feature = "writable")]
+    pub fn listxattr(&mut self, ino: u32) -> FuseResult<Vec<String>> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.listxattr(ino).map_err(|_| EIO)
     }
 
     /// Create a hard link (writable builds only).

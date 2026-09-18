@@ -1277,4 +1277,269 @@ impl Volume {
         self.commit_transaction()?;
         Ok(())
     }
+
+    /// Extended attribute operations (Phase 12).
+    ///
+    /// Inline xattrs are stored in the inode's union area (`u[0..]`),
+    /// using a TLV format: [name_len:u16 LE][val_len:u16 LE][name bytes][value bytes].
+    /// The di_ea DXD descriptor marks the extent as inline (DXD_INLINE).
+    /// The INLINEEA mode flag is set when xattrs are present.
+    #[cfg(feature = "writable")]
+    pub fn setxattr(
+        &mut self,
+        ino: u32,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> StorageResult<()> {
+        const XATTR_CREATE: u32 = 1;
+        const XATTR_REPLACE: u32 = 2;
+
+        let _ = self.begin_transaction()?;
+
+        let inode = crate::inode::Inode::read(self, ino)?;
+        let name_bytes = name.as_bytes();
+
+        if name_bytes.len() > 255 {
+            self.abort_transaction();
+            return Err(StorageError::Other("xattr name too long".to_string()));
+        }
+        if value.len() > crate::types::IXATTRSIZE {
+            self.abort_transaction();
+            return Err(StorageError::Other("xattr value too large for inline storage".to_string()));
+        }
+
+        // Parse existing xattrs from the inode's union area.
+        let ea_data = self.read_inline_xattr_data(&inode);
+        let parsed = parse_xattr_list(&ea_data);
+
+        // Check existence for XATTR_CREATE / XATTR_REPLACE semantics.
+        let exists = parsed.iter().any(|(n, _)| n == name_bytes);
+        if flags & XATTR_CREATE != 0 && exists {
+            self.abort_transaction();
+            return Err(StorageError::Other("xattr already exists".to_string()));
+        }
+        if flags & XATTR_REPLACE != 0 && !exists {
+            self.abort_transaction();
+            return Err(StorageError::Other("xattr does not exist".to_string()));
+        }
+
+        // Build new xattr list: replace existing entry or append.
+        let mut new_list: Vec<u8> = Vec::new();
+        for (existing_name, existing_val) in &parsed {
+            if existing_name == name_bytes {
+                write_xattr_entry(&mut new_list, existing_name, value);
+            } else {
+                write_xattr_entry(&mut new_list, existing_name, existing_val);
+            }
+        }
+        if !exists {
+            write_xattr_entry(&mut new_list, name_bytes, value);
+        }
+
+        // Check total size fits in IXATTRSIZE (128 bytes).
+        if new_list.len() > crate::types::IXATTRSIZE {
+            self.abort_transaction();
+            return Err(StorageError::Other("xattr data too large".to_string()));
+        }
+
+        let ea_size = new_list.len() as u32;
+        let page_block = inode.page_block;
+        let page_offset = inode.page_offset;
+
+        self.update_inode_page(ino, page_block, page_offset, |dinode_bytes| {
+            // Store xattr data in the union area (u starts at offset 128).
+            let u_offset = 128;
+            for i in 0..crate::types::IXATTRSIZE {
+                if u_offset + i < dinode_bytes.len() {
+                    dinode_bytes[u_offset + i] = 0;
+                }
+            }
+            let end = u_offset + new_list.len();
+            if end <= dinode_bytes.len() {
+                dinode_bytes[u_offset..end].copy_from_slice(&new_list);
+            }
+
+            // Update the di_ea DXD descriptor (at offset 104 in dinode).
+            let ea_off = 104;
+            dinode_bytes[ea_off] = crate::types::DxdFlag::DXD_INLINE.bits();
+            LittleEndian::write_u32(&mut dinode_bytes[ea_off + 4..ea_off + 8], ea_size);
+            dinode_bytes[ea_off + 8..ea_off + 16].copy_from_slice(&[0u8; 8]);
+
+            // Set INLINEEA flag in mode.
+            let mode = LittleEndian::read_u32(&dinode_bytes[52..56]);
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], mode | crate::types::INLINEEA);
+        })?;
+
+        self.mark_page_dirty(ino, page_block)?;
+        self.commit_transaction()?;
+
+        Ok(())
+    }
+
+    /// Get an extended attribute value by name (Phase 12).
+    /// Returns `Ok(None)` if the xattr does not exist.
+    #[cfg(feature = "writable")]
+    pub fn getxattr(&mut self, ino: u32, name: &str) -> StorageResult<Option<Vec<u8>>> {
+        let inode = crate::inode::Inode::read(self, ino)?;
+        let ea_data = self.read_inline_xattr_data(&inode);
+        let parsed = parse_xattr_list(&ea_data);
+
+        for (existing_name, existing_val) in parsed {
+            if existing_name == name.as_bytes() {
+                return Ok(Some(existing_val));
+            }
+        }
+        Ok(None)
+    }
+
+    /// List xattr names for an inode (Phase 12).
+    #[cfg(feature = "writable")]
+    pub fn listxattr(&mut self, ino: u32) -> StorageResult<Vec<String>> {
+        let inode = crate::inode::Inode::read(self, ino)?;
+        let ea_data = self.read_inline_xattr_data(&inode);
+        let parsed = parse_xattr_list(&ea_data);
+        Ok(parsed.iter().map(|(n, _)| String::from_utf8_lossy(n).to_string()).collect())
+    }
+
+    /// Remove an extended attribute (Phase 12).
+    /// Returns `Ok(true)` if an attribute was removed, `Ok(false)` if not found.
+    #[cfg(feature = "writable")]
+    pub fn removexattr(&mut self, ino: u32, name: &str) -> StorageResult<bool> {
+        let _ = self.begin_transaction()?;
+
+        let inode = crate::inode::Inode::read(self, ino)?;
+        let ea_data = self.read_inline_xattr_data(&inode);
+        let parsed = parse_xattr_list(&ea_data);
+
+        let found = parsed.iter().any(|(n, _)| n == name.as_bytes());
+        if !found {
+            let _ = self.abort_transaction();
+            return Ok(false);
+        }
+
+        // Rebuild the list without the removed entry.
+        let mut new_list: Vec<u8> = Vec::new();
+        for (existing_name, existing_val) in parsed {
+            if existing_name != name.as_bytes() {
+                write_xattr_entry(&mut new_list, &existing_name, &existing_val);
+            }
+        }
+
+        let ea_size = new_list.len() as u32;
+        let page_block = inode.page_block;
+        let page_offset = inode.page_offset;
+
+        self.update_inode_page(ino, page_block, page_offset, |dinode_bytes| {
+            let u_offset = 128;
+            for i in 0..crate::types::IXATTRSIZE {
+                if u_offset + i < dinode_bytes.len() {
+                    dinode_bytes[u_offset + i] = 0;
+                }
+            }
+            let end = u_offset + new_list.len();
+            if end <= dinode_bytes.len() {
+                dinode_bytes[u_offset..end].copy_from_slice(&new_list);
+            }
+
+            // Update di_ea descriptor.
+            let ea_off = 104;
+            if new_list.is_empty() {
+                dinode_bytes[ea_off] = 0; // clear DXD_INLINE
+            } else {
+                dinode_bytes[ea_off] = crate::types::DxdFlag::DXD_INLINE.bits();
+            }
+            LittleEndian::write_u32(&mut dinode_bytes[ea_off + 4..ea_off + 8], ea_size);
+            dinode_bytes[ea_off + 8..ea_off + 16].copy_from_slice(&[0u8; 8]);
+
+            // Clear INLINEEA flag if no xattrs remain.
+            let mode = LittleEndian::read_u32(&dinode_bytes[52..56]);
+            let new_mode = if new_list.is_empty() {
+                mode & !crate::types::INLINEEA
+            } else {
+                mode | crate::types::INLINEEA
+            };
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], new_mode);
+        })?;
+
+        self.mark_page_dirty(ino, page_block)?;
+        self.commit_transaction()?;
+
+        Ok(true)
+    }
+
+    /// Read the inline xattr data from an inode's union area.
+    #[cfg(feature = "writable")]
+    fn read_inline_xattr_data(&self, inode: &crate::inode::Inode) -> Vec<u8> {
+        let ea_flag = inode.dinode.di_ea.flag;
+        if ea_flag & crate::types::DxdFlag::DXD_INLINE.bits() == 0 {
+            return Vec::new();
+        }
+        let ea_size = inode.dinode.di_ea.length() as usize;
+        if ea_size == 0 {
+            return Vec::new();
+        }
+        let end = ea_size.min(inode.dinode.u.len());
+        inode.dinode.u[..end].to_vec()
+    }
+
+    /// Parse an inline xattr TLV list into (name, value) pairs.
+    fn parse_xattr_list(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut result = Vec::new();
+        let mut pos = 0;
+        while pos + 4 <= data.len() {
+            let name_len = LittleEndian::read_u16(&data[pos..pos + 2]) as usize;
+            let val_len = LittleEndian::read_u16(&data[pos + 2..pos + 4]) as usize;
+            pos += 4;
+            if pos + name_len + val_len > data.len() {
+                break;
+            }
+            let name = data[pos..pos + name_len].to_vec();
+            pos += name_len;
+            let value = data[pos..pos + val_len].to_vec();
+            pos += val_len;
+            result.push((name, value));
+        }
+        result
+    }
+
+    /// Write an xattr entry (TLV) to a buffer.
+    fn write_xattr_entry(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+        let name_len = name.len().min(255) as u16;
+        let val_len = value.len().min(65535) as u16;
+        buf.extend_from_slice(&name_len.to_le_bytes());
+        buf.extend_from_slice(&val_len.to_le_bytes());
+        buf.extend_from_slice(&name[..name_len as usize]);
+        buf.extend_from_slice(value);
+    }
+}
+
+/// Parse an inline xattr TLV list into (name, value) pairs.
+fn parse_xattr_list(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let name_len = LittleEndian::read_u16(&data[pos..pos + 2]) as usize;
+        let val_len = LittleEndian::read_u16(&data[pos + 2..pos + 4]) as usize;
+        pos += 4;
+        if pos + name_len + val_len > data.len() {
+            break;
+        }
+        let name = data[pos..pos + name_len].to_vec();
+        pos += name_len;
+        let value = data[pos..pos + val_len].to_vec();
+        pos += val_len;
+        result.push((name, value));
+    }
+    result
+}
+
+/// Write an xattr entry (TLV) to a buffer.
+fn write_xattr_entry(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    let name_len = name.len().min(255) as u16;
+    let val_len = value.len().min(65535) as u16;
+    buf.extend_from_slice(&name_len.to_le_bytes());
+    buf.extend_from_slice(&val_len.to_le_bytes());
+    buf.extend_from_slice(&name[..name_len as usize]);
+    buf.extend_from_slice(value);
 }

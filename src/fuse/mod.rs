@@ -31,6 +31,7 @@ pub const EACCES: i32 = 13;
 pub const EBUSY: i32 = 16;
 pub const EOPNOTSUPP: i32 = 95;
 pub const EIO: i32 = 5;
+pub const EPERM: i32 = 1;
 
 /// Result type for FUSE operations that may carry an errno value.
 pub type FuseResult<T> = Result<T, i32>;
@@ -272,11 +273,11 @@ impl FuseFs {
 
     /// Open a file or directory (writable builds only).
     ///
-    /// Validates that the inode exists. The return value is the inode number,
-    /// which can be used as a FUSE file handle. No data is read.
+    /// Validates that the inode exists and increments the open-handle count
+    /// for open-unlinked semantics (inode is retained while open handles exist).
     #[cfg(feature = "writable")]
     pub fn open(&mut self, ino: u32) -> FuseResult<()> {
-        let result = Inode::read(&mut self.volume, ino);
+        let result = self.volume.open_file(ino);
         match result {
             Ok(_) => Ok(()),
             Err(_) => Err(ENOENT),
@@ -285,11 +286,12 @@ impl FuseFs {
 
     /// Release an open file handle (writable builds only).
     ///
-    /// In the current design, there is no per-file state to free — each
-    /// operation is stateless. This is a no-op provided for FUSE semantics.
+    /// Decrements the open-handle count. If the inode's nlink dropped to 0
+    /// (via unlink while open) and this was the last handle, the inode's
+    /// data blocks are freed.
     #[cfg(feature = "writable")]
-    pub fn release(&mut self, _ino: u32) -> FuseResult<()> {
-        Ok(())
+    pub fn release(&mut self, ino: u32) -> FuseResult<()> {
+        self.volume.release_file(ino).map_err(|_| EIO)
     }
 
     /// Set file attributes (writable builds only).
@@ -330,5 +332,28 @@ impl FuseFs {
             return Err(EROFS);
         }
         Err(EOPNOTSUPP)
+    }
+
+    /// Create a hard link (writable builds only).
+    ///
+    /// Increments the target inode's link count and inserts a new directory
+    /// entry. Hard links to directories are rejected.
+    #[cfg(feature = "writable")]
+    pub fn link(&mut self, parent_ino: u32, name: &str, target_ino: u32) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume.link_file(parent_ino, name, target_ino).map(|_| ()).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                EEXIST
+            } else if msg.contains("cannot hard-link a directory") {
+                EPERM
+            } else if msg.contains("invalid filename") {
+                EINVAL
+            } else {
+                EIO
+            }
+        })
     }
 }

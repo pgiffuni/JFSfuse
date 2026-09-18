@@ -58,6 +58,11 @@ pub struct Volume {
     /// Block allocation map (writable builds only).
     #[cfg(feature = "writable")]
     pub bmap: Option<BlockAllocMap>,
+    /// Open handle counts, keyed by inode disk block (for open-unlinked semantics).
+    /// Tracks how many times an inode page is held open. When nlink reaches 0
+    /// (via unlink), the inode is only freed when its open-handle count drops to 0.
+    #[cfg(feature = "writable")]
+    pub open_handles: std::collections::HashMap<u64, u32>,
 }
 
 impl Volume {
@@ -118,6 +123,8 @@ impl Volume {
             root_ino: FILESYSTEM_I + ROOT_I,
             #[cfg(feature = "writable")]
             bmap: None,
+            #[cfg(feature = "writable")]
+            open_handles: std::collections::HashMap::new(),
         };
 
         volume.init_log()?;
@@ -971,7 +978,8 @@ impl Volume {
     ///
     /// 1. Look up entry in parent's dtroot.
     /// 2. Remove entry.
-    /// 3. Free child inode (mark as unused).
+    /// 3. Decrement child's link count. If nlink reaches zero AND no open
+    ///    handles remain, free the inode and its data blocks.
     /// 4. Update parent metadata.
     /// 5. Commit.
     #[cfg(feature = "writable")]
@@ -990,22 +998,182 @@ impl Volume {
 
         let child_ino = child_ino.unwrap();
 
-        // 2. Free the child inode (set mode to 0 = unused).
+        // 2. Read the child inode to get its type and current nlink.
         let child = crate::inode::Inode::read(self, child_ino)?;
-        self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
-            // Zero out the mode to mark as free.
-            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
-            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
-        })?;
+        let is_dir = child.is_dir();
+        let current_nlink = child.dinode.nlink();
+
+        // Directories can only have nlink == 0 (already removed via rmdir).
+        if is_dir {
+            self.abort_transaction();
+            return Err(StorageError::Other("use rmdir for directories".to_string()));
+        }
+
+        let new_nlink = current_nlink.saturating_sub(1);
+        let should_free = new_nlink == 0 && !self.has_open_handles(child.page_block);
+
+        if should_free {
+            // No open handles — free the inode and its data blocks.
+            // First, compute the blocks to free (can't borrow self.bmap inside the closure).
+            let freed_blocks: Vec<(u64, u32)> = if child.is_regular() {
+                let xt_bytes = &child.dinode.u[96..];
+                if let Ok(mut xt) = crate::btree::xtree::Xtree::from_inode_data(xt_bytes) {
+                    xt.truncate_extents(0)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
+                // Zero out the mode to mark as free.
+                LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
+                LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+                LittleEndian::write_u32(&mut dinode_bytes[40..44], 0);
+            })?;
+
+            // Free the blocks.
+            if let Some(bmap) = self.bmap.as_mut() {
+                for (addr, len) in &freed_blocks {
+                    let mut pxd = crate::types::Pxd::default();
+                    pxd.set_length(*len);
+                    pxd.set_address(*addr);
+                    let _ = bmap.free_extent(&pxd);
+                }
+            }
+        } else {
+            // Still has open handles or nlink > 0 — just decrement nlink.
+            // This implements the open-unlinked semantics: the inode persists
+            // in the inode table until the last open handle is released.
+            self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
+                LittleEndian::write_u32(&mut dinode_bytes[40..44], new_nlink);
+            })?;
+        }
         self.mark_page_dirty(child_ino, child.page_block)?;
 
-        // 3. Mark parent dirty (dtroot already updated via remove_dir_entry).
+        // 4. Mark parent dirty (dtroot already updated via remove_dir_entry).
         let parent = crate::inode::Inode::read(self, parent_ino)?;
         self.mark_page_dirty(parent_ino, parent.page_block)?;
 
-        // 4. Commit.
+        // 5. Commit.
         self.commit_transaction()?;
 
         Ok(true)
+    }
+
+    /// Create a hard link (Phase 10).
+    ///
+    /// 1. Verify the target inode is not a directory (directories may only
+    ///    be linked via `.` / `..` in JFS).
+    /// 2. Insert a new directory entry pointing to the target inode.
+    /// 3. Increment the target inode's link count.
+    /// 4. Update parent directory metadata.
+    /// 5. Commit.
+    #[cfg(feature = "writable")]
+    pub fn link_file(&mut self, parent_ino: u32, name: &str, target_ino: u32) -> StorageResult<u32> {
+        let _ = self.begin_transaction()?;
+
+        // 1. Read the target inode.
+        let target = crate::inode::Inode::read(self, target_ino)?;
+
+        // 2. Reject hard links to directories.
+        if target.is_dir() {
+            let _ = self.abort_transaction();
+            return Err(StorageError::Other("cannot hard-link a directory".to_string()));
+        }
+
+        // 3. Validate name.
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        if name_u16.is_empty() || name_u16.len() > 11 {
+            let _ = self.abort_transaction();
+            return Err(StorageError::Other("invalid filename length".to_string()));
+        }
+
+        // 4. Insert directory entry in parent.
+        let index = {
+            let parent = crate::inode::Inode::read(self, parent_ino)?;
+            let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+            dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+        };
+        let inserted = self.insert_dir_entry(parent_ino, &name_u16, target_ino, index)?;
+        if !inserted {
+            let _ = self.abort_transaction();
+            return Err(StorageError::Other("directory entry already exists".to_string()));
+        }
+
+        // 5. Increment target's nlink.
+        let new_nlink = target.dinode.nlink() + 1;
+        self.update_inode_page(target_ino, target.page_block, target.page_offset, |dinode_bytes| {
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], new_nlink);
+        })?;
+        self.mark_page_dirty(target_ino, target.page_block)?;
+
+        // 6. Mark parent dirty.
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
+
+        // 7. Commit.
+        self.commit_transaction()?;
+
+        Ok(target_ino)
+    }
+
+    /// Open a file — increments the open-handle count for open-unlinked semantics.
+    #[cfg(feature = "writable")]
+    pub fn open_file(&mut self, ino: u32) -> StorageResult<()> {
+        let inode = crate::inode::Inode::read(self, ino)?;
+        *self.open_handles.entry(inode.page_block).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Check if an inode has any open handles.
+    /// The open_handles map is keyed by the inode's disk page block.
+    #[cfg(feature = "writable")]
+    fn has_open_handles(&self, page_block: u64) -> bool {
+        self.open_handles.get(&page_block).copied().unwrap_or(0) > 0
+    }
+
+    /// Release an open file handle — decrements the open-handle count.
+    /// If the inode is in pending-deletion state (nlink == 0) and this was
+    /// the last handle, the inode's blocks are freed.
+    #[cfg(feature = "writable")]
+    pub fn release_file(&mut self, ino: u32) -> StorageResult<()> {
+        let inode = crate::inode::Inode::read(self, ino)?;
+        if let Some(count) = self.open_handles.get_mut(&inode.page_block) {
+            *count = count.saturating_sub(1);
+        }
+
+        // If nlink is 0 and no open handles remain, free the inode.
+        self.begin_transaction()?;
+        if inode.dinode.nlink() == 0 && !self.has_open_handles(inode.page_block) {
+            // Free data blocks (compute first to avoid borrow conflicts).
+            let freed_blocks: Vec<(u64, u32)> = if inode.is_regular() {
+                let xt_bytes = inode.xtroot_bytes();
+                if let Ok(mut xt) = crate::btree::xtree::Xtree::from_inode_data(xt_bytes) {
+                    xt.truncate_extents(0)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            if let Some(bmap) = self.bmap.as_mut() {
+                for (addr, len) in &freed_blocks {
+                    let mut pxd = crate::types::Pxd::default();
+                    pxd.set_length(*len);
+                    pxd.set_address(*addr);
+                    let _ = bmap.free_extent(&pxd);
+                }
+            }
+            // Mark inode as free on disk.
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
+            })?;
+            self.mark_page_dirty(ino, inode.page_block)?;
+        }
+        self.commit_transaction()?;
+        Ok(())
     }
 }

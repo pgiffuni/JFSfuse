@@ -21,6 +21,8 @@ use crate::storage::{
     BLOCK_SIZE, FileStorage, PageCache, Result as StorageResult, Storage, StorageError,
 };
 use crate::transaction::{CommitResult, TransactionId, TransactionManager};
+#[cfg(feature = "writable")]
+use crate::alloc::dmap::BlockAllocMap;
 use crate::types::{
     self, AGGREGATE_I, BMAP_I, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JFS_MAGIC, JfsSuperblock, LOG_I,
     LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_B, SUPER1_OFF,
@@ -53,6 +55,9 @@ pub struct Volume {
     pub num_ag: u32,
     /// Root inode number.
     pub root_ino: u32,
+    /// Block allocation map (writable builds only).
+    #[cfg(feature = "writable")]
+    pub bmap: Option<BlockAllocMap>,
 }
 
 impl Volume {
@@ -111,10 +116,16 @@ impl Volume {
             ag_size,
             num_ag,
             root_ino: FILESYSTEM_I + ROOT_I,
+            #[cfg(feature = "writable")]
+            bmap: None,
         };
 
         volume.init_log()?;
         volume.recover_journal()?;
+        #[cfg(feature = "writable")]
+        {
+            volume.bmap = Some(BlockAllocMap::new(volume.storage.clone())?);
+        }
 
         Ok(volume)
     }
@@ -272,17 +283,28 @@ impl Volume {
     }
 
     /// Commit the active transaction, flushing the journal then metadata
-    /// to stable storage (writable builds only).
+    /// and allocation map to stable storage (writable builds only).
     #[cfg(feature = "writable")]
     pub fn commit_transaction(&mut self) -> StorageResult<CommitResult> {
         let journal = self.log.as_mut();
-        self.tx_mgr
-            .commit(&*self.storage, &mut self.page_cache, journal)
+        let result = self
+            .tx_mgr
+            .commit(&*self.storage, &mut self.page_cache, journal)?;
+
+        // Flush the allocation map changes to disk.
+        if let Some(bmap) = self.bmap.as_mut() {
+            bmap.commit()?;
+        }
+
+        Ok(result)
     }
 
     /// Abort the active transaction and discard dirty pages (writable builds only).
     #[cfg(feature = "writable")]
     pub fn abort_transaction(&mut self) {
+        if let Some(bmap) = self.bmap.as_mut() {
+            bmap.rollback();
+        }
         self.tx_mgr.abort(&mut self.page_cache)
     }
 
@@ -296,10 +318,12 @@ impl Volume {
     ///
     /// Implements the ordered-data write policy:
     /// 1. Begin transaction
-    /// 2. Write data blocks to their physical locations
-    /// 3. Update inode size if the write extends the file
-    /// 4. Journal metadata (inode page) via TransactionManager
-    /// 5. Commit transaction (journal flush + metadata flush)
+    /// 2. Allocate new blocks for sparse regions (if needed)
+    /// 3. Write data blocks to their physical locations
+    /// 4. Flush data blocks
+    /// 5. Update inode size and xtree metadata
+    /// 6. Journal metadata (inode page) via TransactionManager
+    /// 7. Commit transaction (journal flush + metadata flush)
     #[cfg(feature = "writable")]
     pub fn write_at(
         &mut self,
@@ -307,11 +331,12 @@ impl Volume {
         offset: u64,
         data: &[u8],
     ) -> StorageResult<usize> {
-        let txid = self.begin_transaction()?;
+        let _ = self.begin_transaction()?;
 
         let inode = crate::inode::Inode::read(self, ino)?;
         let size = inode.size();
-        let xtree = crate::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
+        let mut xtree = crate::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
+        let mut xtree_modified = false;
 
         let mut written = 0usize;
 
@@ -326,6 +351,7 @@ impl Volume {
         let mut data_pos = 0usize;
         let mut remaining = data.len();
         let mut cur_byte_offset = byte_offset as usize;
+        let mut next_logical = fsb_offset;
 
         for (block_addr, block_count) in extents {
             if remaining == 0 {
@@ -333,8 +359,58 @@ impl Volume {
             }
 
             if block_addr == 0 {
-                // Sparse region — can't allocate (allocator is a stub).
-                // Fill with zeros in the output.
+                // Sparse region — allocate new blocks if the allocator is available.
+                #[cfg(feature = "writable")]
+                {
+                    if let Some(bmap) = self.bmap.as_mut() {
+                        let alloc_count: crate::types::BlockLength = block_count;
+                        if let Some(pxd) = bmap.alloc_extent(alloc_count, next_logical as u64)? {
+                            let new_addr = pxd.address();
+                            let new_len = pxd.length() as u64;
+
+                            // Write data to the newly allocated blocks.
+                            let mut data_pos_in_hole = data_pos;
+                            let mut remaining_in_hole = remaining;
+                            let mut cur_offset = cur_byte_offset;
+                            for blk in 0..new_len {
+                                if remaining_in_hole == 0 {
+                                    break;
+                                }
+                                let to_copy = std::cmp::min(
+                                    BLOCK_SIZE - cur_offset,
+                                    remaining_in_hole,
+                                );
+                                let mut block_data = vec![0u8; BLOCK_SIZE as usize];
+                                if data_pos_in_hole + to_copy <= data.len() {
+                                    block_data[cur_offset..cur_offset + to_copy]
+                                        .copy_from_slice(&data[data_pos_in_hole
+                                        ..data_pos_in_hole + to_copy]);
+                                }
+                                self.storage.write_block(new_addr + blk, &block_data)?;
+
+                                written += to_copy;
+                                data_pos_in_hole += to_copy;
+                                remaining_in_hole -= to_copy;
+                                cur_offset = 0;
+                            }
+
+                            // Insert the new extent into the xtree.
+                            if xtree.insert_extent(
+                                next_logical as i64,
+                                new_len as u32,
+                                new_addr,
+                            ) {
+                                xtree_modified = true;
+                            }
+
+                            next_logical += new_len;
+                            data_pos = data_pos_in_hole;
+                            remaining = remaining_in_hole;
+                            continue;
+                        }
+                    }
+                }
+                // No allocator — skip (sparse region stays unwritten).
                 let zeros_to_copy = std::cmp::min(
                     block_count as usize * BLOCK_SIZE - cur_byte_offset,
                     remaining,
@@ -346,17 +422,15 @@ impl Volume {
                 continue;
             }
 
+            // Existing extent — write data directly to the physical blocks.
             for blk in 0..block_count as u64 {
                 if remaining == 0 {
                     break;
                 }
-
                 let mut block_data = self.storage.read_block(block_addr + blk)?;
-
                 let to_copy = std::cmp::min(BLOCK_SIZE - cur_byte_offset, remaining);
                 block_data[cur_byte_offset..cur_byte_offset + to_copy]
                     .copy_from_slice(&data[data_pos..data_pos + to_copy]);
-
                 self.storage.write_block(block_addr + blk, &block_data)?;
 
                 written += to_copy;
@@ -364,13 +438,31 @@ impl Volume {
                 remaining -= to_copy;
                 cur_byte_offset = 0;
             }
+
+            next_logical += block_count as u64;
         }
 
-        // Update file size if write extends past EOF.
+        // Flush data blocks (ordered-data model).
+        self.storage.flush_data()?;
+
+        // Update inode size and xtree if modified.
         let new_end = offset + written as u64;
-        if new_end > size {
+        let mut update_size = new_end > size;
+        if update_size {
             self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
                 LittleEndian::write_u64(&mut dinode_bytes[24..32], new_end);
+            })?;
+        }
+        let _ = &mut update_size;
+
+        if xtree_modified {
+            let xt_bytes = xtree.to_bytes();
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                let xt_off = crate::types::Dinode::size() - xt_bytes.len();
+                dinode_bytes[xt_off..xt_off + xt_bytes.len()].copy_from_slice(&xt_bytes);
+                // Update nblocks
+                let total_blocks = xtree.iter_extents().map(|e| e.length as u64).sum::<u64>();
+                LittleEndian::write_u64(&mut dinode_bytes[32..40], total_blocks);
             })?;
         }
 

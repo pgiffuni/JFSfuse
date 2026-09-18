@@ -136,9 +136,60 @@ fn test_fsync_succeeds() {
 
     let result = fs.flush(ino);
     assert!(result.is_some(), "fsync should return Some on success");
-    assert!(result.is_some(), "fsync should return Some on success");
 
     // Verify a transaction was committed.
     let txid = fs.volume.tx_mgr.current_txid();
     assert!(txid.is_some(), "transaction should be committed after fsync");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_write_past_eof_allocates_blocks() {
+    use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+    use std::sync::Arc;
+
+    let path = "/tmp/kilo/test_jfs.img";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
+        return;
+    }
+
+    let data = std::fs::read(path).ok().unwrap();
+    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+    let mem = MemoryStorage::new(num_blocks);
+    let storage: Arc<dyn Storage> = Arc::new(mem);
+    let vol_blocks = data.len() / BLOCK_SIZE as usize;
+    for i in 0..vol_blocks {
+        let start = i * BLOCK_SIZE as usize;
+        let end = start + BLOCK_SIZE as usize;
+        let _ = storage.write_block(i as u64, &data[start..end]);
+    }
+
+    let vol = Volume::open_from_storage(storage).expect("should mount");
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    // Create a new file (empty, zero extent).
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "wpe_test", 0o100644);
+    assert!(ino.is_some(), "create should succeed");
+    let new_ino = ino.unwrap();
+
+    // Write data past EOF — this requires block allocation.
+    let write_data = b"Hello, allocated world!";
+    let written = fs.write(new_ino, 0, write_data);
+    assert!(written.is_some(), "write should succeed");
+    assert_eq!(written.unwrap(), write_data.len());
+
+    // Read back and verify.
+    let after = fs.read(new_ino, 0, write_data.len()).expect("should read");
+    assert_eq!(after, write_data, "data should match what was written");
+
+    // Verify the file size was updated.
+    let dinode = fs.getattr(new_ino).expect("should getattr");
+    let size = u64::from_le_bytes(dinode.di_size);
+    assert_eq!(size, write_data.len() as u64, "size should be updated");
+
+    // Cleanup.
+    let _ = fs.unlink(parent, "wpe_test");
 }

@@ -383,6 +383,98 @@ impl Xtree {
         self.root.header.set_nextindex(new_next as u16);
         freed
     }
+
+    /// Validate the xtree's invariant: extents must be in ascending logical
+    /// order with no overlapping ranges.
+    ///
+    /// Returns an error string if the invariant is violated.
+    pub fn validate(&self) -> Result<(), String> {
+        let next_idx = self.root.header.nextindex() as usize;
+        let mut prev_end: i64 = 0;
+
+        for i in XTENTRYSTART..next_idx.min(XTROOTMAXSLOT) {
+            let xad = &self.root.xad[i];
+            let length = xad.length();
+            if length == 0 {
+                continue;
+            }
+            let offset = xad.offset() as i64;
+            let end = offset + length as i64;
+
+            if offset < prev_end {
+                return Err(format!(
+                    "extent at index {} overlaps previous (offset={}, prev_end={})",
+                    i, offset, prev_end
+                ));
+            }
+            prev_end = end;
+        }
+
+        Ok(())
+    }
+
+    /// Split an extent at the given logical block offset.
+    ///
+    /// If the extent straddling `split_at` is found, it is divided into two
+    /// extents: one covering `[original_offset, split_at)` and another
+    /// covering `[split_at, original_end)`. Returns `true` if a split occurred.
+    ///
+    /// If `split_at` falls exactly on an extent boundary, no split is needed.
+    pub fn split_extent(&mut self, split_at: i64) -> bool {
+        if split_at <= 0 {
+            return false;
+        }
+
+        let next_idx = self.root.header.nextindex() as usize;
+        let mut to_split: Option<usize> = None;
+
+        for i in XTENTRYSTART..next_idx.min(XTROOTMAXSLOT) {
+            let xad = &self.root.xad[i];
+            let offset = xad.offset() as i64;
+            let length = xad.length() as i32 as i64;
+
+            if offset < split_at && offset + length > split_at {
+                to_split = Some(i);
+                break;
+            }
+        }
+
+        let idx = match to_split {
+            Some(i) => i,
+            None => return false,
+        };
+
+        let xad = &self.root.xad[idx];
+        let original_offset = xad.offset();
+        let original_length = xad.length();
+        let address = xad.address();
+        let keep_len = (split_at - original_offset as i64) as u32;
+        let new_len = original_length - keep_len;
+        let new_addr = address + keep_len as u64;
+        let new_offset = split_at;
+
+        // Check if there's room for a new extent.
+        let new_next = next_idx + 1;
+        if new_next > XTROOTMAXSLOT {
+            return false;
+        }
+
+        // Truncate the existing extent to the kept portion.
+        self.root.xad[idx].set_length(keep_len);
+
+        // Insert the new extent at the end (direct placement, no merging).
+        let new_idx = next_idx;
+        if new_idx < XTROOTMAXSLOT {
+            let xad = &mut self.root.xad[new_idx];
+            xad.set_offset(new_offset);
+            xad.set_length(new_len);
+            xad.set_address(new_addr);
+            xad.flag = 0;
+        }
+        self.root.header.set_nextindex(new_next as u16);
+
+        true
+    }
 }
 
 #[cfg(test)]
@@ -603,5 +695,70 @@ mod tests {
 
         assert!(freed.is_empty(), "growing should not free any extents");
         assert_eq!(xt.next_index(), 3, "extent count should not change");
+    }
+
+    #[test]
+    fn test_xtree_validate_no_overlap() {
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01;
+        data[18..20].copy_from_slice(&4u16.to_le_bytes()); // nextindex = 4 (2 entries)
+        data[20..22].copy_from_slice(&18u16.to_le_bytes());
+
+        // xad[2] at byte offset 32: offset=0 (off1=0, off2=0), length=10, address=100
+        // Layout: flag(1) rsvrd(2) off1(1) off2(4) loc.len_addr(4) loc.addr2(4)
+        data[40..44].copy_from_slice(&10u32.to_le_bytes()); // loc.len_addr = length 10
+        data[44..48].copy_from_slice(&100u32.to_le_bytes()); // loc.addr2 = address 100
+
+        // xad[3] at byte offset 48: offset=10, length=5, address=200
+        data[51] = 0; // off1 (high byte of offset) = 0
+        data[52..56].copy_from_slice(&10u32.to_le_bytes()); // off2 = offset 10
+        data[56..60].copy_from_slice(&5u32.to_le_bytes()); // loc.len_addr = length 5
+        data[60..64].copy_from_slice(&200u32.to_le_bytes()); // loc.addr2 = address 200
+
+        let xt = Xtree::from_inode_data(&data).unwrap();
+        assert!(xt.validate().is_ok(), "non-overlapping extents should validate");
+    }
+
+    #[test]
+    fn test_xtree_split_extent() {
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01;
+        data[18..20].copy_from_slice(&2u16.to_le_bytes());
+        data[20..22].copy_from_slice(&18u16.to_le_bytes());
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+        xt.insert_extent(0, 10, 100);
+
+        // Split at offset 5: [0..5] addr=100 + [5..10] addr=105
+        assert!(xt.split_extent(5), "should split at offset 5");
+
+        // Should have 2 extents now.
+        assert_eq!(xt.next_index(), 4, "should have 2 extents after split");
+
+        // Verify first part.
+        let ext1 = xt.lookup(0).unwrap().unwrap();
+        assert_eq!(ext1.length, 5, "first half should be 5 blocks");
+        assert_eq!(ext1.address, 100, "first half keeps original address");
+
+        // Verify second part.
+        let ext2 = xt.lookup(5).unwrap().unwrap();
+        assert_eq!(ext2.length, 5, "second half should be 5 blocks");
+        assert_eq!(ext2.address, 105, "second half address should be 105");
+    }
+
+    #[test]
+    fn test_xtree_split_on_boundary_noop() {
+        let mut data = vec![0u8; 288];
+        data[16] = 0x01;
+        data[18..20].copy_from_slice(&2u16.to_le_bytes());
+        data[20..22].copy_from_slice(&18u16.to_le_bytes());
+
+        let mut xt = Xtree::from_inode_data(&data).unwrap();
+        xt.insert_extent(0, 10, 100);
+
+        // Split at boundary (offset 10) — no split needed.
+        let result = xt.split_extent(10);
+        assert!(!result, "split at boundary should be a no-op");
+        assert_eq!(xt.next_index(), 3);
     }
 }

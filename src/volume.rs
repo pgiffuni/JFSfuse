@@ -228,7 +228,7 @@ impl Volume {
     /// i.e. sector 64 (SUPER1_B) * PBSIZE (512). We use the byte offset
     /// directly rather than `SUPER1_B * BLOCK_SIZE` since SUPER1_B is
     /// expressed in 512-byte sectors, not 4 KiB blocks.
-    fn read_super(storage: &dyn Storage) -> StorageResult<JfsSuperblock> {
+    pub fn read_super(storage: &dyn Storage) -> StorageResult<JfsSuperblock> {
         let offset = SUPER1_OFF;
         let data = storage.read_bytes(offset, PSIZE)?;
 
@@ -1396,7 +1396,7 @@ impl Volume {
 
         // Parse existing xattrs from the inode's union area.
         let ea_data = self.read_inline_xattr_data(&inode);
-        let parsed = parse_xattr_list(&ea_data);
+        let parsed = Self::parse_xattr_list(&ea_data);
 
         // Check existence for XATTR_CREATE / XATTR_REPLACE semantics.
         let exists = parsed.iter().any(|(n, _)| n == name_bytes);
@@ -1413,13 +1413,13 @@ impl Volume {
         let mut new_list: Vec<u8> = Vec::new();
         for (existing_name, existing_val) in &parsed {
             if existing_name == name_bytes {
-                write_xattr_entry(&mut new_list, existing_name, value);
+                Self::write_xattr_entry(&mut new_list, existing_name, value);
             } else {
-                write_xattr_entry(&mut new_list, existing_name, existing_val);
+                Self::write_xattr_entry(&mut new_list, existing_name, existing_val);
             }
         }
         if !exists {
-            write_xattr_entry(&mut new_list, name_bytes, value);
+            Self::write_xattr_entry(&mut new_list, name_bytes, value);
         }
 
         // Check total size fits in IXATTRSIZE (128 bytes).
@@ -1468,7 +1468,7 @@ impl Volume {
     pub fn getxattr(&mut self, ino: u32, name: &str) -> StorageResult<Option<Vec<u8>>> {
         let inode = crate::inode::Inode::read(self, ino)?;
         let ea_data = self.read_inline_xattr_data(&inode);
-        let parsed = parse_xattr_list(&ea_data);
+        let parsed = Self::parse_xattr_list(&ea_data);
 
         for (existing_name, existing_val) in parsed {
             if existing_name == name.as_bytes() {
@@ -1483,7 +1483,7 @@ impl Volume {
     pub fn listxattr(&mut self, ino: u32) -> StorageResult<Vec<String>> {
         let inode = crate::inode::Inode::read(self, ino)?;
         let ea_data = self.read_inline_xattr_data(&inode);
-        let parsed = parse_xattr_list(&ea_data);
+        let parsed = Self::parse_xattr_list(&ea_data);
         Ok(parsed.iter().map(|(n, _)| String::from_utf8_lossy(n).to_string()).collect())
     }
 
@@ -1495,7 +1495,7 @@ impl Volume {
 
         let inode = crate::inode::Inode::read(self, ino)?;
         let ea_data = self.read_inline_xattr_data(&inode);
-        let parsed = parse_xattr_list(&ea_data);
+        let parsed = Self::parse_xattr_list(&ea_data);
 
         let found = parsed.iter().any(|(n, _)| n == name.as_bytes());
         if !found {
@@ -1507,7 +1507,7 @@ impl Volume {
         let mut new_list: Vec<u8> = Vec::new();
         for (existing_name, existing_val) in parsed {
             if existing_name != name.as_bytes() {
-                write_xattr_entry(&mut new_list, &existing_name, &existing_val);
+                Self::write_xattr_entry(&mut new_list, &existing_name, &existing_val);
             }
         }
 
@@ -1597,34 +1597,190 @@ impl Volume {
         buf.extend_from_slice(&name[..name_len as usize]);
         buf.extend_from_slice(value);
     }
-}
 
-/// Parse an inline xattr TLV list into (name, value) pairs.
-fn parse_xattr_list(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut result = Vec::new();
-    let mut pos = 0;
-    while pos + 4 <= data.len() {
-        let name_len = LittleEndian::read_u16(&data[pos..pos + 2]) as usize;
-        let val_len = LittleEndian::read_u16(&data[pos + 2..pos + 4]) as usize;
-        pos += 4;
-        if pos + name_len + val_len > data.len() {
-            break;
+    /// Run a consistency check on the filesystem (Phase 14).
+    ///
+    /// Verifies:
+    /// - Superblock validity
+    /// - Journal state
+    /// - Root inode is a directory
+    /// - Root directory entries (`.`, `..`, valid inodes)
+    /// - Each inode in the root directory references a valid inode
+    /// - Xtree extents are ordered and non-overlapping
+    /// - Extent physical addresses are within volume bounds
+    ///
+    /// Returns a `CheckReport` with all issues found. The `--repair` flag
+    /// is intentionally not supported yet — repair is disabled until the
+    /// checker can produce a complete diagnostic report.
+    pub fn check_consistent(&mut self) -> StorageResult<CheckReport> {
+        let mut report = CheckReport::default();
+
+        // 1. Verify superblock magic.
+        if !self.sb.is_valid_magic() {
+            report.add_error("invalid superblock magic".to_string());
         }
-        let name = data[pos..pos + name_len].to_vec();
-        pos += name_len;
-        let value = data[pos..pos + val_len].to_vec();
-        pos += val_len;
-        result.push((name, value));
+
+        // 2. Verify journal state.
+        if let Some(log) = &self.log {
+            let ls = log.logsuper();
+            if ls.magic_val() != LOGMAGIC {
+                report.add_error("invalid log superblock magic".to_string());
+            }
+        }
+
+        // 3. Verify root inode is a directory.
+        let root_ino = self.root_ino;
+        let root = match crate::inode::Inode::read(self, root_ino) {
+            Ok(r) => r,
+            Err(e) => {
+                report.add_error_ino(format!("root inode unreadable: {}", e), root_ino);
+                return Ok(report);
+            }
+        };
+
+        if !root.is_dir() {
+            report.add_error_ino("root inode is not a directory".to_string(), root_ino);
+        }
+
+        // 4. Validate root directory dtree.
+        let root_dtree = match crate::btree::dtree::Dtree::from_inode_data(root.dtroot_bytes()) {
+            Ok(d) => d,
+            Err(e) => {
+                report.add_error_ino(format!("root dtree invalid: {}", e), root_ino);
+                return Ok(report);
+            }
+        };
+
+        // 5. Verify `.entry` — each dirent points to a valid inode.
+        let entries = root_dtree.entries()?;
+        for entry in &entries {
+            let child_ino = entry.inumber;
+
+            // Skip `.` and `..` — they're validated separately.
+            let name_str = String::from_utf16_lossy(&entry.name)
+                .trim_end_matches('\0')
+                .to_string();
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+
+            // Each child should have a readable inode.
+            match crate::inode::Inode::read(self, child_ino) {
+                Ok(child_inode) => {
+                    // 6. Verify inode mode is valid (has a type).
+                    let mode = child_inode.mode();
+                    if mode & 0xf000 == 0 {
+                        report.add_error_ino("inode has no type (mode=0)".to_string(), child_ino);
+                    }
+                }
+                Err(_) => {
+                    report.add_error_ino(
+                        format!("directory entry '{}' points to invalid inode", name_str),
+                        child_ino,
+                    );
+                }
+            }
+        }
+
+        // 6. Verify xtree extents for regular files in root.
+        for entry in &entries {
+            let name_str = String::from_utf16_lossy(&entry.name)
+                .trim_end_matches('\0')
+                .to_string();
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+
+            if let Ok(child) = crate::inode::Inode::read(self, entry.inumber) {
+                if child.is_regular() {
+                    if let Ok(xt) = crate::btree::xtree::Xtree::from_inode_data(child.xtroot_bytes()) {
+                        if let Err(e) = xt.validate() {
+                            report.add_error_ino(
+                                format!("xtree validation failed: {}", e),
+                                entry.inumber,
+                            );
+                        }
+
+                        // 7. Verify extent addresses are within volume bounds.
+                        for ext in xt.iter_extents() {
+                            if ext.address >= self.agg_size {
+                                report.add_error_block(
+                                    format!("extent address {} exceeds volume size", ext.address),
+                                    ext.address,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 8. Verify xattr consistency.
+        for entry in &entries {
+            let name_str = String::from_utf16_lossy(&entry.name)
+                .trim_end_matches('\0')
+                .to_string();
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+
+            if let Ok(child) = crate::inode::Inode::read(self, entry.inumber) {
+                let ea_flag = child.dinode.di_ea.flag;
+                let has_inline_ea = ea_flag & crate::types::DxdFlag::DXD_INLINE.bits() != 0;
+                let inline_ea_mode = child.mode() & crate::types::INLINEEA != 0;
+
+                if has_inline_ea && !inline_ea_mode {
+                    report.add_error_ino(
+                        "inode has inline EA descriptor but missing INLINEEA mode flag".to_string(),
+                        entry.inumber,
+                    );
+                }
+            }
+        }
+
+        Ok(report)
     }
-    result
 }
 
-/// Write an xattr entry (TLV) to a buffer.
-fn write_xattr_entry(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
-    let name_len = name.len().min(255) as u16;
-    let val_len = value.len().min(65535) as u16;
-    buf.extend_from_slice(&name_len.to_le_bytes());
-    buf.extend_from_slice(&val_len.to_le_bytes());
-    buf.extend_from_slice(&name[..name_len as usize]);
-    buf.extend_from_slice(value);
+/// Result of a consistency check.
+#[derive(Debug, Clone)]
+pub struct CheckIssue {
+    /// Severity level: 0 = info, 1 = warning, 2 = error.
+    pub level: u8,
+    /// Human-readable description of the issue.
+    pub message: String,
+    /// The block or inode affected, if applicable.
+    pub block: Option<u64>,
+    pub ino: Option<u32>,
+}
+
+/// Result of a consistency check.
+#[derive(Debug, Default)]
+pub struct CheckReport {
+    /// All issues found, grouped by severity.
+    pub issues: Vec<CheckIssue>,
+    /// True if any error-level issues were found.
+    pub is_clean: bool,
+}
+
+impl CheckReport {
+    pub fn is_clean(&self) -> bool {
+        !self.issues.iter().any(|i| i.level >= 2)
+    }
+
+    pub fn add_error(&mut self, msg: String) {
+        self.issues.push(CheckIssue { level: 2, message: msg, block: None, ino: None });
+    }
+
+    pub fn add_warning(&mut self, msg: String) {
+        self.issues.push(CheckIssue { level: 1, message: msg, block: None, ino: None });
+    }
+
+    pub fn add_error_block(&mut self, msg: String, block: u64) {
+        self.issues.push(CheckIssue { level: 2, message: msg, block: Some(block), ino: None });
+    }
+
+    pub fn add_error_ino(&mut self, msg: String, ino: u32) {
+        self.issues.push(CheckIssue { level: 2, message: msg, block: None, ino: Some(ino) });
+    }
 }

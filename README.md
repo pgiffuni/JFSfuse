@@ -7,6 +7,8 @@ and allocation maps of IBM's [JFS filesystem](https://jfs.sourceforge.net/) enti
 in Rust, providing **read-write** access through the FUSE (Filesystem in Userspace)
 interface with full journaling support.
 
+> **Note:** This code was developed with the assistance of Kilo, an AI coding assistant powered by poolside/laguna-s-2.1:free.
+
 ## Building
 
 ### Prerequisites

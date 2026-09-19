@@ -53,11 +53,11 @@ pub const EINTR: i32 = 4;
     /// - [`FUSE_PARALLEL_DIROPS`] — concurrent directory operations
     /// - [`FUSE_BMAP`] — file block to physical block mapping via Xtree
     /// - [`FUSE_SYNCFS`] — filesystem-wide sync (journal commit + metadata flush + storage sync)
-///
-/// ## Add when implemented
-/// - [`FUSE_DO_READDIRPLUS`] / [`FUSE_READDIRPLUS_AUTO`] — readdir plus
-/// - [`FUSE_WRITEBACK_CACHE`] — deferred writeback caching
-/// - [`FUSE_HANDLE_KILLPRIV`] / [`FUSE_HANDLE_KILLPRIV_V2` — killpriv
+    /// - [`FUSE_DO_READDIRPLUS`] / [`FUSE_READDIRPLUS_AUTO`] — readdir with attributes
+    ///
+    /// ## Add when implemented
+    /// - [`FUSE_WRITEBACK_CACHE`] — deferred writeback caching
+    /// - [`FUSE_HANDLE_KILLPRIV`] — kill privileges on write
 
 pub const FUSE_ASYNC_READ: u32       = 1 << 0;
 pub const FUSE_BIG_WRITES: u32       = 1 << 2;
@@ -67,12 +67,10 @@ pub const FUSE_POSIX_LOCKS: u32      = 1 << 11;
 pub const FUSE_DO_READDIRPLUS: u32   = 1 << 13;
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 pub const FUSE_BMAP: u32             = 1 << 15;
-/// FUSE_SYNCFS — synchronize filesystem-wide metadata to stable storage.
 pub const FUSE_SYNCFS: u32           = 1 << 31;
 pub const FUSE_WRITEBACK_CACHE: u32  = 1 << 20;
 pub const FUSE_PARALLEL_DIROPS: u32  = 1 << 21;
 pub const FUSE_HANDLE_KILLPRIV: u32  = 1 << 27;
-pub const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
 
 /// Lock types (POSIX fcntl `l_type`).
 pub const F_RDLCK: i16 = 0;
@@ -243,6 +241,8 @@ impl FuseFs {
             | FUSE_PARALLEL_DIROPS
             | FUSE_BMAP
             | FUSE_SYNCFS
+            | FUSE_DO_READDIRPLUS
+            | FUSE_READDIRPLUS_AUTO
     }
 
     /// Register an in-flight FUSE request, returning a `RequestId` and

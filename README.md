@@ -93,7 +93,7 @@ fusejfs/
 ## Features
 
 ### Read-only
-Available without feature flags. Supports `lookup`, `readdir`, `read`, `getattr`.
+Available without feature flags. Supports `lookup`, `readdir`, `read`, `getattr`, `lseek` (SEEK_DATA/SEEK_HOLE).
 
 ### Writable (`--features writable`)
 Full journaled write support with ordered-data semantics:
@@ -112,7 +112,6 @@ Full journaled write support with ordered-data semantics:
 | `setattr` | chmod, chown, utimens |
 | `setxattr` / `getxattr` / `listxattr` / `removexattr` | Extended attributes (inline TLV storage) |
 | `rename` | Reserved (EOPNOTSUPP) |
-| `lseek` (SEEK_DATA/SEEK_HOLE) | Find next data extent or hole from a given offset |
 | `fallocate` | Pre-allocate space (mode 0) or punch holes (FALLOC_FL_PUNCH_HOLE \| FALLOC_FL_KEEP_SIZE) |
 
 ### Crash safety

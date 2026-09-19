@@ -1,11 +1,11 @@
-# jfsfuse
+# JFS for fuse
 
 A Rust reimplementation of IBM's JFS (Journaled File System) exposed over FUSE.
 
 This project re-implements the on-disk format, B+-tree managers, journal recovery,
-and allocation maps of IBM's JFS filesystem entirely in Rust, providing **read-write**
-access through the FUSE (Filesystem in Userspace) interface with full journaling
-support.
+and allocation maps of IBM's [JFS filesystem](https://jfs.sourceforge.net/) entirely
+in Rust, providing **read-write** access through the FUSE (Filesystem in Userspace)
+interface with full journaling support.
 
 ## Building
 
@@ -136,7 +136,8 @@ This project contains code with two different licenses:
   `bin/jfsck.rs`, `bin/newjfs.rs`) — are licensed under **MIT**.
 
 Each source file carries an `SPDX-License-Identifier` header identifying its license.
-The package as a whole is distributed under `MIT OR GPL-2.0-or-later`.
+The package as a whole is distributed under `GPL-2.0-or-later` and should IBM or
+a future copyright holder relax the licensing, we can follow.
 
 ## jfsck — Consistency Checker
 

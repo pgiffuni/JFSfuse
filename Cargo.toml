@@ -15,7 +15,7 @@ writable = []
 [dependencies]
 byteorder = "1.5"
 bitflags = "2.6"
-lru = "0.12"
+lru = "0.16"
 log = "0.4"
 thiserror = "1.0"
 uuid = { version = "1.10", features = ["v4"] }

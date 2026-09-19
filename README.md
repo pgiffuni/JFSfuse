@@ -1,6 +1,6 @@
 # jfsfuse
 
-A Rust reimplementation of the Linux JFS (Journaled File System) exposed over FUSE.
+A Rust reimplementation of IBM's JFS (Journaled File System) exposed over FUSE.
 
 This project re-implements the on-disk format, B+-tree managers, journal recovery,
 and allocation maps of IBM's JFS filesystem entirely in Rust, providing **read-write**
@@ -32,9 +32,11 @@ cargo test --features writable
 
 - `jfsfuse-mount` — FUSE filesystem mount utility
 - `jfsck` — JFS consistency checker and diagnostic tool
+- `newjfs` — JFS filesystem image creator
 
 ```sh
 cargo build --bin jfsck --features writable
+cargo build --bin newjfs --features writable
 ```
 
 ## Files
@@ -52,23 +54,24 @@ fusejfs/
 │   │   └── mod.rs
 │   ├── journal/        # Journal subsystem: log I/O and crash recovery (logredo)
 │   │   ├── mod.rs
-│   │   ├── logmgr.rs   # Log manager (mirrors jfs_logmgr.c/h)
+│   │   ├── logmgr.rs   # Log manager (mirrors kernel JFS logmgr)
 │   │   └── recovery.rs # Crash recovery / logredo
 │   ├── alloc/          # Allocation maps: block allocation map and inode allocation map
 │   │   ├── mod.rs
-│   │   ├── dmap.rs     # Block allocation map (mirrors jfs_dmap.c/h)
-│   │   └── imap.rs     # Inode allocation map (mirrors jfs_imap.c/h)
+│   │   ├── dmap.rs     # Block allocation map (mirrors kernel JFS dmap)
+│   │   └── imap.rs     # Inode allocation map (mirrors kernel JFS imap)
 │   ├── btree/          # B+-tree managers: xtree and dtree
 │   │   ├── mod.rs
-│   │   ├── dtree.rs    # Directory B+-tree (mirrors jfs_dtree.c/h)
-│   │   └── xtree.rs    # Extent B+-tree (mirrors jfs_xtree.c/h)
-│   ├── inode.rs        # Runtime inode access (mirrors jfs_incore.h / jfs_inode.c)
+│   │   ├── dtree.rs    # Directory B+-tree (mirrors kernel JFS dtree)
+│   │   └── xtree.rs    # Extent B+-tree (mirrors kernel JFS xtree)
+│   ├── inode.rs        # Runtime inode access (mirrors kernel JFS inode code)
 │   ├── volume.rs       # Volume mount: superblock parsing, journal recovery
 │   ├── fuse/           # FUSE filesystem operations adapter
 │   │   └── mod.rs
 │   └── bin/
 │       ├── mount.rs    # CLI binary entry point (jfsfuse-mount)
-│       └── jfsck.rs    # Consistency checker CLI (jfsck)
+│       ├── jfsck.rs    # Consistency checker CLI (jfsck)
+│       └── newjfs.rs  # Filesystem image creator CLI (newjfs)
 ├── tests/              # Integration tests (organized by phase)
 └── target/             # Cargo build output (git-ignored)
 ```
@@ -77,7 +80,7 @@ fusejfs/
 
 | Module | Responsibility |
 |--------|---------------|
-| `types` | On-disk type definitions for all JFS structures (pxd_t, dxd_t, dinode, xad_t, xtroot, dtroot, logsuper, logpage, lrd, jfs_superblock, iag, dmap). All constants and field accessors mirror the corresponding C headers. |
+| `types` | On-disk type definitions for all JFS structures (pxd_t, dxd_t, dinode, xad_t, xtroot, dtroot, logsuper, logpage, lrd, jfs_superblock, iag, dmap). All constants and field accessors mirror the corresponding kernel JFS headers. |
 | `storage` | Block-level I/O (`Storage` trait, `FileStorage`, `NullStorage`, `MemoryStorage`), a metadata page cache (`PageCache` replacing the kernel's `metapage`/`address_space`), and a raw buffer pool for journal operations. Includes `FaultInjector` for crash-safety testing. |
 | `journal` | Journal/log management and crash recovery. `LogManager` handles log page I/O and logsuper read/write; `JournalRecovery` implements backward-replay logredo to restore filesystem consistency after an unclean shutdown. |
 | `alloc` | Block allocation map (`dmap`) and inode allocation map (`imap`) — the buddy allocator and IAG structures for managing free blocks and inode numbers. |
@@ -97,16 +100,20 @@ Full journaled write support with ordered-data semantics:
 
 | Operation | Description |
 |-----------|-------------|
+| `lookup` / `readdir` | Name→inode resolution and directory listing (read-only) |
+| `getattr` | Get inode attributes (read-only) |
+| `open` / `release` | Open/close file handles (read-only: existence check; writable: open-handle tracking) |
+| `read` | Read file data via xtree extent mapping |
 | `create` / `mkdir` | Create files and directories with inline dtree initialization |
 | `unlink` / `rmdir` | Remove files and directories with link-count management |
 | `write` / `truncate` | Ordered-data writes with block allocation |
-| `open` / `release` | Open-handle tracking for open-unlinked semantics |
 | `link` | Hard links (directories rejected) |
 | `symlink` / `readlink` | Inline symbolic links (paths < 128 bytes) |
 | `setattr` | chmod, chown, utimens |
 | `setxattr` / `getxattr` / `listxattr` / `removexattr` | Extended attributes (inline TLV storage) |
-| `mkdir` / `rmdir` | Directory creation/deletion with `.`/`..` entry management |
 | `rename` | Reserved (EOPNOTSUPP) |
+| `lseek` (SEEK_DATA/SEEK_HOLE) | Find next data extent or hole from a given offset |
+| `fallocate` | Pre-allocate space (mode 0) or punch holes (FALLOC_FL_PUNCH_HOLE \| FALLOC_FL_KEEP_SIZE) |
 
 ### Crash safety
 - Ordered-data journaling: data blocks flushed before metadata journal commit
@@ -126,7 +133,7 @@ This project contains code with two different licenses:
 
 - **Original Rust code** — the storage abstraction layer, FUSE adapter, binaries,
   and crate root (`lib.rs`, `storage/mod.rs`, `fuse/mod.rs`, `bin/mount.rs`,
-  `bin/jfsck.rs`) — are licensed under **MIT**.
+  `bin/jfsck.rs`, `bin/newjfs.rs`) — are licensed under **MIT**.
 
 Each source file carries an `SPDX-License-Identifier` header identifying its license.
 The package as a whole is distributed under `MIT OR GPL-2.0-or-later`.
@@ -134,14 +141,13 @@ The package as a whole is distributed under `MIT OR GPL-2.0-or-later`.
 ## jfsck — Consistency Checker
 
 `jfsck` is a standalone tool for checking and repairing JFS filesystems,
-modeled after FreeBSD's `fsck_ffs(8)`.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `jfsck --read-only <image>` | Check filesystem consistency without mounting for write. Reports errors/warnings found in superblock, journal, root inode, directory entries, extent trees, and xattr metadata. |
-| `jfsck --repair <image>` | Not yet implemented. Exits with an error message. Automatic repair is disabled until the checker can produce a complete diagnostic report. |
+| `jfsck --repair <image>` | Run a consistency check, then apply safe repairs when the filesystem is structurally consistent. Currently clears a stale `FM_DIRTY` superblock state after journal replay. Requires `--features writable`. |
 | `jfsck --replay <image>` | Mount the filesystem and replay the journal if needed. Use after an unclean shutdown. Requires `--features writable`. |
 | `jfsck --dump-inode <image> <ino>` | Print detailed metadata for a single inode: mode, size, nlink, uid/gid, and xtree/dtree layout. |
 | `jfsck --dump-xtree <image> <ino>` | Show the extent tree for a regular file or directory, including logical offset, length, and physical address for each extent. |
@@ -151,14 +157,18 @@ modeled after FreeBSD's `fsck_ffs(8)`.
 ### Example
 
 ```sh
+# Create a filesystem image (optional: specify block count, default 4096 = 16 MiB)
+newjfs /tmp/myfs.jfs
+newjfs /tmp/myfs.jfs 8192       # 32 MiB
+
 # Check filesystem
-jfsck --read-only /path/to/image.jfs
+jfsck --read-only /tmp/myfs.jfs
 
 # Dump a specific inode
-jfsck --dump-inode /path/to/image.jfs 18
+jfsck --dump-inode /tmp/myfs.jfs 18
 
 # Show journal state
-jfsck --dump-journal /path/to/image.jfs
+jfsck --dump-journal /tmp/myfs.jfs
 ```
 
 ## Architecture

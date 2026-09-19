@@ -156,14 +156,73 @@ impl FuseFs {
 
     /// Read file data at offset.
     pub fn read(&mut self, ino: u32, offset: u64, length: usize) -> Option<Vec<u8>> {
-        let size = Inode::read(&mut self.volume, ino).ok()?.size();
+        let inode = Inode::read(&mut self.volume, ino).ok()?;
+        let size = inode.size();
         if offset >= size {
             return Some(vec![]);
         }
-        let inode = Inode::read(&mut self.volume, ino).ok()?;
+        let max_read = std::cmp::min(length, (size - offset) as usize);
         let xtree = Xtree::from_inode_data(inode.xtroot_bytes()).ok()?;
         let storage = self.volume.storage.clone();
-        xtree.read_data(offset, length, &*storage).ok()
+        xtree.read_data(offset, max_read, &*storage).ok()
+    }
+
+    /// lseek — find the next data segment or hole from a given offset.
+    ///
+    /// Implements SEEK_DATA and SEEK_HOLE by walking the file's xtree
+    /// extent list. Returns the byte offset of the next data region
+    /// (SEEK_DATA) or hole (SEEK_HOLE), relative to the file start.
+    ///
+    /// Seek constants (Linux `<unistd.h>`):
+    /// - `SEEK_DATA = 3` — returns the offset of the next data extent at or after `offset`
+    /// - `SEEK_HOLE = 4` — returns the offset of the next hole at or after `offset`
+    pub fn lseek_data_or_hole(&mut self, ino: u32, offset: u64, seek_type: i32) -> Option<u64> {
+        const SEEK_DATA: i32 = 3;
+        const SEEK_HOLE: i32 = 4;
+
+        let inode = Inode::read(&mut self.volume, ino).ok()?;
+        let size = inode.size();
+        let block = crate::storage::BLOCK_SIZE as u64;
+
+        match seek_type {
+            SEEK_DATA => {
+                let xtree = Xtree::from_inode_data(inode.xtroot_bytes()).ok()?;
+
+                for ext in xtree.iter_extents() {
+                    let ext_start = ext.offset as u64 * block;
+                    let ext_end = ext_start + ext.length as u64 * block;
+
+                    if ext_end > offset {
+                        if ext_start <= offset {
+                            return Some(offset);
+                        } else {
+                            return Some(ext_start);
+                        }
+                    }
+                }
+
+                Some(size)
+            }
+            SEEK_HOLE => {
+                let xtree = Xtree::from_inode_data(inode.xtroot_bytes()).ok()?;
+
+                for ext in xtree.iter_extents() {
+                    let ext_start = ext.offset as u64 * block;
+                    let ext_end = ext_start + ext.length as u64 * block;
+
+                    if ext_start > offset {
+                        return Some(offset);
+                    }
+
+                    if offset < ext_end {
+                        return Some(ext_end);
+                    }
+                }
+
+                Some(size)
+            }
+            _ => None,
+        }
     }
 
     /// Create a file (write-supported, gated behind `writable`).
@@ -211,6 +270,36 @@ impl FuseFs {
             return None;
         }
         self.volume.truncate(ino, new_size).ok()
+    }
+
+    /// Pre-allocate or deallocate file space (writable builds only).
+    ///
+    /// Implements `fallocate(2)` semantics via the FUSE `fallocate` operation.
+    /// Supports space preallocation (mode 0) and hole punching
+    /// (`FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`).
+    #[cfg(feature = "writable")]
+    pub fn fallocate(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        len: u64,
+        mode: u32,
+    ) -> FuseResult<()> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume
+            .fallocate(ino, offset, len, mode)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not supported") {
+                    EOPNOTSUPP
+                } else if msg.contains("no contiguous free blocks") || msg.contains("no free") {
+                    ENOSPC
+                } else {
+                    EIO
+                }
+            })
     }
 
     /// Remove a file (write-supported, gated behind `writable`).

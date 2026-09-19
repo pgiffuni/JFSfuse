@@ -12,6 +12,7 @@
 //! - [`transaction`] — transaction manager for journaled write transactions
 //! - [`fuse`] — FUSE filesystem operations adapter
 
+pub mod mkfs;
 pub mod alloc;
 pub mod btree;
 pub mod fuse;

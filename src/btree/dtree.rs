@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Directory B+-tree manager (dtree).
 //!
-//! Mirrors `jfs_dtree.c` / `jfs_dtree.h` — manages the directory entry B+-tree.
+//! Mirrors the kernel JFS dtree code — manages the directory entry B+-tree.
 //! Maps filenames to inode numbers. Root is inline in the directory inode
 //! as `dtroot_t` — a union of a header (32 bytes) and `dtslot[9]` (9*32=288 bytes).
 //!

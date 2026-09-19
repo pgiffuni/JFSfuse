@@ -47,6 +47,7 @@ pub struct TransactionManager {
     next_txid: AtomicU64,
     active: Option<ActiveTxn>,
     write_lock: std::sync::Mutex<()>,
+    last_committed: std::sync::atomic::AtomicU64,
 }
 
 impl TransactionManager {
@@ -55,6 +56,7 @@ impl TransactionManager {
             next_txid: AtomicU64::new(1),
             active: None,
             write_lock: std::sync::Mutex::new(()),
+            last_committed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -79,8 +81,18 @@ impl TransactionManager {
     }
 
     /// Transaction ID of the currently active transaction, if any.
+    /// If no transaction is active, returns the last committed transaction ID.
     pub fn current_txid(&self) -> Option<TransactionId> {
-        self.active.as_ref().map(|a| a.txid)
+        if let Some(tx) = &self.active {
+            Some(tx.txid)
+        } else {
+            let last = self.last_committed.load(Ordering::SeqCst);
+            if last > 0 {
+                Some(last)
+            } else {
+                None
+            }
+        }
     }
 
     /// Mark a page dirty and associate it with the current transaction.
@@ -188,6 +200,8 @@ impl TransactionManager {
                 let _ = cache.put(*inode, p);
             }
         }
+
+        self.last_committed.store(txid, Ordering::SeqCst);
 
         Ok(CommitResult {
             pages_written: written,

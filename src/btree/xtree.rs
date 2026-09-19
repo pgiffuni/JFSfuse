@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Extent descriptor B+-tree manager (xtree).
 //!
-//! Mirrors `jfs_xtree.c` / `jfs_xtree.h` — manages the extent allocation
+//! Mirrors the kernel JFS xtree code — manages the extent allocation
 //! descriptor B+-tree. Maps file offsets (in fsblocks) to disk block addresses.
 //!
 //! Root can be inline in the inode (`xtroot_t`) or in external pages (`xtpage_t`).
@@ -297,14 +297,21 @@ impl Xtree {
             return false;
         }
 
-        let idx = next_idx as usize;
+        // For an empty or header-overlap xtroot, the first real entry goes at
+        // XTENTRYSTART. The on-disk xad array at offset 32 corresponds to
+        // xad[XTENTRYSTART] in the in-memory array.
+        let idx = if next_idx as usize <= XTENTRYSTART {
+            XTENTRYSTART
+        } else {
+            next_idx as usize
+        };
         let xad = &mut self.root.xad[idx];
         xad.set_offset(logical_offset);
         xad.set_length(length);
         xad.set_address(physical_addr);
         xad.set_flag(XadFlag::XAD_NEW);
 
-        self.root.header.set_nextindex(next_idx + 1);
+        self.root.header.set_nextindex(idx as u16 + 1);
         true
     }
 
@@ -384,7 +391,99 @@ impl Xtree {
         freed
     }
 
-    /// Validate the xtree's invariant: extents must be in ascending logical
+    /// Remove extents within the range `[start_fsb, end_fsb)`.
+    ///
+    /// Extents entirely within the range are freed and removed. Extents
+    /// straddling the boundaries are split: the portion outside the range
+    /// is kept, the portion inside is freed.
+    ///
+    /// Returns a list of `(physical_address, block_count)` pairs for the
+    /// freed blocks.
+    pub fn punch_extents(&mut self, start_fsb: i64, end_fsb: i64) -> Vec<(u64, u32)> {
+        let next_idx = self.root.header.nextindex() as usize;
+        let mut kept: Vec<Xad> = Vec::new();
+        let mut freed = Vec::new();
+
+        for i in XTENTRYSTART..next_idx {
+            if i >= XTROOTMAXSLOT {
+                break;
+            }
+            let xad = &self.root.xad[i];
+            let ext_offset = xad.offset() as i64;
+            let ext_length = xad.length() as u32;
+            let ext_addr = xad.address();
+
+            if ext_length == 0 {
+                continue;
+            }
+
+            let ext_end = ext_offset + ext_length as i64;
+
+            if ext_end <= start_fsb {
+                // Entirely before the punch range — keep as-is.
+                kept.push(*xad);
+            } else if ext_offset >= end_fsb {
+                // Entirely after the punch range — keep as-is.
+                kept.push(*xad);
+            } else if ext_offset >= start_fsb && ext_end <= end_fsb {
+                // Entirely within the punch range — free and remove.
+                freed.push((ext_addr, ext_length));
+            } else if ext_offset < start_fsb && ext_end > end_fsb {
+                // Spans the entire punch range — split into two.
+                let left_len = (start_fsb - ext_offset) as u32;
+                let right_len = (ext_end - end_fsb) as u32;
+                let right_addr = ext_addr + left_len as u64;
+
+                freed.push((ext_addr + left_len as u64, (end_fsb - start_fsb) as u32));
+
+                let mut left = *xad;
+                left.set_length(left_len);
+                kept.push(left);
+
+                let mut right = *xad;
+                right.set_offset(end_fsb);
+                right.set_length(right_len);
+                right.set_address(right_addr);
+                kept.push(right);
+            } else if ext_offset < start_fsb {
+                // Starts before punch range, extends into it — keep left part.
+                let keep_len = (start_fsb - ext_offset) as u32;
+                let free_len = ext_length - keep_len;
+                freed.push((ext_addr + keep_len as u64, free_len));
+
+                let mut xad_copy = *xad;
+                xad_copy.set_length(keep_len);
+                kept.push(xad_copy);
+            } else {
+                // Starts within punch range, extends past it — keep right part.
+                let keep_len = (ext_end - end_fsb) as u32;
+                let free_len = (end_fsb - ext_offset) as u32;
+                freed.push((ext_addr, free_len));
+
+                let mut xad_copy = *xad;
+                xad_copy.set_offset(end_fsb);
+                xad_copy.set_length(keep_len);
+                xad_copy.set_address(ext_addr + free_len as u64);
+                kept.push(xad_copy);
+            }
+        }
+
+        // Write kept extents back.
+        for (write_idx, xad) in kept.iter().enumerate() {
+            let idx = XTENTRYSTART + write_idx;
+            if idx < XTROOTMAXSLOT {
+                self.root.xad[idx] = *xad;
+            }
+        }
+        let new_next = XTENTRYSTART + kept.len();
+        for idx in new_next..next_idx.min(XTROOTMAXSLOT) {
+            self.root.xad[idx] = Xad::default();
+        }
+        self.root.header.set_nextindex(new_next as u16);
+        freed
+    }
+
+
     /// order with no overlapping ranges.
     ///
     /// Returns an error string if the invariant is violated.

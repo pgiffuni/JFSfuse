@@ -4,18 +4,15 @@
 
 use std::sync::Arc;
 
-use byteorder::{ByteOrder, LittleEndian};
-
 use jfsfuse::journal::LogManager;
-use jfsfuse::storage::{BLOCK_SIZE, FileStorage, MemoryStorage, Storage};
+use jfsfuse::mkfs;
+use jfsfuse::storage::{BLOCK_SIZE, Storage};
 use jfsfuse::types::{LOGMAGIC, LOGREDONE, LOGWRAP, LOGVERSION, LogSuper};
 use jfsfuse::volume::Volume;
 
-const IMAGE_PATH: &str = "/tmp/kilo/test_jfs.img";
-
 /// Read the inline log base from the JFS superblock.
 fn read_inline_log_base(storage: &dyn Storage) -> Option<u64> {
-    use jfsfuse::types::{SUPER1_OFF, PSIZE, JfsSuperblock};
+    use jfsfuse::types::{PSIZE, SUPER1_OFF, JfsSuperblock};
     let sb_bytes = storage.read_bytes(SUPER1_OFF, PSIZE).unwrap();
     let mut sb = JfsSuperblock::default();
     if sb_bytes.len() >= 80 {
@@ -33,25 +30,15 @@ fn read_inline_log_base(storage: &dyn Storage) -> Option<u64> {
 
 #[test]
 fn test_volume_mount_runs_recovery_on_dirty_log() {
-    // Load the test image into MemoryStorage so we can modify it.
-    let real = FileStorage::open(std::path::Path::new(IMAGE_PATH)).unwrap();
-    let num_blocks = real.size_blocks();
-    let mut mem = MemoryStorage::new(num_blocks);
-
-    // Copy the entire image into memory.
-    for block in 0..num_blocks {
-        let data = real.read_block(block).unwrap();
-        mem.write_block(block, &data).unwrap();
-    }
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
+    // Generate a JFS image in memory so we can modify it.
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
 
     // Verify the log is currently LOGREDONE (clean).
     let log_base = read_inline_log_base(&*storage).expect("image should have inline log");
     let ls_clean = LogManager::read_super(&*storage, log_base).unwrap();
     assert_eq!(
         ls_clean.state(), LOGREDONE,
-        "test image should start with LOGREDONE state"
+        "generated image should start with LOGREDONE state"
     );
 
     // Simulate an unclean shutdown: change logsuper state to LOGWRAP.
@@ -61,9 +48,6 @@ fn test_volume_mount_runs_recovery_on_dirty_log() {
         let mut lm = LogManager::new(storage.clone(), ls_clean, log_base);
         lm.write_super(&ls_dirty).unwrap();
     }
-
-    // Also mark the filesystem state as dirty (FM_DIRTY) to trigger recovery.
-    // This is done by modifying s_state in the superblock.
 
     // Mount the volume — this should run recovery.
     let result = Volume::open_from_storage(storage);
@@ -87,9 +71,9 @@ fn test_volume_mount_runs_recovery_on_dirty_log() {
 
 #[test]
 fn test_volume_mount_skips_recovery_on_clean_log() {
-    let storage = Arc::new(FileStorage::open(std::path::Path::new(IMAGE_PATH)).unwrap());
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
 
-    // The test image has a clean log (LOGREDONE). Mount should succeed
+    // The generated image has a clean log (LOGREDONE). Mount should succeed
     // without running recovery.
     let result = Volume::open_from_storage(storage);
     assert!(result.is_ok(), "mount with clean log should succeed");

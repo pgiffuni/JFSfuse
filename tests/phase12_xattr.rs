@@ -1,48 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Phase 12: Extended attribute tests.
 //!
-//! Tests xattr set/get/list/remove operations on a real JFS image.
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
+//! Tests xattr set/get/list/remove operations on a generated JFS image.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
 use jfsfuse::fuse::{EEXIST, ENOENT, EROFS};
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
 
-fn load_image_to_memory() -> Option<Volume> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return None;
-    }
-
-    let data = std::fs::read(path).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    Some(Volume::open_from_storage(storage).expect("should mount JFS image from memory"))
+fn load_image_to_memory() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 #[cfg(feature = "writable")]
 #[test]
 fn test_setxattr_and_getxattr() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -65,10 +43,6 @@ fn test_setxattr_and_getxattr() {
 #[test]
 fn test_setxattr_replace() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -101,10 +75,6 @@ fn test_setxattr_replace() {
 #[test]
 fn test_listxattr() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -129,10 +99,6 @@ fn test_listxattr() {
 #[test]
 fn test_removexattr() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -169,10 +135,6 @@ fn test_removexattr() {
 #[test]
 fn test_xattr_rejected_in_readonly_mode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     // Don't enable writable.
 
@@ -189,10 +151,6 @@ fn test_xattr_rejected_in_readonly_mode() {
 #[test]
 fn test_xattr_get_nonexistent() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -211,10 +169,6 @@ fn test_xattr_get_nonexistent() {
 #[test]
 fn test_xattr_long_name_rejected() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -234,10 +188,6 @@ fn test_xattr_long_name_rejected() {
 #[test]
 fn test_xattr_multiple_on_same_inode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 

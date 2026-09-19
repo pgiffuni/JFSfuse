@@ -3,8 +3,7 @@
 //!
 //! All structures are `#[repr(C, packed)]` with explicit little-endian field
 //! access, preserving binary compatibility with the Linux JFS on-disk format
-//! (see `fs/jfs/jfs_types.h`, `jfs_filsys.h`, `jfs_dinode.h`, `jfs_xtree.h`,
-//! `jfs_dtree.h`, `jfs_imap.h`, `jfs_dmap.h`, `jfs_logmgr.h`).
+//! (see the Linux JFS on-disk format).
 //!
 //! Field accessors (`length`, `address`, etc.) mirror the C macros
 //! (`lengthPXD`, `addressPXD`, `lengthXAD`, `offsetXAD`) using Rust method
@@ -12,29 +11,29 @@
 //!
 //! ## Provenance
 //!
-//! | Rust type | C header | On-disk size |
+//! | Rust type | C struct | On-disk size |
 //! |-----------|----------|-------------|
-//! | [`Pxd`] | `jfs_types.h:pxd_t` | 8 bytes |
-//! | [`Dxd`] | `jfs_types.h:dxd_t` | 16 bytes |
-//! | [`Timestruc`] | `jfs_types.h:timestruc_t` | 8 bytes |
-//! | [`Dinode`] | `jfs_dinode.h:dinode` | 512 bytes |
-//! | [`Xad`] | `jfs_xtree.h:xad_t` | 16 bytes |
-//! | [`XtHeader`] | `jfs_xtree.h:xtheader` | 24 bytes |
-//! | [`XtRoot`] | `jfs_xtree.h:xtroot_t` | 288 bytes |
-//! | [`BtPage`] | `jfs_btree.h:btpage` | 4096 bytes |
-//! | [`DtSlot`] | `jfs_dtree.h:dtslot` | 32 bytes |
-//! | [`LdtEntry`] | `jfs_dtree.h:ldtentry` | 32 bytes |
-//! | [`LogSuper`] | `jfs_logmgr.h:logsuper` | 208+ bytes |
-//! | [`Logpage`] | `jfs_logmgr.h:logpage` | 4096 bytes |
-//! | [`Lrd`] | `jfs_logmgr.h:lrd` | 36 bytes |
-//! | [`Iag`] | `jfs_imap.h:iag` | 4096 bytes |
-//! | [`Dmap`] | `jfs_dmap.h:dmap` | 4096 bytes |
-//! | [`JfsSuperblock`] | `jfs_superblock.h:jfs_superblock` | 256 bytes |
+//! | [`Pxd`] | `pxd_t` | 8 bytes |
+//! | [`Dxd`] | `dxd_t` | 16 bytes |
+//! | [`Timestruc`] | `timestruc_t` | 8 bytes |
+//! | [`Dinode`] | `dinode` | 512 bytes |
+//! | [`Xad`] | `xad_t` | 16 bytes |
+//! | [`XtHeader`] | `xtheader` | 24 bytes |
+//! | [`XtRoot`] | `xtroot_t` | 288 bytes |
+//! | [`BtPage`] | `btpage` | 4096 bytes |
+//! | [`DtSlot`] | `dtslot` | 32 bytes |
+//! | [`LdtEntry`] | `ldtentry` | 32 bytes |
+//! | [`LogSuper`] | `logsuper` | 208+ bytes |
+//! | [`Logpage`] | `logpage` | 4096 bytes |
+//! | [`Lrd`] | `lrd` | 36 bytes |
+//! | [`Iag`] | `iag` | 4096 bytes |
+//! | [`Dmap`] | `dmap` | 4096 bytes |
+//! | [`JfsSuperblock`] | `jfs_superblock` | 256 bytes |
 
 use byteorder::{ByteOrder, LittleEndian};
 
 // ──────────────────────────── Constants ────────────────────────────
-// From jfs_filsys.h — filesystem block layout constants.
+// Filesystem block layout constants.
 
 pub const PSIZE: usize = 4096;
 pub const L2PSIZE: u8 = 12;
@@ -48,7 +47,7 @@ pub const L2INODESLOTSIZE: u8 = 7;
 pub const IDATASIZE: usize = 256;
 pub const IXATTRSIZE: usize = 128;
 
-// Inode allocation map (from jfs_imap.h): each IAG manages 4096 inodes
+// Inode allocation map. Each IAG manages 4096 inodes
 // in 128 extents of 32 inodes each.
 pub const IAG_SIZE: usize = 4096;
 pub const INOSPERIAG: u32 = 4096;
@@ -59,12 +58,12 @@ pub const IXSIZE: usize = DISIZE * (INOSPEREXT as usize);
 pub const INOSPERPAGE: u32 = 8;
 pub const L2INOSPERPAGE: u8 = 3;
 
-// B+-tree common constants (from jfs_btree.h).
+// B+-tree common constants.
 pub const MAXTREEHEIGHT: usize = 8;
 pub const EXTSPERIAG: usize = 128;
 pub const EXTSPERIAG_I: usize = 128;
 
-// Log constants (from jfs_logmgr.h): log page size, max active volumes.
+// Log constants: log page size, max active volumes.
 pub const LOGPSIZE: usize = 4096;
 pub const L2LOGPSIZE: u8 = 12;
 pub const LOGPAGES: usize = 16;
@@ -76,7 +75,7 @@ pub const MAX_ACTIVE: usize = 128;
 pub const JFS_MAGIC: &[u8; 4] = b"JFS1";
 pub const JFS_VERSION: u32 = 2;
 
-// Superblock locations (from jfs_filsys.h): fixed at block offsets 64–112.
+// Superblock locations (from JFS filesystem constants): fixed at block offsets 64–112.
 pub const SUPER1_B: u64 = 64;
 pub const AIMAP_B: u64 = SUPER1_B + 8;
 pub const AITBL_B: u64 = AIMAP_B + 16;
@@ -94,7 +93,7 @@ pub const AGGR_RSVD_BLOCKS: u64 = SUPER1_B;
 pub const AGGR_RSVD_BYTES: u64 = SUPER1_OFF;
 pub const AGGR_INODE_TABLE_START: u64 = AITBL_OFF;
 
-// Reserved inode numbers (from jfs_filsys.h).
+// Reserved inode numbers (from JFS filesystem constants).
 pub const AGGR_RESERVED_I: u32 = 0;
 pub const AGGREGATE_I: u32 = 1;
 pub const BMAP_I: u32 = 2;
@@ -107,20 +106,20 @@ pub const ACL_I: u32 = 3;
 pub const FILESET_OBJECT_I: u32 = 4;
 pub const FILESYSTEM_I: u32 = 16;
 
-// Filesystem state flags (from jfs_filsys.h: FM_*).
+// Filesystem state flags (from JFS filesystem constants: FM_*).
 pub const FM_CLEAN: u32 = 0x00000000;
 pub const FM_MOUNT: u32 = 0x00000001;
 pub const FM_DIRTY: u32 = 0x00000002;
 pub const FM_LOGREDO: u32 = 0x00000004;
 pub const FM_EXTENDFS: u32 = 0x00000008;
 
-// Log superblock state values (from jfs_logmgr.h).
+// Log superblock state values.
 pub const LOGMOUNT: u32 = 0;
 pub const LOGREDONE: u32 = 1;
 pub const LOGWRAP: u32 = 2;
 pub const LOGREADERR: u32 = 3;
 
-// Log record types (lrd.type, from jfs_logmgr.h).
+// Log record types (lrd.type).
 pub const LOG_COMMIT: u16 = 0x8000;
 pub const LOG_SYNCPT: u16 = 0x4000;
 pub const LOG_MOUNT: u16 = 0x2000;
@@ -130,7 +129,7 @@ pub const LOG_NOREDOINOEXT: u16 = 0x0040;
 pub const LOG_UPDATEMAP: u16 = 0x0008;
 pub const LOG_NOREDOFILE: u16 = 0x0001;
 
-// REDOPAGE data type flags (from jfs_logmgr.h).
+// REDOPAGE data type flags.
 pub const LOG_INODE: u16 = 0x0001;
 pub const LOG_XTREE: u16 = 0x0002;
 pub const LOG_DTREE: u16 = 0x0004;
@@ -143,7 +142,7 @@ pub const LOG_EXTEND: u16 = 0x0200;
 pub const LOG_RELOCATE: u16 = 0x0400;
 pub const LOG_DIR_XTREE: u16 = 0x0800;
 
-// Mode extended bits (from jfs_dinode.h: high 16 bits of di_mode).
+// Mode extended bits (high 16 bits of di_mode).
 pub const IFJOURNAL: u32 = 0x00010000;
 pub const ISPARSE: u32 = 0x00020000;
 pub const INLINEEA: u32 = 0x00040000;
@@ -155,11 +154,11 @@ pub type BlockNo = u64;
 /// Block length type — count in filesystem blocks.
 pub type BlockLength = u64;
 
-/// Number of bytes per filesystem block (PSIZE from jfs_filsys.h).
+/// Number of bytes per filesystem block (PSIZE from JFS filesystem constants).
 pub const BLOCK_SIZE: usize = PSIZE;
 
 // ──────────────────────── pxd_t: physical extent descriptor ────────────────────────
-// From jfs_types.h. Encodes a 40-bit block address and a 24-bit length in 8 bytes.
+// Encodes a 40-bit block address and a 24-bit length in 8 bytes.
 // The high 8 bits of `len_addr` hold the upper byte of the address; the low
 // 24 bits hold the length. `addr2` holds the low 32 bits of the address.
 // Max extent: 2^24 - 1 blocks (≈64 GB at 4 KB). Max volume: 2^40 blocks (≈4 PiB).
@@ -226,7 +225,7 @@ impl Pxd {
 }
 
 // ──────────────────────── dxd_t: data extent descriptor ────────────────────────
-// From jfs_types.h. Used for ACL, extended attribute, and symlink descriptors.
+// Used for ACL, extended attribute, and symlink descriptors.
 // 16 bytes: 1-byte flag, 3-byte reserved, 4-byte size (LE), then an embedded Pxd.
 
 #[repr(C, packed)]
@@ -275,7 +274,7 @@ impl Dxd {
 }
 
 // ──────────────────────── xad_t: xtree extent descriptor ────────────────────────
-// From jfs_xtree.h. Each entry maps a logical file offset to a physical extent.
+// Each entry maps a logical file offset to a physical extent.
 // 16 bytes: 1-byte flag, 2-byte reserved, 1-byte off1 + 4-byte off2 (LE) for a
 // split 40-bit extent offset, then a Pxd for the physical location.
 // The offset is split across off1 (high 8 bits) and off2 (low 32 bits).
@@ -338,7 +337,7 @@ impl Xad {
 }
 
 // ──────────────────────── pxdlist ────────────────────────
-// From jfs_types.h. A small array of up to MAXTREEHEIGHT (8) physical extents.
+// A small array of up to MAXTREEHEIGHT (8) physical extents.
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
@@ -349,7 +348,7 @@ pub struct PxdList {
 }
 
 // ──────────────────────── timestruc_t ────────────────────────
-// From jfs_types.h. On-disk timestamp: little-endian seconds + nanoseconds.
+// On-disk timestamp: little-endian seconds + nanoseconds.
 // Differs from Linux's timespec in using `__le32` for portability.
 
 #[repr(C, packed)]
@@ -378,7 +377,7 @@ impl Timestruc {
 }
 
 // ──────────────────────── dinode ────────────────────────
-// From jfs_dinode.h. The on-disk inode is always 512 bytes (DISIZE).
+// The on-disk inode is always 512 bytes (DISIZE).
 // Layout: 128-byte base area, then a 384-byte union that varies by file type:
 //   - Directories: dtroot (B+-tree root, 9 slots × 32 bytes = 288 bytes)
 //   - Regular files: xtroot (extent B+-tree root, 18 xad slots × 16 bytes = 288 bytes)
@@ -521,7 +520,7 @@ impl Dinode {
     }
 
     /// Parse a raw 512-byte dinode from disk into the struct fields.
-    /// Mirrors `copy_from_dinode()` in jfs_imap.c.
+    /// Mirrors `copy_from_dinode()`.
     pub fn parse(data: &[u8], dinode: &mut Dinode) -> std::result::Result<(), String> {
         if data.len() < std::mem::size_of::<Dinode>() {
             return Err("insufficient data for dinode".to_string());
@@ -577,7 +576,7 @@ impl Dinode {
 }
 
 // ──────────────────────── xtree structures ────────────────────────
-// From jfs_xtree.h. The extent B+-tree maps logical file offsets (in fsblocks)
+// The extent B+-tree maps logical file offsets (in fsblocks)
 // to physical disk block addresses. Max extent length: 2^24−1 blocks (MAXXLEN).
 
 /// Maximum extent length (24-bit field limit from pxd_t).
@@ -595,7 +594,7 @@ pub const XTPAGEMAXSLOT: usize = 256;
 /// First xad slot index that holds real data (first 2 overlap the header).
 pub const XTENTRYSTART: usize = 2;
 
-/// B+-tree page header for both xtree root and pages (jfs_xtree.h:xtheader).
+/// B+-tree page header for both xtree root and pages (xtheader).
 /// 24 bytes. `next`/`prev` are sibling pointers; `nextindex` is the entry
 /// count in use; `maxentry` is the slot capacity; `self` (pxd) is this page's
 /// own disk extent.
@@ -645,7 +644,7 @@ impl XtHeader {
 }
 
 /// Extent B+-tree root (xtroot_t) — stored inline in the inode's union area.
-/// From jfs_xtree.h. A union of xtheader + xad array. For BT_ROOT pages,
+/// A union of xtheader + xad array. For BT_ROOT pages,
 /// `bt == 0` indicates the root is in the inode (no disk I/O needed).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -688,7 +687,7 @@ impl XtRoot {
 }
 
 // ──────────────────────── dtree structures ────────────────────────
-// From jfs_dtree.h. The directory B+-tree maps filenames (UCS-2) to inode
+// The directory B+-tree maps filenames (UCS-2) to inode
 // numbers. Uses 32-byte fixed slots; variable-length names may span multiple
 // linked slots. Entries are kept sorted via a 1-byte-per-entry index table
 // (stbl) for binary search.
@@ -743,12 +742,12 @@ pub struct LdtEntry {
 }
 
 // ──────────────────────── B+-tree common ────────────────────────
-// From jfs_btree.h. All B+-trees (xtree, dtree) use a common page format:
+// All B+-trees (xtree, dtree) use a common page format:
 // 16-byte header (next/prev sibling, flag, self-address) + 4064-byte entry area.
 
 pub const BTPAGE_ENTRY_SIZE: usize = 4064;
 
-/// Common B+-tree page header (jfs_btree.h:btpage).
+/// Common B+-tree page header (btpage).
 /// 32 bytes: sibling links, flag (type/root/leaf/etc.), and self block address.
 /// The `entry` array holds type-specific slot data (xad, dtslot, etc.).
 #[repr(C, packed)]
@@ -775,7 +774,7 @@ impl Default for BtPage {
     }
 }
 
-/// B+-tree page flags (jfs_btree.h). `BT_TYPE` (0x07) masks the page type.
+/// B+-tree page flags. `BT_TYPE` (0x07) masks the page type.
 bitflags::bitflags! {
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -791,7 +790,7 @@ bitflags::bitflags! {
 }
 
 // ──────────────────────── logsuper ────────────────────────
-// From jfs_logmgr.h. Located at disk block 1 (after the unused block 0).
+// Located at disk block 1 (after the unused block 0).
 // The log superblock records the log's magic, size, state, and active volumes.
 
 #[repr(C)]
@@ -811,7 +810,7 @@ pub struct LogSuper {
     pub active: [ActiveEntry; MAX_ACTIVE],
 }
 
-/// One entry in the logsuper active-volume table (jfs_logmgr.h).
+/// One entry in the logsuper active-volume table.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ActiveEntry {
@@ -891,14 +890,14 @@ impl LogSuper {
 }
 
 // ──────────────────────── logpage ────────────────────────
-// From jfs_logmgr.h. 4096-byte log page: header (8 bytes), data array,
+// 4096-byte log page: header (8 bytes), data array,
 // and trailer (4 bytes). XOR integrity: XOR all 32-bit words in `data`;
 // the upper 16 bits go in the header `eor`, the lower 16 bits in the trailer
 // `eor`. The trailer `page` field must match the header `page` field.
 
 pub const LOG_PAGE_DATA_WORDS: usize = LOGPSIZE / 4 - 4;
 
-/// Log page with XOR integrity check (jfs_logmgr.h:logpage).
+/// Log page with XOR integrity check.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Logpage {
@@ -917,7 +916,7 @@ impl Default for Logpage {
     }
 }
 
-/// Log page header (jfs_logmgr.h). 8 bytes: page number + end-of-record offset.
+/// Log page header. 8 bytes: page number + end-of-record offset.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct LogpageHeader {
@@ -926,7 +925,7 @@ pub struct LogpageHeader {
     pub eor: [u8; 2],
 }
 
-/// Log page trailer (jfs_logmgr.h). Mirrors header for XOR validation.
+/// Log page trailer. Mirrors header for XOR validation.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct LogpageTrailer {
@@ -966,7 +965,7 @@ impl Logpage {
 }
 
 // ──────────────────────── lrd (log record descriptor) ────────────────────────
-// From jfs_logmgr.h. Each log record is `[data][lrd]` (36 bytes). The `type`
+// Each log record is `[data][lrd]` (36 bytes). The `type`
 // field selects the interpretation: LOG_COMMIT, LOG_REDOPAGE, LOG_NOREDOPAGE,
 // LOG_NOREDOINOEXT, LOG_UPDATEMAP, LOG_SYNCPT, LOG_MOUNT. `backchain` links
 // records within a transaction (0 = last record). The union fields
@@ -1087,9 +1086,9 @@ impl Lrd {
         self.r#type() & LOG_MOUNT != 0
     }
 }
+// ──────────────────────── Superblock ────────────────────────
 
-// ──────────────────────── jfs_superblock ────────────────────────
-// From jfs_superblock.h. The aggregate superblock at fixed offset 0x8000.
+/// The aggregate superblock at fixed offset 0x8000.
 // Magic "JFS1", version 2, block size must be PSIZE (4096). The superblock
 // also carries inline log extent (s_logpxd), fsck work extent (s_fsckpxd),
 // and secondary AIM/AIT extents for aggregate inode table.
@@ -1241,13 +1240,13 @@ impl JfsSuperblock {
 }
 
 // ──────────────────────── IAG (Inode Allocation Group) ────────────────────────
-// From jfs_imap.h. Each IAG is a 4096-byte page managing 4096 inodes
+// Each IAG is a 4096-byte page managing 4096 inodes
 // (INOSPERIAG) arranged as 128 extents (EXTSPERIAG) of 32 inodes each.
 // Contains working/persistent allocation bitmaps and per-extent pxd descriptors
 // pointing to the actual disk inode pages.
 
 /// On-disk IAG (Inode Allocation Group) page — 4096 bytes.
-/// From jfs_imap.h. Manages 128 inode extents (EXTSPERIAG = 128), each
+/// Manages 128 inode extents (EXTSPERIAG = 128), each
 /// covering 32 inodes. `wmap` is the working (transient) bitmap, `pmap`
 /// is the persistent (committed) bitmap, and `inoext` holds the pxd
 /// descriptors for each extent's disk page.
@@ -1270,7 +1269,7 @@ impl Default for Iag {
 }
 
 /// On-disk dmap (block allocation map page) — 4096 bytes.
-/// From jfs_dmap.h. Manages 8192 blocks (BPERDMAP) as two 1024-word
+/// Manages 8192 blocks (BPERDMAP) as two 1024-word
 /// bitmaps: `wmap` (working, transient) and `pmap` (persistent, committed).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

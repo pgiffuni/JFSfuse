@@ -1,48 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Phase 4: Block allocation tests.
 //!
-//! Tests that the BlockAllocMap can read the on-disk dmap pages from a real
-//! JFS image, allocate contiguous blocks, and commit the bitmap changes.
+//! Tests that the BlockAllocMap can read the on-disk dmap pages from a
+//! generated JFS image, allocate contiguous blocks, and commit the bitmap
+//! changes.
 //!
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
 use jfsfuse::alloc::dmap::BlockAllocMap;
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 
-fn load_image_to_memory() -> Option<Arc<dyn Storage>> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return None;
-    }
-
-    let data = std::fs::read(path).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    Some(storage)
+fn load_image_to_memory() -> Arc<dyn Storage> {
+    mkfs::create_filesystem()
 }
 
 #[cfg(feature = "writable")]
 #[test]
 fn test_bmap_init_from_real_image() {
     let storage = load_image_to_memory();
-    let storage = match storage {
-        Some(s) => s,
-        None => return,
-    };
 
     let bmap = BlockAllocMap::new(storage).expect("should initialize bmap");
     assert!(bmap.mapsize() > 0, "mapsize should be non-zero");
@@ -57,10 +35,6 @@ fn test_bmap_init_from_real_image() {
 #[test]
 fn test_bmap_alloc_single_block() {
     let storage = load_image_to_memory();
-    let storage = match storage {
-        Some(s) => s,
-        None => return,
-    };
 
     let mut bmap = BlockAllocMap::new(storage).expect("should initialize bmap");
     let before = bmap.nfree();
@@ -80,10 +54,6 @@ fn test_bmap_alloc_single_block() {
 #[test]
 fn test_bmap_alloc_contiguous_extent() {
     let storage = load_image_to_memory();
-    let storage = match storage {
-        Some(s) => s,
-        None => return,
-    };
 
     let mut bmap = BlockAllocMap::new(storage).expect("should initialize bmap");
     let nblocks = 4u64;
@@ -103,10 +73,6 @@ fn test_bmap_alloc_contiguous_extent() {
 #[test]
 fn test_bmap_free_and_realloc() {
     let storage = load_image_to_memory();
-    let storage = match storage {
-        Some(s) => s,
-        None => return,
-    };
 
     let mut bmap = BlockAllocMap::new(storage).expect("should initialize bmap");
 
@@ -125,10 +91,6 @@ fn test_bmap_free_and_realloc() {
 #[test]
 fn test_bmap_alloc_many_blocks() {
     let storage = load_image_to_memory();
-    let storage = match storage {
-        Some(s) => s,
-        None => return,
-    };
 
     let mut bmap = BlockAllocMap::new(storage).expect("should initialize bmap");
     let before = bmap.nfree();
@@ -146,10 +108,6 @@ fn test_bmap_alloc_many_blocks() {
 #[test]
 fn test_bmap_commit_reduces_free_count() {
     let storage = load_image_to_memory();
-    let storage = match storage {
-        Some(s) => s,
-        None => return,
-    };
 
     let mut bmap = BlockAllocMap::new(Arc::clone(&storage)).expect("should initialize bmap");
     let before = bmap.nfree();
@@ -167,6 +125,4 @@ fn test_bmap_commit_reduces_free_count() {
     // The allocated block address should be valid (non-zero and within range).
     assert!(allocated_block > 0);
     assert!(allocated_block < bmap.mapsize());
-
-    let _ = BLOCK_SIZE; // ensure import used
 }

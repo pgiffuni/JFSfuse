@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Journal subsystem — log I/O and crash recovery.
 //!
-//! Mirrors the kernel `jfs_logmgr.c` (log I/O) and the jfsutils `logredo.c`
+//! Mirrors the kernel logmgr (log I/O) and the jfsutils logredo
 //! (crash recovery). In FUSE, logredo runs once at mount time before any
 //! client I/O is accepted.
 //!

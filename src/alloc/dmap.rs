@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Block allocation map manager (dmap).
 //!
-//! Mirrors `jfs_dmap.c` / `jfs_dmap.h` — the buddy allocator for filesystem blocks.
+//! Mirrors the kernel JFS dmap code — the buddy allocator for filesystem blocks.
 //! Reads on-disk dmap pages to build an in-memory free-block bitmap, then
 //! provides allocation and freeing of contiguous extents.
 //!

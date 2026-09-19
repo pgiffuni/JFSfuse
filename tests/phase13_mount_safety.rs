@@ -4,39 +4,20 @@
 //! Tests that writable mounts perform proper validation and that crash
 //! scenarios are handled correctly by the journal recovery path.
 //!
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
 use jfsfuse::journal::LogManager;
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
-use jfsfuse::types::{FM_CLEAN, FM_DIRTY, LOGMAGIC, LOGREDONE, LOGWRAP, LOGVERSION, LogSuper};
+use jfsfuse::mkfs;
+use jfsfuse::storage::{BLOCK_SIZE, Storage};
+use jfsfuse::types::{FM_CLEAN, FM_DIRTY, LOGMAGIC, LOGREDONE, LOGWRAP, LOGVERSION, LogSuper, PSIZE};
 use jfsfuse::volume::Volume;
 
-const IMAGE_PATH: &str = "/tmp/kilo/test_jfs.img";
-
-fn load_image_to_memory() -> Option<Volume> {
-    if !std::path::Path::new(IMAGE_PATH).exists() {
-        eprintln!("skipping: {} not found", IMAGE_PATH);
-        return None;
-    }
-
-    let data = std::fs::read(IMAGE_PATH).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    Some(Volume::open_from_storage(storage).expect("should mount JFS image from memory"))
+fn load_image_to_memory() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 /// Read the inline log base from the JFS superblock.
@@ -53,15 +34,9 @@ fn read_log_base(storage: &dyn Storage) -> u64 {
     }
 }
 
-const PSIZE: usize = 4096;
-
 #[test]
 fn test_readonly_mount_skips_recovery_on_clean_log() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     // Verify the log is in LOGREDONE state after mount.
     let storage = vol.storage.clone();
@@ -75,10 +50,6 @@ fn test_readonly_mount_skips_recovery_on_clean_log() {
 #[test]
 fn test_writable_mount_marks_fs_dirty() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     // The read-only mount should start clean.
     // We need to re-load from memory for a writable mount.
@@ -97,10 +68,6 @@ fn test_writable_mount_marks_fs_dirty() {
 #[test]
 fn test_writable_mount_validates_root_inode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     let storage = vol.storage.clone();
 
@@ -121,10 +88,6 @@ fn test_writable_mount_validates_root_inode() {
 #[test]
 fn test_writable_mount_rejects_invalid_root() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     let storage = vol.storage.clone();
 
@@ -137,10 +100,6 @@ fn test_writable_mount_rejects_invalid_root() {
 #[test]
 fn test_crash_before_data_flush_preserved_by_journal() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -165,10 +124,6 @@ fn test_crash_before_data_flush_preserved_by_journal() {
 #[test]
 fn test_crash_after_journal_commit() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -194,10 +149,6 @@ fn test_crash_after_journal_commit() {
 #[test]
 fn test_journal_wraparound_handled() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -209,7 +160,14 @@ fn test_journal_wraparound_handled() {
         let name = format!("tf13wrap{}", i);
         let ino = fs.create(parent, &name, 0o100644).expect("create should succeed");
         let data = format!("data-{}", i);
-        fs.write(ino, 0, data.as_bytes()).expect("write should succeed");
+        let write_result = fs.write(ino, 0, data.as_bytes());
+        if write_result.is_none() {
+            eprintln!("DEBUG test: write failed for ino {}, i={}", ino, i);
+            // Check the actual error
+            let err = fs.volume.write_at(ino, 0, data.as_bytes());
+            eprintln!("DEBUG test: write_at error: {:?}", err);
+        }
+        write_result.expect("write should succeed");
 
         // Verify consistency.
         let read_data = fs.read(ino, 0, data.len()).expect("read should succeed");
@@ -227,10 +185,6 @@ fn test_journal_wraparound_handled() {
 #[test]
 fn test_clean_unmount_marks_fs_clean() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     // Get the storage backend.
     let storage = vol.storage.clone();
@@ -256,10 +210,6 @@ fn test_clean_unmount_marks_fs_clean() {
 #[test]
 fn test_write_then_crash_recovery() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     // Get the storage backend.
     let storage = vol.storage.clone();
@@ -304,10 +254,6 @@ fn test_write_then_crash_recovery() {
 #[test]
 fn test_journal_recovery_replays_committed_records() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     let storage = vol.storage.clone();
     let log_base = read_log_base(&*storage);
@@ -326,10 +272,6 @@ fn test_journal_recovery_replays_committed_records() {
 #[test]
 fn test_mount_refuses_corrupt_superblock() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     let storage = vol.storage.clone();
 
@@ -351,10 +293,6 @@ fn test_mount_refuses_bad_block_size() {
     // verify the validation logic is present by checking the error path.
     // This is a code-coverage test for the validation sequence.
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
 
     // Verify the volume mounted successfully despite the validation steps.
     assert_eq!(vol.block_size(), PSIZE as u32);

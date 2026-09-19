@@ -1,44 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Integration test: read operations against a real JFS filesystem image.
+//! Integration test: read operations against a JFS filesystem image.
 //!
-//! Requires the test image at `/tmp/kilo/test_jfs.img` (100MB, created by
-//! `jfs_mkfs`). Skipped if the image does not exist.
+//! Uses `jfsfuse::mkfs::create_filesystem()` to generate a valid in-memory
+//! JFS image, replacing the need for `/tmp/kilo/test_jfs.img`.
+
+use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
 
-fn skip_if_no_image() -> Option<String> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if std::path::Path::new(path).exists() {
-        Some(path.to_string())
-    } else {
-        None
-    }
+fn load_test_volume() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 #[test]
 fn test_mount_real_jfs_image() {
-    let path = match skip_if_no_image() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-            return;
-        }
-    };
-
-    let vol = Volume::open(&path).expect("should mount JFS image");
+    let vol = load_test_volume();
     assert_eq!(vol.root_ino, 18);
     assert_eq!(vol.block_size, 4096);
 }
 
 #[test]
 fn test_read_root_inode() {
-    let path = match skip_if_no_image() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let mut vol = Volume::open(&path).expect("should mount");
+    let mut vol = load_test_volume();
     let root = vol.root_inode().expect("should read root inode");
     assert!(root.is_dir(), "root should be a directory");
     assert_eq!(u32::from_le_bytes(root.dinode.di_mode), 0x141ed);
@@ -47,12 +34,7 @@ fn test_read_root_inode() {
 
 #[test]
 fn test_readdir_root() {
-    let path = match skip_if_no_image() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let vol = Volume::open(&path).expect("should mount");
+    let vol = load_test_volume();
     let mut fs = FuseFs::new(vol);
 
     let entries = fs
@@ -69,12 +51,7 @@ fn test_readdir_root() {
 
 #[test]
 fn test_lookup_dot_and_dotdot() {
-    let path = match skip_if_no_image() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let vol = Volume::open(&path).expect("should mount");
+    let vol = load_test_volume();
     let mut fs = FuseFs::new(vol);
     let root = fs.volume.root_ino;
 

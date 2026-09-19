@@ -1,32 +1,35 @@
 // SPDX-License-Identifier: MIT
-//! jfsck — JFS consistency checker.
+//! `jfsck` — JFS consistency checker.
 //!
 //! Usage:
-//!   jfsck --read-only <image>
-//!   jfsck --repair <image>
-//!   jfsck --replay <image>
-//!   jfsck --dump-inode <image> <ino>
-//!   jfsck --dump-xtree <image> <ino>
-//!   jfsck --dump-dtree <image> <ino>
-//!   jfsck --dump-journal <image>
+//!   jfsck --read-only `image`
+//!   jfsck --repair `image`
+//!   jfsck --replay `image`
+//!   jfsck --dump-inode `image` `ino`
+//!   jfsck --dump-xtree `image` `ino`
+//!   jfsck --dump-dtree `image` `ino`
+//!   jfsck --dump-journal `image`
 //!
-//! The `--repair` flag is reserved and not yet enabled — it will exit
-//! with an error message until the checker can produce a complete
-//! diagnostic report.
+//! The `--repair` flag performs a limited set of safe repairs when the
+//! filesystem is structurally consistent. Currently it clears a stale
+//! `FM_DIRY` state left behind by an unclean shutdown after the journal
+//! has been replayed to a clean state.
 
+use byteorder::{ByteOrder, LittleEndian};
 use std::env;
 use std::process;
 
-use jfsfuse::storage::{BLOCK_SIZE, FileStorage, Storage};
+use jfsfuse::storage::{BLOCK_SIZE, FileStorage};
+use jfsfuse::types::{FM_CLEAN, FM_DIRTY};
 use jfsfuse::volume::Volume;
 
-const USAGE: &str = "usage: jfsck --read-only <image>\n\
-                     jfsck --repair <image>\n\
-                     jfsck --replay <image>\n\
-                     jfsck --dump-inode <image> <ino>\n\
-                     jfsck --dump-xtree <image> <ino>\n\
-                     jfsck --dump-dtree <image> <ino>\n\
-                     jfsck --dump-journal <image>";
+const USAGE: &str = "usage: fsck_jfs --read-only `image`\n\
+                     fsck_jfs --repair `image`\n\
+                     fsck_jfs --replay `image`\n\
+                     fsck_jfs --dump-inode `image` `ino`\n\
+                     fsck_jfs --dump-xtree `image` `ino`\n\
+                     fsck_jfs --dump-dtree `image` `ino`\n\
+                     fsck_jfs --dump-journal `image`";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -44,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--replay" => cmd_replay(image),
         "--dump-inode" => {
             if args.len() < 4 {
-                eprintln!("usage: jfsck --dump-inode <image> <ino>");
+                eprintln!("usage: fsck_jfs --dump-inode `image` `ino`");
                 process::exit(1);
             }
             let ino: u32 = args[3].parse().map_err(|_| "invalid inode number")?;
@@ -52,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "--dump-xtree" => {
             if args.len() < 4 {
-                eprintln!("usage: jfsck --dump-xtree <image> <ino>");
+                eprintln!("usage: fsck_jfs --dump-xtree `image` `ino`");
                 process::exit(1);
             }
             let ino: u32 = args[3].parse().map_err(|_| "invalid inode number")?;
@@ -60,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "--dump-dtree" => {
             if args.len() < 4 {
-                eprintln!("usage: jfsck --dump-dtree <image> <ino>");
+                eprintln!("usage: fsck_jfs --dump-dtree `image` `ino`");
                 process::exit(1);
             }
             let ino: u32 = args[3].parse().map_err(|_| "invalid inode number")?;
@@ -119,8 +122,61 @@ fn cmd_read_only(image: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "writable")]
 fn cmd_repair(image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("error: --repair is not yet supported. Run with --read-only for a diagnostic report.");
-    process::exit(1);
+    let storage = std::sync::Arc::new(FileStorage::open(std::path::Path::new(image))?);
+    let mut vol = Volume::open_from_storage(storage)?;
+
+    let report = vol.check_consistent()?;
+
+    let mut has_repairable = false;
+    let mut has_structural_errors = false;
+    let mut errors = 0;
+    let mut warnings = 0;
+
+    for issue in &report.issues {
+        let prefix = match issue.level {
+            2 => { errors += 1; "ERROR" }
+            1 => { warnings += 1; "WARNING" }
+            _ => "INFO",
+        };
+        let location = match (&issue.ino, &issue.block) {
+            (Some(ino), _) => format!(" inode {}", ino),
+            (_, Some(block)) => format!(" block {}", block),
+            _ => String::new(),
+        };
+        eprintln!("{}:{} {}", prefix, location, issue.message);
+    }
+
+    if errors > 0 {
+        has_structural_errors = true;
+    }
+
+    // If the filesystem state is FM_DIRTY but the journal has already been
+    // replayed to a clean state and no structural errors were found,
+    // clear the dirty flag.
+    let current_state = LittleEndian::read_u32(&vol.sb.s_state);
+    if current_state == FM_DIRTY && !has_structural_errors {
+        vol.set_fs_state(FM_CLEAN)?;
+        println!("Repaired: cleared stale FM_DIRTY state (journal replayed).");
+        has_repairable = true;
+    }
+
+    if has_structural_errors {
+        eprintln!("\n{} errors, {} warnings", errors, warnings);
+        eprintln!("Structural errors found — automatic repair is not safe.");
+        process::exit(1);
+    } else if has_repairable {
+        if warnings > 0 {
+            eprintln!("\n{} warnings", warnings);
+        }
+        println!("Filesystem repaired successfully.");
+        Ok(())
+    } else {
+        if warnings > 0 {
+            eprintln!("\n{} warnings", warnings);
+        }
+        println!("Filesystem is clean.");
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "writable"))]

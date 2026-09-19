@@ -1,43 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Phase 6: Write operations on a JFS filesystem image.
 //!
-//! Loads the test image into MemoryStorage (a writable backend) and verifies:
+//! Loads a generated JFS image into MemoryStorage (a writable backend) and
+//! verifies:
 //! - `write_at` can overwrite existing data blocks within a file
 //! - `truncate` can change the file size
 //! - `fsync` triggers a journal commit
 //!
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
 
-/// Load the test image into a writable MemoryStorage-backed Volume.
-fn load_image_to_memory() -> Option<Volume> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return None;
-    }
-
-    let data = std::fs::read(path).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    let vol = Volume::open_from_storage(storage).expect("should mount JFS image from memory");
-    Some(vol)
+/// Load a generated JFS image into a writable MemoryStorage-backed Volume.
+fn load_image_to_memory() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 /// Find the first non-dot file entry in the root directory.
@@ -52,22 +34,22 @@ fn find_test_file(fs: &mut FuseFs) -> Option<u32> {
 #[cfg(feature = "writable")]
 #[test]
 fn test_write_at_overwrites_existing_blocks() {
-    let vol = match load_image_to_memory() {
-        Some(v) => v,
-        None => return,
-    };
+    let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
-    let ino = match find_test_file(&mut fs) {
-        Some(i) => i,
-        None => {
-            eprintln!("no test file found in root directory");
-            return;
-        }
-    };
+    // Create a test file with some initial data.
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "testfile", 0o100644);
+    assert!(ino.is_some(), "create should succeed");
+    let ino = ino.unwrap();
 
-    // Read existing data at offset 0.
+    // Write initial data.
+    let initial = b"initial data block!";
+    let written = fs.write(ino, 0, initial);
+    assert!(written.is_some() && written.unwrap() == initial.len());
+
+    // Read existing data.
     let before = fs.read(ino, 0, 32).expect("should read file");
     assert!(!before.is_empty(), "file should have data");
 
@@ -89,19 +71,18 @@ fn test_write_at_overwrites_existing_blocks() {
 #[cfg(feature = "writable")]
 #[test]
 fn test_truncate_changes_size() {
-    let vol = match load_image_to_memory() {
-        Some(v) => v,
-        None => return,
-    };
+    let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
-    let ino = match find_test_file(&mut fs) {
-        Some(i) => i,
-        None => return,
-    };
+    // Create a test file with data.
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "trunctest", 0o100644).unwrap();
 
-    let before_data = fs.read(ino, 0, BLOCK_SIZE).expect("should read file");
+    let initial = b"this is some data for truncation testing";
+    let _ = fs.write(ino, 0, initial);
+
+    let before_data = fs.read(ino, 0, jfsfuse::storage::BLOCK_SIZE).expect("should read file");
     let before_size = before_data.len() as u64;
     assert!(before_size > 0, "file should have non-zero size before truncate");
 
@@ -122,17 +103,13 @@ fn test_truncate_changes_size() {
 #[cfg(feature = "writable")]
 #[test]
 fn test_fsync_succeeds() {
-    let vol = match load_image_to_memory() {
-        Some(v) => v,
-        None => return,
-    };
+    let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
-    let ino = match find_test_file(&mut fs) {
-        Some(i) => i,
-        None => return,
-    };
+    // Create a file — fsync on root.
+    let ino = fs.create(fs.volume.root_ino, "fsync_test", 0o100644).unwrap();
+    let _ = fs.write(ino, 0, b"data");
 
     let result = fs.flush(ino);
     assert!(result.is_some(), "fsync should return Some on success");
@@ -145,27 +122,7 @@ fn test_fsync_succeeds() {
 #[cfg(feature = "writable")]
 #[test]
 fn test_write_past_eof_allocates_blocks() {
-    use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
-    use std::sync::Arc;
-
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return;
-    }
-
-    let data = std::fs::read(path).ok().unwrap();
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    let vol = Volume::open_from_storage(storage).expect("should mount");
+    let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 

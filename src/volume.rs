@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! JFS volume management.
 //!
-//! Mirrors `jfs_mount.c` / `super.c` — superblock validation, inline log
+//! Mirrors the kernel JFS mount code — superblock validation, inline log
 //! detection, allocation map setup, and journal recovery orchestration.
 //!
 //! The mount flow:
@@ -183,9 +183,9 @@ impl Volume {
         Ok(volume)
     }
 
-    /// Remount read-only after a crash, marking the filesystem dirty (Phase 13).
+    /// Set the filesystem state in the superblock (Phase 13).
     #[cfg(feature = "writable")]
-    fn set_fs_state(&mut self, state: u32) -> StorageResult<()> {
+    pub fn set_fs_state(&mut self, state: u32) -> StorageResult<()> {
         // Write the new filesystem state to the superblock at offset 40.
         let sb_bytes = self.storage.read_bytes(crate::types::SUPER1_OFF, PSIZE)?;
         let mut buf = sb_bytes.to_vec();
@@ -511,7 +511,6 @@ impl Volume {
                 data_pos += zeros_to_copy;
                 remaining -= zeros_to_copy;
                 cur_byte_offset = 0;
-                continue;
             }
 
             // Existing extent — write data directly to the physical blocks.
@@ -608,10 +607,134 @@ impl Volume {
             self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
                 LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size_val);
             })?;
+        } else {
+            // Same fragment block — still update the size field.
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size_val);
+            })?;
         }
 
         self.mark_page_dirty(ino, inode.page_block)?;
         self.commit_transaction()?;
+        Ok(())
+    }
+
+    /// Pre-allocate or deallocate file space (writable builds only).
+    ///
+    /// Implements a subset of `fallocate(2)`:
+    /// - `mode = 0` (default): allocate disk blocks for the range
+    ///   `[offset, offset + len)`, zero-fill any unwritten blocks, and
+    ///   update the file size if the range extends past EOF.
+    /// - `FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE`: deallocate blocks in
+    ///   the range, creating a hole (file size unchanged).
+    ///
+    /// `FALLOC_FL_COLLAPSE_RANGE`, `FALLOC_FL_INSERT_RANGE`,
+    /// `FALLOC_FL_ZERO_RANGE`, and `FALLOC_FL_NOCACHE` are not supported.
+    #[cfg(feature = "writable")]
+    pub fn fallocate(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        len: u64,
+        mode: u32,
+    ) -> StorageResult<()> {
+        const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+        const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+        const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+        const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+        const FALLOC_FL_NOCACHE: u32 = 0x40;
+        const FALLOC_FL_UNSUPPORTED: u32 =
+            FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE | FALLOC_FL_INSERT_RANGE | FALLOC_FL_NOCACHE;
+
+        if mode & FALLOC_FL_UNSUPPORTED != 0 {
+            return Err(StorageError::Other(format!(
+                "fallocate mode {:#x} is not supported",
+                mode
+            )));
+        }
+
+        let _ = self.begin_transaction()?;
+
+        let inode = crate::inode::Inode::read(self, ino)?;
+        let mut xtree = crate::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
+        let mut xtree_modified = false;
+
+        let start_fsb = offset / (BLOCK_SIZE as u64);
+        let end_fsb = (offset + len + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+        let block_count = end_fsb - start_fsb;
+
+        let is_punch = mode & (FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE)
+            == (FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE);
+
+        if is_punch && block_count > 0 {
+            // Deallocate blocks in the range, creating a hole.
+            let freed = xtree.punch_extents(start_fsb as i64, end_fsb as i64);
+
+            // Free the blocks via the allocator.
+            if let Some(bmap) = self.bmap.as_mut() {
+                for (addr, len) in &freed {
+                    let mut pxd = crate::types::Pxd::default();
+                    pxd.set_length(*len);
+                    pxd.set_address(*addr);
+                    let _ = bmap.free_extent(&pxd);
+                }
+            }
+
+            xtree_modified = true;
+        } else if block_count > 0 {
+            // Allocate blocks for regions not already covered by extents.
+            if let Some(bmap) = self.bmap.as_mut() {
+                for fsb in start_fsb..end_fsb {
+                    if xtree.lookup(fsb).ok().flatten().is_some() {
+                        continue;
+                    }
+                    if let Some(pxd) = bmap.alloc_extent(1, fsb)? {
+                        let new_addr = pxd.address();
+                        let zero_block = vec![0u8; BLOCK_SIZE as usize];
+                        self.storage.write_block(new_addr, &zero_block)?;
+                        if xtree.insert_extent(fsb as i64, 1, new_addr) {
+                            xtree_modified = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update file size if needed (only for space allocation, not punch).
+        if !is_punch {
+            let new_size = if mode & FALLOC_FL_KEEP_SIZE == 0 && offset + len > inode.size() {
+                offset + len
+            } else {
+                inode.size()
+            };
+            if new_size != inode.size() {
+                self.update_inode_page(
+                    ino,
+                    inode.page_block,
+                    inode.page_offset,
+                    |dinode_bytes| {
+                        LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size);
+                    },
+                )?;
+            }
+        }
+
+        if xtree_modified {
+            let xt_bytes = xtree.to_bytes();
+            self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                let xt_off = crate::types::Dinode::size() - xt_bytes.len();
+                dinode_bytes[xt_off..xt_off + xt_bytes.len()].copy_from_slice(&xt_bytes);
+                let total_blocks =
+                    xtree.iter_extents().map(|e| e.length as u64).sum::<u64>();
+                LittleEndian::write_u64(&mut dinode_bytes[32..40], total_blocks);
+            })?;
+        }
+
+        self.mark_page_dirty(ino, inode.page_block)?;
+        self.storage.flush_data()?;
+        self.commit_transaction()?;
+
         Ok(())
     }
 
@@ -761,16 +884,20 @@ impl Volume {
                 continue;
             }
             let data = self.storage.read_block(block_num)?;
-            for i in 0..crate::types::INOSPERPAGE {
+             for i in 0..crate::types::INOSPERPAGE {
                 let off = (i as usize) * crate::types::DISIZE;
                 if off + crate::types::DISIZE > data.len() {
                     break;
                 }
                 let mode = LittleEndian::read_u32(&data[off + 52..off + 56]);
                 if mode == 0 {
-                    // Found a free inode. Its inode number is determined by
-                    // its position in the table. We compute a virtual ino.
                     let ino = FILESYSTEM_I + (block_offset * crate::types::INOSPERPAGE as u64 + i as u64) as u32;
+                    // Skip inode numbers that collide with known special inodes
+                    // (e.g. root inode has ino = FILESYSTEM_I + ROOT_I).
+                    if ino == FILESYSTEM_I + crate::types::ROOT_I {
+                        continue;
+                    }
+                    let _ = self.tx_mgr.record_allocation(block_num);
                     return Ok((ino, block_num, off));
                 }
             }
@@ -857,6 +984,9 @@ impl Volume {
             LittleEndian::write_u64(&mut dinode_bytes[32..40], 0);
             // Set nlink to 1
             LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
+            // Set fileset and inode number.
+            LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
         })?;
         self.mark_page_dirty(child_ino, _child_block)?;
 
@@ -921,8 +1051,8 @@ impl Volume {
             LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
 
             // Initialize the dtroot (inline directory B+-tree root, 288 bytes).
-            // The dtroot starts at offset 128 in the dinode.
-            let dtroot = &mut dinode_bytes[128..128 + 288];
+            // The dtroot is at u[96..] which maps to dinode offset 224 (128+96).
+            let dtroot = &mut dinode_bytes[224..224 + 288];
             // dtroot header layout (32 bytes, at offset 96 within the union = offset 128+96=224 in dinode):
             //   Actually, dtroot_bytes() returns &self.u[96..], and u starts at offset 128.
             //   So dtroot[0..24] is the DASD+header, dtroot[24..32] is stbl.
@@ -935,8 +1065,8 @@ impl Volume {
             //   bytes 20-23: idotdot (parent inode number)
             //   bytes 24-31: stbl (sorted index table, 8 bytes)
 
-            // Set flag to BT_ROOT.
-            dtroot[16] = 0x01;
+            // Set flag to BT_ROOT | BT_LEAF | BT_SWAPPED (matches root dtroot).
+            dtroot[16] = 0x83;
             // nextindex = 2 (for `.` and `..` entries)
             dtroot[17] = 2;
             // freecnt = 0 (no free slots)
@@ -950,24 +1080,20 @@ impl Volume {
             dtroot[25] = 2; // `..` → slot 2
 
             // Write `.` entry into slot 1 (offset 32 within dtroot).
-            // Slot format: next(1) cnt(1) name[15](30 bytes) index(4 bytes)
+            // Slot format: inumber(4) next(1) name_len(1) name[11](22 bytes) index(4)
             let dot_slot = &mut dtroot[32..64];
-            dot_slot[0] = 0; // next: no linked slot
-            dot_slot[1] = 1; // cnt: this entry uses 1 slot
-            // name: dot = [0x2E, 0x00] in UCS-2 (".")
-            dot_slot[2] = 0x2E; // '.'
-            dot_slot[3] = 0x00;
-            // index field (last 4 bytes of slot) — directory table index
-            LittleEndian::write_u32(&mut dot_slot[28..32], 0);
+            LittleEndian::write_u32(&mut dot_slot[0..4], child_ino); // inumber = self
+            dot_slot[5] = 1; // name_len = 1 (for ".")
+            LittleEndian::write_u16(&mut dot_slot[6..8], 0x2E); // '.'
+            LittleEndian::write_u32(&mut dot_slot[28..32], 0); // index = 0
 
             // Write `..` entry into slot 2 (offset 64 within dtroot).
             let dotdot_slot = &mut dtroot[64..96];
-            dotdot_slot[0] = 0;
-            dotdot_slot[1] = 1;
-            // name: ".." = [0x2E, 0x2E, 0x00] in UCS-2
-            dotdot_slot[2] = 0x2E;
-            dotdot_slot[3] = 0x2E;
-            LittleEndian::write_u32(&mut dotdot_slot[28..32], 1);
+            LittleEndian::write_u32(&mut dotdot_slot[0..4], parent_ino); // inumber = parent
+            dotdot_slot[5] = 2; // name_len = 2 (for "..")
+            LittleEndian::write_u16(&mut dotdot_slot[6..8], 0x2E); // '.'
+            LittleEndian::write_u16(&mut dotdot_slot[8..10], 0x2E); // '.'
+            LittleEndian::write_u32(&mut dotdot_slot[28..32], 1); // index = 1
         })?;
         self.mark_page_dirty(child_ino, _child_block)?;
 
@@ -989,6 +1115,7 @@ impl Volume {
             let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
             LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
         })?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
 
         // 6. Commit.
         self.commit_transaction()?;
@@ -1087,6 +1214,8 @@ impl Volume {
         let child = crate::inode::Inode::read(self, child_ino)?;
         let is_dir = child.is_dir();
         let current_nlink = child.dinode.nlink();
+
+        // Directories can only have nlink == 0 (already removed via rmdir).
 
         // Directories can only have nlink == 0 (already removed via rmdir).
         if is_dir {

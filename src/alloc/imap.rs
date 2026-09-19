@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Inode allocation map manager (imap).
 //!
-//! Mirrors `jfs_imap.c` / `jfs_imap.h` — the IAG (Inode Allocation Group)
+//! Mirrors the kernel JFS imap code — the IAG (Inode Allocation Group)
 //! buddy allocator for inode numbers.
 //!
 //! Each IAG manages 4096 inodes (128 extents of 32 inodes each).

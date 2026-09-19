@@ -2,47 +2,25 @@
 //! Phase 11: Symbolic link tests.
 //!
 //! Tests symlink creation, target reading, and inline storage.
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
 use jfsfuse::fuse::{EEXIST, EOPNOTSUPP, EROFS};
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
 
-fn load_image_to_memory() -> Option<Volume> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return None;
-    }
-
-    let data = std::fs::read(path).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    Some(Volume::open_from_storage(storage).expect("should mount JFS image from memory"))
+fn load_image_to_memory() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 #[cfg(feature = "writable")]
 #[test]
 fn test_symlink_creates_inline_target() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -77,10 +55,6 @@ fn test_symlink_creates_inline_target() {
 #[test]
 fn test_symlink_lookup_resolves() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -102,10 +76,6 @@ fn test_symlink_lookup_resolves() {
 #[test]
 fn test_symlink_short_path() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -124,10 +94,6 @@ fn test_symlink_short_path() {
 #[test]
 fn test_symlink_near_128_bytes() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -147,10 +113,6 @@ fn test_symlink_near_128_bytes() {
 #[test]
 fn test_symlink_long_path_unsupported() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -171,10 +133,6 @@ fn test_symlink_long_path_unsupported() {
 #[test]
 fn test_symlink_duplicate_name_fails() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -197,10 +155,6 @@ fn test_symlink_duplicate_name_fails() {
 #[test]
 fn test_symlink_readlink_rejected_in_readonly() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     // Don't enable writable.
 
@@ -213,10 +167,6 @@ fn test_symlink_readlink_rejected_in_readonly() {
 #[test]
 fn test_symlink_inode_mode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -239,10 +189,6 @@ fn test_symlink_inode_mode() {
 #[test]
 fn test_symlink_nlink_is_one() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -261,10 +207,6 @@ fn test_symlink_nlink_is_one() {
 #[test]
 fn test_symlink_and_file_same_name() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -280,7 +222,8 @@ fn test_symlink_and_file_same_name() {
 
     // Verify they have different inode numbers and types.
     assert_ne!(file_ino, link_ino);
-    assert_ne!(fs.getattr(file_ino).unwrap().is_regular(), fs.getattr(link_ino).unwrap().is_symlink());
+    assert!(fs.getattr(file_ino).unwrap().is_regular(), "file should be regular");
+    assert!(fs.getattr(link_ino).unwrap().is_symlink(), "link should be symlink");
 
     // Clean up.
     fs.unlink(parent, "tf11mix");

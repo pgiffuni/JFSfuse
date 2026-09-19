@@ -7,47 +7,25 @@
 //! - The inode is freed only when nlink reaches 0 AND no open handles remain.
 //! - Hard links to directories are rejected.
 //!
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
 use jfsfuse::fuse::{EEXIST, EPERM, EROFS};
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
 
-fn load_image_to_memory() -> Option<Volume> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return None;
-    }
-
-    let data = std::fs::read(path).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    Some(Volume::open_from_storage(storage).expect("should mount JFS image from memory"))
+fn load_image_to_memory() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 #[cfg(feature = "writable")]
 #[test]
 fn test_hard_link_increments_nlink() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -83,10 +61,6 @@ fn test_hard_link_increments_nlink() {
 #[test]
 fn test_hard_link_rejects_directory() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -108,10 +82,6 @@ fn test_hard_link_rejects_directory() {
 #[test]
 fn test_hard_link_duplicate_name_fails() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -136,10 +106,6 @@ fn test_hard_link_duplicate_name_fails() {
 #[test]
 fn test_unlink_decrements_nlink() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -169,10 +135,6 @@ fn test_unlink_decrements_nlink() {
 #[test]
 fn test_open_unlinked_retains_inode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -210,10 +172,6 @@ fn test_open_unlinked_retains_inode() {
 #[test]
 fn test_link_rejected_in_readonly_mode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     // Don't enable writable.
 
@@ -226,10 +184,6 @@ fn test_link_rejected_in_readonly_mode() {
 #[test]
 fn test_open_release_multiple_handles() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -259,10 +213,6 @@ fn test_open_release_multiple_handles() {
 #[test]
 fn test_multiple_hard_links() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 

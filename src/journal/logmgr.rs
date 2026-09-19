@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Journal log manager.
 //!
-//! Mirrors `jfs_logmgr.c` / `jfs_logmgr.h` — the kernel's log I/O layer.
+//! Mirrors the kernel JFS logmgr code — the log I/O layer.
 //! Manages log pages, group commit, syncpt advancement, and log wrapping.
 //!
 //! For read-only FUSE operation, only log scanning for recovery is needed.

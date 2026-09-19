@@ -2,49 +2,27 @@
 //! Phase 9: FUSE mutation operation tests.
 //!
 //! Tests `mkdir`, `rmdir`, `setattr`, `open`/`release`, and error-code mapping
-//! on a real JFS image loaded into MemoryStorage.
+//! on a generated JFS image loaded into MemoryStorage.
 //!
-//! Requires the test image at `/tmp/kilo/test_jfs.img`.
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
 use jfsfuse::fuse::{EEXIST, ENOENT, ENOTEMPTY, EROFS};
-use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
+use jfsfuse::mkfs;
+use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
 
-fn load_image_to_memory() -> Option<Volume> {
-    let path = "/tmp/kilo/test_jfs.img";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: /tmp/kilo/test_jfs.img not found");
-        return None;
-    }
-
-    let data = std::fs::read(path).ok()?;
-    let num_blocks = (data.len() as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-    let mem = MemoryStorage::new(num_blocks);
-
-    let storage: Arc<dyn Storage> = Arc::new(mem);
-
-    let vol_blocks = data.len() / BLOCK_SIZE as usize;
-    for i in 0..vol_blocks {
-        let start = i * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        let _ = storage.write_block(i as u64, &data[start..end]);
-    }
-
-    Some(Volume::open_from_storage(storage).expect("should mount JFS image from memory"))
+fn load_image_to_memory() -> Volume {
+    let storage: Arc<dyn Storage> = mkfs::create_filesystem();
+    Volume::open_from_storage(storage).expect("should mount generated JFS image")
 }
 
 #[cfg(feature = "writable")]
 #[test]
 fn test_mkdir_creates_directory() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -83,10 +61,6 @@ fn test_mkdir_creates_directory() {
 #[test]
 fn test_mkdir_creates_dotdot_entries() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -107,10 +81,6 @@ fn test_mkdir_creates_dotdot_entries() {
 #[test]
 fn test_mkdir_duplicate_fails() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -132,10 +102,6 @@ fn test_mkdir_duplicate_fails() {
 #[test]
 fn test_rmdir_removes_directory() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -159,10 +125,6 @@ fn test_rmdir_removes_directory() {
 #[test]
 fn test_rmdir_nonexistent_fails_with_enoent() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -175,10 +137,6 @@ fn test_rmdir_nonexistent_fails_with_enoent() {
 #[test]
 fn test_rmdir_nonempty_fails() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -205,10 +163,6 @@ fn test_rmdir_nonempty_fails() {
 #[test]
 fn test_setattr_mode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -235,10 +189,6 @@ fn test_setattr_mode() {
 #[test]
 fn test_setattr_uid_gid() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -262,10 +212,6 @@ fn test_setattr_uid_gid() {
 #[test]
 fn test_open_returns_enoent_for_missing_inode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -278,10 +224,6 @@ fn test_open_returns_enoent_for_missing_inode() {
 #[test]
 fn test_open_succeeds_for_existing_inode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -300,10 +242,6 @@ fn test_open_succeeds_for_existing_inode() {
 #[test]
 fn test_release_is_noop() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -322,10 +260,6 @@ fn test_release_is_noop() {
 #[test]
 fn test_write_operations_rejected_in_readonly_mode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     // Don't call enable_writable — should be read-only by default.
 
@@ -340,10 +274,6 @@ fn test_write_operations_rejected_in_readonly_mode() {
 #[test]
 fn test_setattr_rejected_in_readonly_mode() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     // Don't call enable_writable.
 
@@ -356,10 +286,6 @@ fn test_setattr_rejected_in_readonly_mode() {
 #[test]
 fn test_rename_returns_eopnotsupp() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -373,10 +299,6 @@ fn test_rename_returns_eopnotsupp() {
 #[test]
 fn test_mkdir_increments_parent_nlink() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
@@ -406,10 +328,6 @@ fn test_mkdir_increments_parent_nlink() {
 #[test]
 fn test_rmdir_decrements_parent_nlink() {
     let vol = load_image_to_memory();
-    let vol = match vol {
-        Some(v) => v,
-        None => return,
-    };
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 

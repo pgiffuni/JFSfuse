@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Journal crash recovery (logredo).
 //!
-//! Implements the backward-replay logredo algorithm from jfsutils `logredo.c`
-//! and `log_work.c`. Recovery scans the log backward from the end, encounters
+//! Implements the backward-replay logredo algorithm from jfsutils.
+//! Recovery scans the log backward from the end, encounters
 //! commit records first (which mark transactions as committed), and then applies
 //! only committed after-image records (REDOPAGE) to disk pages.
 //!
@@ -291,7 +291,7 @@ impl Default for RecoveryVolume {
 
 /// Reads log pages backward from the end of the log.
 ///
-/// Replaces jfsutils' `logRead()` from `log_read.c`.
+/// Replaces jfsutils' `logRead()` function.
 pub struct LogReader<'a> {
     log_storage: &'a dyn Storage,
     /// End of log (byte offset of last record).

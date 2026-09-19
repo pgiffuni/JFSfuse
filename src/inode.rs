@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! On-disk inode access — mirrors `jfs_incore.h` / `jfs_inode.c`.
+//! On-disk inode access — mirrors the kernel JFS inode code.
 //!
 //! Provides read/write access to disk inodes (dinode structures) and
 //! translates between on-disk and runtime representations.

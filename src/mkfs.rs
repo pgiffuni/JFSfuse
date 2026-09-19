@@ -233,8 +233,10 @@ fn build_block_alloc_map(storage: &dyn Storage, num_blocks: u64) {
 
     // Compute reserved blocks (metadata + journal).
     let mut reserved: Vec<(u64, u64)> = Vec::new();
-    reserved.push((0, 16)); // Reserved + sb + AIM + AIT + sb2 (blocks 0..16)
-    reserved.push((24, 4)); // AIT blocks 24..28
+    reserved.push((0, 17)); // Reserved + sb + AIM + AIT + sb2 (blocks 0..16)
+    reserved.push((17, 3)); // Bmap descriptor + 2 dmap pages (blocks 17..19)
+    reserved.push((22, 2)); // AIM2 (blocks 22..24)
+    reserved.push((24, 5)); // AIT + root inode table (blocks 24..29)
     reserved.push((3840, LOG_AREA_BLOCKS)); // Log area
 
     // Count free blocks.

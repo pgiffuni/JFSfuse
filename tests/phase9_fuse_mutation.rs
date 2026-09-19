@@ -349,3 +349,86 @@ fn test_rmdir_decrements_parent_nlink() {
         "rmdir should decrement parent's link count"
     );
 }
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_basic() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Create source file with data.
+    let src_ino = fs.create(parent, "srcfile", 0o100644).expect("create src");
+
+    // Write initial data to source.
+    let data = b"Hello, fusejfs!";
+    let written = fs.write(src_ino, 0, data).expect("write src");
+    assert_eq!(written, data.len());
+
+    // Read back from source to verify write worked.
+    let src_read = fs.read(src_ino, 0, data.len()).expect("read src for verify");
+    assert_eq!(&src_read, data, "source data should match after write");
+
+    // Create destination file.
+    let dst_ino = fs.create(parent, "dstfile", 0o100644).expect("create dst");
+
+    // Copy from src to dst.
+    let copied = fs.copy_file_range(src_ino, 0, dst_ino, 0, data.len(), 0);
+    assert!(copied.is_ok(), "copy_file_range should succeed: {:?}", copied.err());
+    assert_eq!(copied.unwrap(), data.len(), "should copy all bytes");
+
+    // Verify destination content.
+    let read_back = fs.read(dst_ino, 0, data.len()).expect("should read file");
+    assert_eq!(&read_back[..], data, "destination content should match");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_with_move() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let src_ino = fs.create(parent, "movsrc", 0o100644).expect("create src");
+    let data = b"Movable data!";
+    fs.write(src_ino, 0, data).expect("write src");
+
+    let dst_ino = fs.create(parent, "iovdst", 0o100644).expect("create dst");
+
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(
+        src_ino, 0, dst_ino, 0, data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+    );
+    assert!(copied.is_ok(), "copy with MOVE should succeed");
+
+    // Destination should have the data.
+    let read_dst = fs.read(dst_ino, 0, data.len()).expect("read dst");
+    assert_eq!(&read_dst[..], data, "destination content should match");
+
+    // Source should have a hole (zero-filled).
+    let read_src = fs.read(src_ino, 0, data.len()).expect("read src after move");
+    assert!(
+        read_src.iter().all(|&b| b == 0),
+        "source should be zeroed after MOVE"
+    );
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_same_file() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "same", 0o100644).expect("create");
+    fs.write(ino, 0, b"test").expect("write");
+
+    // Copying with same inode and offset should fail.
+    let result = fs.copy_file_range(ino, 0, ino, 0, 4, 0);
+    assert!(result.is_err(), "should reject same-inode copy");
+    assert_eq!(result.unwrap_err(), jfsfuse::fuse::EINVAL);
+}

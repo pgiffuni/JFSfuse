@@ -391,6 +391,41 @@ impl Volume {
         Ok(result)
     }
 
+    /// Synchronize all filesystem metadata and pending transactions to
+    /// durable storage.
+    ///
+    /// Performs the JFS sync sequence:
+    /// 1. Flush dirty pages from the page cache to storage
+    /// 2. Commit outstanding transactions (journal commit + metadata flush)
+    /// 3. Flush the log/journal
+    /// 4. Flush the allocation map
+    /// 5. `storage.sync()` — push to stable storage
+    #[cfg(feature = "writable")]
+    pub fn sync(&mut self) -> crate::storage::Result<()> {
+        // 1. Flush dirty pages to storage.
+        self.page_cache.flush_all(&*self.storage)?;
+
+        // 2. Commit outstanding transactions (journal + metadata).
+        //    If there's an active transaction, commit it. If not, this
+        //    is a no-op (returns Err for "no active transaction" internally).
+        let _ = self.commit_transaction();
+
+        // 3. Flush the journal.
+        if let Some(log) = &mut self.log {
+            log.sync()?;
+        }
+
+        // 4. Flush the allocation map.
+        if let Some(bmap) = &mut self.bmap {
+            bmap.commit()?;
+        }
+
+        // 5. Push to stable storage.
+        self.storage.sync()?;
+
+        Ok(())
+    }
+
     /// Abort the active transaction and discard dirty pages (writable builds only).
     #[cfg(feature = "writable")]
     pub fn abort_transaction(&mut self) {
@@ -423,6 +458,25 @@ impl Volume {
         offset: u64,
         data: &[u8],
     ) -> StorageResult<usize> {
+        self.write_at_with_interrupt(ino, offset, data, None)
+    }
+
+    /// Interruptible write — checks `token` at each extent/loop boundary.
+    #[cfg(feature = "writable")]
+    pub fn write_at_with_interrupt(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        data: &[u8],
+        token: Option<&crate::fuse::InterruptToken>,
+    ) -> StorageResult<usize> {
+        let check = |t: Option<&crate::fuse::InterruptToken>| -> StorageResult<()> {
+            if let Some(tk) = t {
+                tk.check()?;
+            }
+            Ok(())
+        };
+
         let _ = self.begin_transaction()?;
 
         let inode = crate::inode::Inode::read(self, ino)?;
@@ -446,6 +500,7 @@ impl Volume {
         let mut next_logical = fsb_offset;
 
         for (block_addr, block_count) in extents {
+            check(token)?;
             if remaining == 0 {
                 break;
             }
@@ -465,6 +520,7 @@ impl Volume {
                             let mut remaining_in_hole = remaining;
                             let mut cur_offset = cur_byte_offset;
                             for blk in 0..new_len {
+                                check(token)?;
                                 if remaining_in_hole == 0 {
                                     break;
                                 }
@@ -515,6 +571,7 @@ impl Volume {
 
             // Existing extent — write data directly to the physical blocks.
             for blk in 0..block_count as u64 {
+                check(token)?;
                 if remaining == 0 {
                     break;
                 }
@@ -534,6 +591,7 @@ impl Volume {
         }
 
         // Flush data blocks (ordered-data model).
+        check(token)?;
         self.storage.flush_data()?;
 
         // Update inode size and xtree if modified.
@@ -738,6 +796,90 @@ impl Volume {
         Ok(())
     }
 
+    /// Optimized `copy_file_range` with MOVE semantics.
+    ///
+    /// Transfers extent references directly from the source file's xtree to
+    /// the destination file's xtree, avoiding a round-trip through read →
+    /// write. The physical blocks are *reowned* by the destination — no data
+    /// copy, no block allocation, and no block freeing occurs.
+    ///
+    /// Returns `Some(n)` if the optimized path handled the copy, or `None`
+    /// if the request could not be served via extent transfer (e.g. the
+    /// source has no allocated blocks in the range — sparse region) and the
+    /// caller should fall back to the read → write path.
+    #[cfg(feature = "writable")]
+    pub fn copy_file_range_extent(
+        &mut self,
+        src_ino: u32,
+        src_offset: u64,
+        dst_ino: u32,
+        dst_offset: u64,
+        len: usize,
+    ) -> StorageResult<Option<usize>> {
+        let bs = BLOCK_SIZE as u64;
+
+        let src_fsb_start = src_offset / bs;
+        let src_fsb_end = (src_offset + len as u64 + bs - 1) / bs;
+        let dst_fsb_start = dst_offset / bs;
+        let dst_fsb_end = (dst_offset + len as u64 + bs - 1) / bs;
+
+        self.begin_transaction()?;
+
+        // --- Source ---
+        let src_inode = crate::inode::Inode::read(self, src_ino)?;
+        let mut src_xtree = crate::btree::xtree::Xtree::from_inode_data(src_inode.xtroot_bytes())?;
+
+        let taken = src_xtree.take_extents(src_fsb_start as i64, src_fsb_end as i64);
+
+        if taken.is_empty() {
+            self.abort_transaction();
+            return Ok(None);
+        }
+
+        // Write back modified source xtree.
+        let xt_bytes = src_xtree.to_bytes();
+        let old_nblocks = src_inode.dinode.nblocks();
+        let new_src_nblocks = self.compute_nblocks(&src_xtree, old_nblocks)?;
+        self.update_inode_page(src_ino, src_inode.page_block, src_inode.page_offset, |d| {
+            let xt_off = crate::types::Dinode::size() - xt_bytes.len();
+            d[xt_off..xt_off + xt_bytes.len()].copy_from_slice(&xt_bytes);
+            LittleEndian::write_u64(&mut d[32..40], new_src_nblocks);
+        })?;
+        self.mark_page_dirty(src_ino, src_inode.page_block)?;
+
+        // --- Destination ---
+        let dst_inode = crate::inode::Inode::read(self, dst_ino)?;
+        let mut dst_xtree = crate::btree::xtree::Xtree::from_inode_data(dst_inode.xtroot_bytes())?;
+
+        for &(src_logical, length, physical_addr) in &taken {
+            let dst_logical = dst_fsb_start as i64 + (src_logical - src_fsb_start as i64);
+            if !dst_xtree.insert_taken_extent(dst_logical, length, physical_addr) {
+                // xtroot is full — cannot proceed via optimized path.
+                self.abort_transaction();
+                return Ok(None);
+            }
+        }
+
+        let new_dst_size = std::cmp::max(
+            dst_inode.size(),
+            dst_offset + len as u64,
+        );
+        let old_dst_nblocks = dst_inode.dinode.nblocks();
+        let new_dst_nblocks = self.compute_nblocks(&dst_xtree, old_dst_nblocks)?;
+
+        let xt_bytes = dst_xtree.to_bytes();
+        self.update_inode_page(dst_ino, dst_inode.page_block, dst_inode.page_offset, |d| {
+            let xt_off = crate::types::Dinode::size() - xt_bytes.len();
+            d[xt_off..xt_off + xt_bytes.len()].copy_from_slice(&xt_bytes);
+            LittleEndian::write_u64(&mut d[24..32], new_dst_size);
+            LittleEndian::write_u64(&mut d[32..40], new_dst_nblocks);
+        })?;
+        self.mark_page_dirty(dst_ino, dst_inode.page_block)?;
+
+        self.commit_transaction()?;
+        Ok(Some(len))
+    }
+
     /// Set file attributes (chmod, chown, utimens).
     ///
     /// Only modifies the specified fields — all parameters except `ino` are optional.
@@ -821,6 +963,50 @@ impl Volume {
 
     pub fn num_ags(&self) -> u32 {
         self.num_ag
+    }
+
+    /// Total number of blocks in the filesystem.
+    pub fn total_blocks(&self) -> u64 {
+        self.agg_size
+    }
+
+    /// Number of free blocks (estimate from allocation map if writable).
+    pub fn free_blocks(&self) -> u64 {
+        #[cfg(feature = "writable")]
+        {
+            return self.bmap.as_ref().map(|b| b.nfree()).unwrap_or(0);
+        }
+        #[cfg(not(feature = "writable"))]
+        {
+            0
+        }
+    }
+
+    /// Total blocks managed by the allocation map.
+    pub fn total_allocated_blocks(&self) -> u64 {
+        #[cfg(feature = "writable")]
+        {
+            return self.bmap.as_ref().map(|b| b.mapsize()).unwrap_or(0);
+        }
+        #[cfg(not(feature = "writable"))]
+        {
+            0
+        }
+    }
+
+    /// Number of free inodes (estimate — currently returns 0 since
+    /// inode allocation tracking is not fully implemented).
+    pub fn free_inodes(&self) -> u64 {
+        0
+    }
+
+    /// Total number of inodes in the filesystem (estimate from block size).
+    pub fn total_inodes(&self) -> u64 {
+        // JFS inode size is typically 512 bytes. Estimate based on
+        // total filesystem size.
+        let inode_size = std::mem::size_of::<crate::types::Dinode>() as u64;
+        let total_bytes = self.agg_size * self.block_size as u64;
+        total_bytes / (inode_size * 4)
     }
 
     /// Apply a mutation to the cached inode page, then unpin it.

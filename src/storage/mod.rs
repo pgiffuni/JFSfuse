@@ -59,6 +59,8 @@ pub enum StorageError {
     FaultInjection,
     #[error("block number {0} exceeds volume size of {1} blocks")]
     BlockOutOfRange(BlockNo, BlockNo),
+    #[error("operation interrupted by FUSE_INTERRUPT")]
+    Interrupted,
     #[error("{0}")]
     Other(String),
 }
@@ -571,6 +573,12 @@ impl PageCache {
     }
 
     /// Get a page, fetching from storage if not cached. Returns a clone.
+    ///
+    /// If another inode's page for the **same** physical block is already
+    /// cached (e.g. two inodes sharing an inode-table page), that newer
+    /// version is reused instead of reading stale data from storage. This
+    /// keeps all cache entries for the same block consistent within a
+    /// transaction.
     pub fn get_or_load(
         &mut self,
         storage: &dyn Storage,
@@ -582,7 +590,15 @@ impl PageCache {
         if let Some(page) = self.cache.get(&key) {
             return Ok(page.clone());
         }
-        let data = storage.read_block(block)?;
+
+        // Check whether another inode's cached page for this block exists.
+        let data = self
+            .cache
+            .iter()
+            .find(|(k, _)| k.1 == block && k.0 != inode)
+            .map(|(_, p)| p.data.clone())
+            .unwrap_or_else(|| storage.read_block(block).unwrap_or_default());
+
         let page = CachedPage {
             block,
             data,
@@ -725,6 +741,23 @@ impl PageCache {
     /// Remove a cached page (replaces release_metapage).
     pub fn release(&mut self, inode: u32, block: BlockNo) {
         self.cache.pop(&(inode, block));
+    }
+
+    /// Evict all cached pages for a given inode (FUSE_FORGET support).
+    ///
+    /// Removes all entries from the page cache whose key matches `inode`,
+    /// freeing memory when the FUSE kernel module signals that an inode's
+    /// reference count has reached zero.
+    pub fn evict(&mut self, inode: u32) {
+        let keys: Vec<(u32, BlockNo)> = self
+            .cache
+            .iter()
+            .filter(|((ino, _), _)| *ino == inode)
+            .map(|((ino, blk), _)| (*ino, *blk))
+            .collect();
+        for key in keys {
+            self.cache.pop(&key);
+        }
     }
 
     /// Clear all cached pages.

@@ -191,6 +191,54 @@ impl Xtree {
         Ok(result)
     }
 
+    /// Interruptible version of `read_data` — checks the `InterruptToken`
+    /// at each block read. Returns `StorageError::Interrupted` if the
+    /// operation is cancelled.
+    pub fn read_data_checked(
+        &self,
+        offset: u64,
+        length: usize,
+        storage: &dyn Storage,
+        token: &crate::fuse::InterruptToken,
+    ) -> StorageResult<Vec<u8>> {
+        let fsb_offset = offset / (BLOCK_SIZE as u64);
+        let byte_offset = offset % (BLOCK_SIZE as u64);
+        let fsb_count = ((length + byte_offset as usize + BLOCK_SIZE - 1) / BLOCK_SIZE) as u64;
+
+        let extents = self.map_blocks(fsb_offset, fsb_count)?;
+        let mut result = Vec::with_capacity(length);
+        let mut remaining = length;
+        let mut buf_offset = byte_offset as usize;
+
+        for (block_addr, block_count) in extents {
+            if block_addr == 0 {
+                let zeros = std::cmp::min(block_count as usize * BLOCK_SIZE, remaining);
+                result.extend(std::iter::repeat(0u8).take(zeros));
+                remaining = remaining.saturating_sub(zeros);
+                buf_offset = 0;
+                if remaining == 0 {
+                    break;
+                }
+                continue;
+            }
+
+            for blk in 0..block_count as u64 {
+                if remaining == 0 {
+                    break;
+                }
+                token.check()?;
+                let data = storage.read_block(block_addr + blk)?;
+                let to_copy = std::cmp::min(BLOCK_SIZE - buf_offset, remaining);
+                result.extend_from_slice(&data[buf_offset..buf_offset + to_copy]);
+                remaining -= to_copy;
+                buf_offset = 0;
+            }
+        }
+
+        result.truncate(length);
+        Ok(result)
+    }
+
     pub fn next_index(&self) -> usize {
         self.root.header.nextindex() as usize
     }
@@ -325,6 +373,35 @@ impl Xtree {
         xad.set_length(length);
         xad.set_address(physical_addr);
         xad.set_flag(XadFlag::XAD_NEW);
+        true
+    }
+
+    /// Insert a pre-existing extent (transfer from another file's xtree).
+    ///
+    /// Unlike `insert_extent`, this does not check for contiguity with
+    /// the last extent — it simply appends a new xad entry. Used by the
+    /// extent-reference transfer path of `copy_file_range`.
+    pub fn insert_taken_extent(
+        &mut self,
+        logical_offset: i64,
+        length: u32,
+        physical_addr: u64,
+    ) -> bool {
+        let next_idx = self.root.header.nextindex() as usize;
+        if next_idx as usize >= XTROOTMAXSLOT {
+            return false;
+        }
+        let idx = if next_idx as usize <= XTENTRYSTART {
+            XTENTRYSTART
+        } else {
+            next_idx as usize
+        };
+        let xad = &mut self.root.xad[idx];
+        xad.set_offset(logical_offset);
+        xad.set_length(length);
+        xad.set_address(physical_addr);
+        xad.flag = 0;
+        self.root.header.set_nextindex(idx as u16 + 1);
         true
     }
 
@@ -481,6 +558,113 @@ impl Xtree {
         }
         self.root.header.set_nextindex(new_next as u16);
         freed
+    }
+
+    /// Remove extents within the range [`start_fsb`, `end_fsb`) and return
+    /// them as `(logical_offset, length, physical_address)` triples.
+    ///
+    /// Unlike `punch_extents`, this method does **not** free the underlying
+    /// blocks — the caller takes ownership of the extent references and is
+    /// responsible for inserting them into another file's xtree (or freeing
+    /// them separately). This is the basis for the move-optimized
+    /// `copy_file_range` path.
+    ///
+    /// Extents entirely within the range are removed wholesale. Extents
+    /// straddling the boundaries are split: the out-of-range portion is kept,
+    /// the in-range portion is returned.
+    pub fn take_extents(&mut self, start_fsb: i64, end_fsb: i64) -> Vec<(i64, u32, u64)> {
+        let next_idx = self.root.header.nextindex() as usize;
+        let mut kept: Vec<Xad> = Vec::new();
+        let mut taken: Vec<(i64, u32, u64)> = Vec::new();
+
+        for i in XTENTRYSTART..next_idx {
+            if i >= XTROOTMAXSLOT {
+                break;
+            }
+            let xad = &self.root.xad[i];
+            let ext_offset = xad.offset() as i64;
+            let ext_length = xad.length() as u32;
+            let ext_addr = xad.address();
+
+            if ext_length == 0 {
+                continue;
+            }
+
+            let ext_end = ext_offset + ext_length as i64;
+
+            if ext_end <= start_fsb {
+                // Entirely before the take range — keep as-is.
+                kept.push(*xad);
+            } else if ext_offset >= end_fsb {
+                // Entirely after the take range — keep as-is.
+                kept.push(*xad);
+            } else if ext_offset >= start_fsb && ext_end <= end_fsb {
+                // Entirely within the take range — take it.
+                taken.push((ext_offset, ext_length, ext_addr));
+            } else if ext_offset < start_fsb && ext_end > end_fsb {
+                // Spans the entire take range — split into three parts.
+                let left_len = (start_fsb - ext_offset) as u32;
+                let right_len = (ext_end - end_fsb) as u32;
+
+                // Take the middle portion.
+                taken.push((
+                    start_fsb,
+                    (end_fsb - start_fsb) as u32,
+                    ext_addr + left_len as u64,
+                ));
+
+                // Keep left portion.
+                let mut left = *xad;
+                left.set_length(left_len);
+                kept.push(left);
+
+                // Keep right portion.
+                let mut right = *xad;
+                right.set_offset(end_fsb);
+                right.set_length(right_len);
+                right.set_address(ext_addr + left_len as u64 + (end_fsb - start_fsb) as u64);
+                kept.push(right);
+            } else if ext_offset < start_fsb {
+                // Starts before take range, extends into it — keep left part.
+                let keep_len = (start_fsb - ext_offset) as u32;
+                let take_len = ext_length - keep_len;
+                taken.push((
+                    start_fsb,
+                    take_len,
+                    ext_addr + keep_len as u64,
+                ));
+
+                let mut xad_copy = *xad;
+                xad_copy.set_length(keep_len);
+                kept.push(xad_copy);
+            } else {
+                // Starts within take range, extends past it — keep right part.
+                let take_len = (end_fsb - ext_offset) as u32;
+                let keep_len = ext_length - take_len;
+                taken.push((ext_offset, take_len, ext_addr));
+
+                let mut xad_copy = *xad;
+                xad_copy.set_offset(end_fsb);
+                xad_copy.set_length(keep_len);
+                xad_copy.set_address(ext_addr + take_len as u64);
+                kept.push(xad_copy);
+            }
+        }
+
+        // Write kept extents back.
+        for (write_idx, xad) in kept.iter().enumerate() {
+            let idx = XTENTRYSTART + write_idx;
+            if idx < XTROOTMAXSLOT {
+                self.root.xad[idx] = *xad;
+            }
+        }
+        let new_next = XTENTRYSTART + kept.len();
+        for idx in new_next..next_idx.min(XTROOTMAXSLOT) {
+            self.root.xad[idx] = Xad::default();
+        }
+        self.root.header.set_nextindex(new_next as u16);
+
+        taken
     }
 
 

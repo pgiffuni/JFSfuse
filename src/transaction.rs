@@ -189,16 +189,15 @@ impl TransactionManager {
         // 4. Flush metadata to durable storage.
         storage.flush_metadata()?;
 
-        // 5. Clear dirty/transaction state on cache pages.
+        // 5. Invalidate cache pages that were written back. We discard the
+        //    cached copy (rather than just clearing the dirty flag) so that
+        //    the next access re-reads from storage. This is necessary because
+        //    multiple inodes can share the same on-disk block: a page cached
+        //    under inode A may be stale if inode B later committed changes to
+        //    the same block. Removing the entry forces a fresh read.
         for (inode, block) in &dirty_pages {
             cache.unpin_page(*inode, *block);
-            let page = cache.get(*inode, *block);
-            if let Some(mut p) = page {
-                p.dirty = false;
-                p.txid = 0;
-                p.unpin();
-                let _ = cache.put(*inode, p);
-            }
+            cache.release(*inode, *block);
         }
 
         self.last_committed.store(txid, Ordering::SeqCst);

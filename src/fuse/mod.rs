@@ -2,14 +2,15 @@
 //! FUSE filesystem operations adapter.
 //!
 //! Bridges JFS filesystem operations to the FUSE kernel interface.
-//! Provides: lookup, readdir, read, getattr, etc.
+//! Provides: lookup, readdir, read, getattr, lseek, etc.
 //!
 //! ## Write support
 //!
-//! All FUSE write callbacks (`create`, `mkdir`, `unlink`, `rmdir`, `rename`,
+//! Write callbacks (`create`, `mkdir`, `unlink`, `rmdir`, `rename`,
 //! `link`, `symlink`, `open`, `release`, `write`, `truncate`, `fsync`,
-//! `setattr`, `setxattr`, etc.) are gated behind the `writable` cargo
-//! feature and remain disabled until the transaction layer is validated.
+//! `setattr`, `setxattr`, etc.) are enabled by the `writable` cargo
+//! feature, which is active by default. To build a read-only variant,
+//! use `--no-default-features --features std`.
 
 use crate::btree::dtree::Dtree;
 use crate::btree::xtree::Xtree;

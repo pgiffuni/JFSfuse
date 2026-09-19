@@ -18,14 +18,15 @@ interface with full journaling support.
 ### Build
 
 ```sh
-cargo build
-cargo build --features writable          # enable writable support
+cargo build                      # writable (default)
+cargo build --no-default-features --features std   # read-only
 ```
 
 ### Run tests
 
 ```sh
-cargo test --features writable
+cargo test                       # writable (default)
+cargo test --no-default-features --features std   # read-only
 ```
 
 ### Binaries
@@ -35,8 +36,8 @@ cargo test --features writable
 - `newjfs` — JFS filesystem image creator
 
 ```sh
-cargo build --bin jfsck --features writable
-cargo build --bin newjfs --features writable
+cargo build --bin jfsck
+cargo build --bin newjfs
 ```
 
 ## Files
@@ -93,10 +94,10 @@ fusejfs/
 ## Features
 
 ### Read-only
-Available without feature flags. Supports `lookup`, `readdir`, `read`, `getattr`, `lseek` (SEEK_DATA/SEEK_HOLE).
+Available with `cargo build --no-default-features --features std`. Supports `lookup`, `readdir`, `read`, `getattr`, `lseek` (SEEK_DATA/SEEK_HOLE).
 
-### Writable (`--features writable`)
-Full journaled write support with ordered-data semantics:
+### Writable (default)
+Full journaled write support with ordered-data semantics. Enable with `cargo build` (or `--features writable`). Disable with `--no-default-features --features std`.
 
 | Operation | Description |
 |-----------|-------------|
@@ -147,8 +148,8 @@ a future copyright holder relax the licensing, we can follow.
 | Command | Description |
 |---------|-------------|
 | `jfsck --read-only <image>` | Check filesystem consistency without mounting for write. Reports errors/warnings found in superblock, journal, root inode, directory entries, extent trees, and xattr metadata. |
-| `jfsck --repair <image>` | Run a consistency check, then apply safe repairs when the filesystem is structurally consistent. Currently clears a stale `FM_DIRTY` superblock state after journal replay. Requires `--features writable`. |
-| `jfsck --replay <image>` | Mount the filesystem and replay the journal if needed. Use after an unclean shutdown. Requires `--features writable`. |
+| `jfsck --repair <image>` | Run a consistency check, then apply safe repairs when the filesystem is structurally consistent. Currently clears a stale `FM_DIRTY` superblock state after journal replay. |
+| `jfsck --replay <image>` | Mount the filesystem and replay the journal if needed. Use after an unclean shutdown. |
 | `jfsck --dump-inode <image> <ino>` | Print detailed metadata for a single inode: mode, size, nlink, uid/gid, and xtree/dtree layout. |
 | `jfsck --dump-xtree <image> <ino>` | Show the extent tree for a regular file or directory, including logical offset, length, and physical address for each extent. |
 | `jfsck --dump-dtree <image> <ino>` | List all directory entries in a directory inode, showing name and inode number. |

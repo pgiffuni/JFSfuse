@@ -15,13 +15,17 @@
 //! `FM_DIRY` state left behind by an unclean shutdown after the journal
 //! has been replayed to a clean state.
 
+#[cfg(feature = "writable")]
 use byteorder::{ByteOrder, LittleEndian};
 use std::env;
 use std::process;
 
 use jfsfuse::storage::{BLOCK_SIZE, FileStorage};
-use jfsfuse::types::{FM_CLEAN, FM_DIRTY};
+#[cfg(feature = "writable")]
+use jfsfuse::types::FM_CLEAN;
 use jfsfuse::volume::Volume;
+#[cfg(feature = "writable")]
+use jfsfuse::types::FM_DIRTY;
 
 const USAGE: &str = "usage: fsck_jfs --read-only `image`\n\
                      fsck_jfs --repair `image`\n\

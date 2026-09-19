@@ -6,11 +6,10 @@ description = "JFS for FUSE on Rust"
 license = "MIT OR GPL-2.0-or-later"
 
 [features]
-default = ["std"]
+default = ["std", "writable"]
 std = []
-# Enable writable (journaled) mount support.
-# Until the transaction layer is fully validated, writable mounting
-# remains disabled even when this feature is active.
+# Enable writable (journaled) mount support. Enabled by default.
+# Use `--no-default-features --features std` for read-only builds.
 writable = []
 
 [dependencies]

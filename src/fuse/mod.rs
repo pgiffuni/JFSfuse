@@ -14,13 +14,17 @@
 
 use std::collections::HashMap;
 
-use crate::btree::dtree::Dtree;
+use crate::btree::dtree::{Dtree, DirectoryCursor};
 use crate::btree::xtree::Xtree;
+pub mod abi;
 pub mod interrupt;
 pub use interrupt::{InterruptFlag, InterruptManager, InterruptToken, RequestId};
 use crate::inode::Inode;
     use crate::types::{BlockNo, Dinode};
 use crate::volume::Volume;
+
+// Re-export all FUSE ABI constants from the abi module.
+pub use abi::*;
 
 /// POSIX errno constants used by the FUSE adapter to report errors.
 /// Maps internal JFS conditions to FUSE results per the Phase 9 table.
@@ -39,38 +43,6 @@ pub const EIO: i32 = 5;
 pub const EPERM: i32 = 1;
 pub const EAGAIN: i32 = 11;
 pub const EINTR: i32 = 4;
-
-/// FUSE capability flags negotiated during FUSE_INIT.
-///
-/// These correspond to the `flags` field returned by the FUSE_INIT handler.
-/// Only flags actually implemented by jfsfuse are set in [`FuseFs::fuse_capabilities`].
-///
-    /// ## Implemented
-    /// - [`FUSE_POSIX_LOCKS`] — POSIX fcntl-style byte-range locks
-    /// - [`FUSE_FLOCK_LOCKS`] — BSD-style `flock(2)` locks
-    /// - [`FUSE_ASYNC_READ`] — asynchronous read (reads may be reordered)
-    /// - [`FUSE_BIG_WRITES`] — writes larger than 4 KB are accepted
-    /// - [`FUSE_PARALLEL_DIROPS`] — concurrent directory operations
-    /// - [`FUSE_BMAP`] — file block to physical block mapping via Xtree
-    /// - [`FUSE_SYNCFS`] — filesystem-wide sync (journal commit + metadata flush + storage sync)
-    /// - [`FUSE_DO_READDIRPLUS`] / [`FUSE_READDIRPLUS_AUTO`] — readdir with attributes
-    ///
-    /// ## Add when implemented
-    /// - [`FUSE_WRITEBACK_CACHE`] — deferred writeback caching
-    /// - [`FUSE_HANDLE_KILLPRIV`] — kill privileges on write
-
-pub const FUSE_ASYNC_READ: u32       = 1 << 0;
-pub const FUSE_BIG_WRITES: u32       = 1 << 2;
-pub const FUSE_FILE_OPS: u32         = 1 << 4;
-pub const FUSE_FLOCK_LOCKS: u32      = 1 << 9;
-pub const FUSE_POSIX_LOCKS: u32      = 1 << 11;
-pub const FUSE_DO_READDIRPLUS: u32   = 1 << 13;
-pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
-pub const FUSE_BMAP: u32             = 1 << 15;
-pub const FUSE_SYNCFS: u32           = 1 << 31;
-pub const FUSE_WRITEBACK_CACHE: u32  = 1 << 20;
-pub const FUSE_PARALLEL_DIROPS: u32  = 1 << 21;
-pub const FUSE_HANDLE_KILLPRIV: u32  = 1 << 27;
 
 /// Lock types (POSIX fcntl `l_type`).
 pub const F_RDLCK: i16 = 0;
@@ -226,21 +198,30 @@ impl FuseFs {
 
     /// Returns the FUSE capability flags this filesystem supports.
     ///
-    /// These flags enable features in the kernel FUSE client. Long-running
-    /// operations (large reads, writes, directory scans) are made
-    /// cancellable via [`FUSE_INTERRUPT`] when [`FUSE_ASYNC_READ`] is
-    /// negotiated — each request gets an identifiable [`RequestId`]
+    /// These flags are negotiated during FUSE_INIT to enable features
+    /// in the kernel FUSE client. All constants are defined in the
+    /// [`abi`](self::abi) module and match the Linux FUSE ABI.
+    ///
+    /// ## Implemented
+    /// - [`FUSE_POSIX_LOCKS`] — POSIX fcntl-style byte-range locks
+    /// - [`FUSE_FLOCK_LOCKS`] — BSD-style `flock(2)` locks
+    /// - [`FUSE_ASYNC_READ`] — asynchronous read (reads may be reordered)
+    /// - [`FUSE_BIG_WRITES`] — writes larger than 4 KB are accepted
+    /// - [`FUSE_PARALLEL_DIROPS`] — concurrent directory operations
+    /// - [`FUSE_BMAP`] (opcode) — file block to physical block mapping via Xtree
+    /// - [`FUSE_DO_READDIRPLUS`] / [`FUSE_READDIRPLUS_AUTO`] — readdir with attributes
+    ///
+    /// Long-running operations are made cancellable via [`FUSE_INTERRUPT`]
+    /// — each request gets an identifiable [`RequestId`]
     /// (see [`Self::register_request`]).
     ///
-    /// [`FUSE_INTERRUPT`]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/fuse/fuse.h
+    /// [`FUSE_INTERRUPT`]: abi::FUSE_INTERRUPT
     pub fn fuse_capabilities(&self) -> u32 {
         FUSE_POSIX_LOCKS
             | FUSE_FLOCK_LOCKS
             | FUSE_ASYNC_READ
             | FUSE_BIG_WRITES
             | FUSE_PARALLEL_DIROPS
-            | FUSE_BMAP
-            | FUSE_SYNCFS
             | FUSE_DO_READDIRPLUS
             | FUSE_READDIRPLUS_AUTO
     }
@@ -416,35 +397,61 @@ impl FuseFs {
         }
     }
 
-    /// Read directory entries. Returns a list of (name, inode_number, file_type).
+    /// Read directory entries starting from `offset`. Returns a list of
+    /// (name, inode_number, file_type).
+    ///
+    /// Uses [`DirectoryCursor`] to support offset-based resumption as
+    /// required by FUSE READDIR — the kernel passes a cookie offset to
+    /// resume from a previous position.
     /// Includes `.` and `..` entries. Real entries come from the dtree stbl order.
-    pub fn readdir(&mut self, ino: u32, _offset: u64) -> Option<Vec<(String, u32, u8)>> {
+    pub fn readdir(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8)>> {
         let inode = Inode::read(&mut self.volume, ino).ok()?;
         if !inode.is_dir() {
             return None;
         }
 
         let mut result = Vec::new();
+        let cursor = DirectoryCursor::from_offset(offset);
 
-        // `.` entry — points to self
-        result.push((".".to_string(), ino, 0x04));
+        // `.` entry — points to self (always emitted; FUSE may skip if offset > 0)
+        if !cursor.is_entry() {
+            result.push((".".to_string(), ino, 0x04));
+        }
 
         // `..` entry — parent from dtroot header
         let dtroot = inode.dtroot_bytes();
         if dtroot.len() >= 24 {
             let parent_ino = u32::from_le_bytes(dtroot[20..24].try_into().unwrap());
-            result.push(("..".to_string(), parent_ino, 0x04));
+            if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
+                result.push(("..".to_string(), parent_ino, 0x04));
+            }
         }
 
-        // Real entries from the dtree
-        if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
-            if let Ok(entries) = dtree.entries() {
-                for e in &entries {
-                    let name = String::from_utf16_lossy(&e.name)
-                        .trim_end_matches('\0')
-                        .to_string();
-                    let file_type = self.infer_file_type(e.inumber);
-                    result.push((name, e.inumber, file_type));
+        // Real entries from the dtree, starting from the cursor's position
+        if cursor.is_entry() {
+            if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
+                if let Ok(entries) = dtree.entries() {
+                    let start_idx = cursor.entry_index().unwrap_or(0);
+                    for e in entries.iter().skip(start_idx) {
+                        let name = String::from_utf16_lossy(&e.name)
+                            .trim_end_matches('\0')
+                            .to_string();
+                        let file_type = self.infer_file_type(e.inumber);
+                        result.push((name, e.inumber, file_type));
+                    }
+                }
+            }
+        } else {
+            // Offset was at . or .., so include all real entries
+            if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
+                if let Ok(entries) = dtree.entries() {
+                    for e in &entries {
+                        let name = String::from_utf16_lossy(&e.name)
+                            .trim_end_matches('\0')
+                            .to_string();
+                        let file_type = self.infer_file_type(e.inumber);
+                        result.push((name, e.inumber, file_type));
+                    }
                 }
             }
         }
@@ -456,31 +463,59 @@ impl FuseFs {
     ///
     /// Like `readdir` but also fetches the `Dinode` (stat) and type for
     /// each child. This reduces subsequent LOOKUP + GETATTR round-trips.
-    pub fn readdirplus(&mut self, ino: u32, _offset: u64) -> Option<Vec<(String, u32, u8, Dinode)>> {
+    /// Supports offset-based resumption via [`DirectoryCursor`].
+    pub fn readdirplus(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8, Dinode)>> {
         let inode = Inode::read(&mut self.volume, ino).ok()?;
         if !inode.is_dir() {
             return None;
         }
 
         let mut result = Vec::new();
+        let cursor = DirectoryCursor::from_offset(offset);
+        let dtroot = inode.dtroot_bytes();
 
         // `.` entry
-        if let Some(attr) = self.getattr(ino) {
-            result.push((".".to_string(), ino, 0x04, attr));
+        if !cursor.is_entry() {
+            if let Some(attr) = self.getattr(ino) {
+                result.push((".".to_string(), ino, 0x04, attr));
+            }
         }
 
         // `..` entry
-        let dtroot = inode.dtroot_bytes();
         if dtroot.len() >= 24 {
             let parent_ino = u32::from_le_bytes(dtroot[20..24].try_into().unwrap());
-            if let Some(attr) = self.getattr(parent_ino) {
-                result.push(("..".to_string(), parent_ino, 0x04, attr));
+            if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
+                if let Some(attr) = self.getattr(parent_ino) {
+                    result.push(("..".to_string(), parent_ino, 0x04, attr));
+                }
             }
         }
 
         // Real entries
-        if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
+        let entries = if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
             if let Ok(entries) = dtree.entries() {
+                let start_idx = cursor.entry_index().unwrap_or(0);
+                Some(entries.into_iter().skip(start_idx).collect::<Vec<_>>())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(entries) = entries {
+            if !cursor.is_entry() {
+                // Offset was at . or .., include all entries
+                for e in &entries {
+                    let name = String::from_utf16_lossy(&e.name)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    let file_type = self.infer_file_type(e.inumber);
+                    if let Some(attr) = self.getattr(e.inumber) {
+                        result.push((name, e.inumber, file_type, attr));
+                    }
+                }
+            } else {
                 for e in &entries {
                     let name = String::from_utf16_lossy(&e.name)
                         .trim_end_matches('\0')
@@ -498,10 +533,11 @@ impl FuseFs {
 
     /// Interruptible readdir — same as `readdir` but checks `token` at
     /// each directory entry. Returns `Err(EINTR)` if interrupted.
+    /// Supports offset-based resumption.
     pub fn readdir_interruptible(
         &mut self,
         ino: u32,
-        _offset: u64,
+        offset: u64,
         token: &InterruptToken,
     ) -> Result<Vec<(String, u32, u8)>, i32> {
         let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
@@ -510,18 +546,31 @@ impl FuseFs {
         }
 
         let mut result = Vec::new();
+        let cursor = DirectoryCursor::from_offset(offset);
 
-        result.push((".".to_string(), ino, 0x04));
+        if !cursor.is_entry() {
+            result.push((".".to_string(), ino, 0x04));
+        }
 
         let dtroot = inode.dtroot_bytes();
         if dtroot.len() >= 24 {
             let parent_ino = u32::from_le_bytes(dtroot[20..24].try_into().unwrap());
-            result.push(("..".to_string(), parent_ino, 0x04));
+            if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
+                result.push(("..".to_string(), parent_ino, 0x04));
+            }
         }
 
         if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
             if let Ok(entries) = dtree.entries() {
-                for e in &entries {
+                let start_idx = if cursor.is_entry() {
+                    cursor.entry_index().unwrap_or(0)
+                } else {
+                    0
+                };
+                for (i, e) in entries.iter().enumerate() {
+                    if i < start_idx {
+                        continue;
+                    }
                     if token.is_interrupted() {
                         return Err(EINTR);
                     }
@@ -1068,19 +1117,39 @@ impl FuseFs {
     /// Rename or move a file/directory (writable builds only).
     ///
     /// Unlinks the old name from the source parent and creates a new entry
-    /// in the destination parent. Not yet implemented.
+    /// in the destination parent.
     #[cfg(feature = "writable")]
     pub fn rename(
         &mut self,
-        _old_parent: u32,
-        _old_name: &str,
-        _new_parent: u32,
-        _new_name: &str,
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
     ) -> FuseResult<()> {
         if !self.writable {
             return Err(EROFS);
         }
-        Err(EOPNOTSUPP)
+        self.volume
+            .rename(old_parent, old_name, new_parent, new_name)
+            .map(|_| ())
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not a directory") {
+                    ENOTDIR
+                } else if msg.contains("not empty") {
+                    ENOTEMPTY
+                } else if msg.contains("already exists") || msg.contains("file exists") {
+                    EEXIST
+                } else if msg.contains("directory entry already exists") {
+                    EEXIST
+                } else if msg.contains("no such file") || msg.contains("not found") {
+                    ENOENT
+                } else if msg.contains("invalid") || msg.contains("cannot") {
+                    EPERM
+                } else {
+                    EIO
+                }
+            })
     }
 
     /// Set an extended attribute (writable builds only).

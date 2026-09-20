@@ -546,3 +546,80 @@ mod tests {
         assert_eq!(entry.inumber, 42);
     }
 }
+
+/// Cursor for offset-based directory iteration (FUSE READDIR / READDIRPLUS).
+///
+/// FUSE uses 64-bit offsets to allow the kernel to resume directory
+/// iteration from where it left off. We use the directory entry's
+/// `index` field (the slot position in the sorted-entry table) plus a
+/// fixed offset for `.` and `..` entries. Specifically:
+/// - offset 0: `.`  (self)
+/// - offset 1: `..` (parent)
+/// - offset 2..=N+1: real entries, indexed by position in the sorted
+///   entry list.
+pub struct DirectoryCursor {
+    /// Current position in the offset space.
+    pub offset: u64,
+}
+
+impl DirectoryCursor {
+    pub const DOT_OFFSET: u64 = 0;
+    pub const DOTDOT_OFFSET: u64 = 1;
+    pub const ENTRY_BASE: u64 = 2;
+
+    pub fn new() -> Self {
+        Self {
+            offset: Self::ENTRY_BASE,
+        }
+    }
+
+    /// Create a cursor resumed from a FUSE offset.
+    pub fn from_offset(offset: u64) -> Self {
+        Self { offset }
+    }
+
+    /// Returns the entry index for the current offset (for real entries),
+    /// or `None` if the offset points at `.` or `..`.
+    pub fn entry_index(&self) -> Option<usize> {
+        if self.offset < Self::ENTRY_BASE {
+            None
+        } else {
+            Some((self.offset - Self::ENTRY_BASE) as usize)
+        }
+    }
+
+    /// Advance the cursor to the next entry.
+    pub fn advance(&mut self) {
+        self.offset += 1;
+    }
+
+    /// Check if the cursor is positioned at `.`.
+    pub fn is_dot(&self) -> bool {
+        self.offset == Self::DOT_OFFSET
+    }
+
+    /// Check if the cursor is positioned at `..`.
+    pub fn is_dotdot(&self) -> bool {
+        self.offset == Self::DOTDOT_OFFSET
+    }
+
+    /// Check if the cursor is positioned at a real entry.
+    pub fn is_entry(&self) -> bool {
+        self.offset >= Self::ENTRY_BASE
+    }
+
+    /// Check if there are more entries after the cursor's entry index.
+    pub fn has_more(&self, num_entries: usize) -> bool {
+        if self.offset < Self::ENTRY_BASE {
+            return true;
+        }
+        let idx = (self.offset - Self::ENTRY_BASE) as usize;
+        idx < num_entries
+    }
+}
+
+impl Default for DirectoryCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}

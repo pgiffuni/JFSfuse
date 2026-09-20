@@ -1118,6 +1118,205 @@ impl Volume {
         Ok(inserted)
     }
 
+    /// Rename a directory entry from `old_parent:old_name` to
+    /// `new_parent:new_name`.
+    ///
+    /// Handles both same-directory renames (single parent page modified)
+    /// and cross-directory renames (two parent pages modified).
+    ///
+    /// Returns `Ok(true)` if the rename succeeded. Returns an error
+    /// if the source was not found.
+    #[cfg(feature = "writable")]
+    pub fn rename(
+        &mut self,
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
+    ) -> StorageResult<bool> {
+        let _ = self.begin_transaction()?;
+
+        let old_name_u16: Vec<u16> = old_name.encode_utf16().collect();
+        let new_name_u16: Vec<u16> = new_name.encode_utf16().collect();
+
+        // Validate name lengths.
+        if old_name_u16.is_empty() || old_name_u16.len() > 11 {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid source filename length".to_string()));
+        }
+        if new_name_u16.is_empty() || new_name_u16.len() > 11 {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid destination filename length".to_string()));
+        }
+
+        // Look up the source entry to get its inode number and type.
+        let (child_ino, child_is_dir) = {
+            let parent = crate::inode::Inode::read(self, old_parent)?;
+            let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+            match dtree.lookup(&old_name_u16)? {
+                Some(entry) => {
+                    let child = crate::inode::Inode::read(self, entry.inumber)?;
+                    (entry.inumber, child.is_dir())
+                }
+                None => {
+                    self.abort_transaction();
+                    return Err(StorageError::Other("no such file or directory".to_string()));
+                }
+            }
+        };
+
+        // Handle cross-directory rename (including directory link count updates).
+        if old_parent != new_parent {
+            // If the destination exists, validate type compatibility and remove it.
+            match self.remove_dir_entry(new_parent, &new_name_u16)? {
+                Some(dest_ino) => {
+                    let dest = crate::inode::Inode::read(self, dest_ino)?;
+                    if dest.is_dir() && !child_is_dir {
+                        self.abort_transaction();
+                        return Err(StorageError::Other(
+                            "cannot rename file over directory".to_string(),
+                        ));
+                    }
+                    if child_is_dir && !dest.is_dir() {
+                        self.abort_transaction();
+                        return Err(StorageError::Other(
+                            "cannot rename directory over file".to_string(),
+                        ));
+                    }
+                    if child_is_dir && dest.is_dir() {
+                        let dest_entries = crate::btree::dtree::Dtree::from_inode_data(dest.dtroot_bytes())?
+                            .entries()?;
+                        if !dest_entries.is_empty() {
+                            self.abort_transaction();
+                            return Err(StorageError::Other(
+                                "destination directory not empty".to_string(),
+                            ));
+                        }
+                    }
+                    let dest_ino_data = dest;
+                    self.mark_page_dirty(new_parent, dest_ino_data.page_block)?;
+                }
+                None => {}
+            }
+
+            // Insert into new parent.
+            let num_entries = {
+                let new_parent_data = crate::inode::Inode::read(self, new_parent)?;
+                let dtree = crate::btree::dtree::Dtree::from_inode_data(new_parent_data.dtroot_bytes())?;
+                dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+            };
+            let inserted = self.insert_dir_entry(new_parent, &new_name_u16, child_ino, num_entries)?;
+            if !inserted {
+                self.abort_transaction();
+                return Err(StorageError::Other(
+                    "failed to insert directory entry".to_string(),
+                ));
+            }
+            {
+                let new_parent_data = crate::inode::Inode::read(self, new_parent)?;
+                self.mark_page_dirty(new_parent, new_parent_data.page_block)?;
+            }
+
+            // Remove from old parent.
+            self.remove_dir_entry(old_parent, &old_name_u16)?;
+            {
+                let old_parent_data = crate::inode::Inode::read(self, old_parent)?;
+                self.mark_page_dirty(old_parent, old_parent_data.page_block)?;
+            }
+
+            // Update directory link counts and `..` pointer for cross-directory dir moves.
+            if child_is_dir {
+                // Update `..` in child to point to new parent.
+                let child_data = crate::inode::Inode::read(self, child_ino)?;
+                self.update_inode_page(child_ino, child_data.page_block, child_data.page_offset, |dinode_bytes| {
+                    let dt_start = crate::types::Dinode::size() - 288;
+                    let parent_off = dt_start + 20;
+                    if parent_off + 4 <= dinode_bytes.len() {
+                        LittleEndian::write_u32(&mut dinode_bytes[parent_off..parent_off + 4], new_parent);
+                    }
+                })?;
+                self.mark_page_dirty(child_ino, child_data.page_block)?;
+
+                // Decrement old parent's link count.
+                let old_parent_data = crate::inode::Inode::read(self, old_parent)?;
+                self.update_inode_page(old_parent, old_parent_data.page_block, old_parent_data.page_offset, |dinode_bytes| {
+                    let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+                    LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink.saturating_sub(1));
+                })?;
+                self.mark_page_dirty(old_parent, old_parent_data.page_block)?;
+
+                // Increment new parent's link count.
+                let new_parent_data = crate::inode::Inode::read(self, new_parent)?;
+                self.update_inode_page(new_parent, new_parent_data.page_block, new_parent_data.page_offset, |dinode_bytes| {
+                    let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+                    LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
+                })?;
+                self.mark_page_dirty(new_parent, new_parent_data.page_block)?;
+            }
+        } else {
+            // Same directory rename — modify a single dtree atomically.
+            let new_num_entries = {
+                let parent = crate::inode::Inode::read(self, old_parent)?;
+                let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+                // Validate destination: if it exists, check type compatibility.
+                if let Some(dest_entry) = dtree.lookup(&new_name_u16)? {
+                    let dest = crate::inode::Inode::read(self, dest_entry.inumber)?;
+                    if dest.is_dir() && !child_is_dir {
+                        self.abort_transaction();
+                        return Err(StorageError::Other(
+                            "cannot rename file over directory".to_string(),
+                        ));
+                    }
+                    if child_is_dir && !dest.is_dir() {
+                        self.abort_transaction();
+                        return Err(StorageError::Other(
+                            "cannot rename directory over file".to_string(),
+                        ));
+                    }
+                    if child_is_dir && dest.is_dir() {
+                        let dest_entries = crate::btree::dtree::Dtree::from_inode_data(dest.dtroot_bytes())?
+                            .entries()?;
+                        if !dest_entries.is_empty() {
+                            self.abort_transaction();
+                            return Err(StorageError::Other(
+                                "destination directory not empty".to_string(),
+                            ));
+                        }
+                    }
+                }
+                dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+            };
+
+            // Remove old entry and insert new entry in a single dtree modification.
+            let parent = crate::inode::Inode::read(self, old_parent)?;
+            let mut dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+
+            // Remove old name if it differs from new name.
+            if old_name_u16 != new_name_u16 {
+                dtree.remove(&old_name_u16)?;
+            }
+
+            // Remove destination entry if it exists (overwrite semantics).
+            dtree.remove(&new_name_u16)?;
+
+            // Insert new name with the child inode.
+            dtree.insert(&new_name_u16, child_ino, new_num_entries)?;
+
+            // Write updated dtroot back to the parent's page.
+            let dt_bytes = dtree.to_bytes().to_vec();
+            self.update_inode_page(old_parent, parent.page_block, parent.page_offset, |dinode_bytes| {
+                let dt_off = crate::types::Dinode::size() - dt_bytes.len();
+                dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
+            })?;
+            self.mark_page_dirty(old_parent, parent.page_block)?;
+        }
+
+        // Commit.
+        self.commit_transaction()?;
+
+        Ok(true)
+    }
+
     /// Remove a directory entry by name from the directory at `parent_ino`.
     /// Returns the child inode number if found. Does NOT commit.
     #[cfg(feature = "writable")]
@@ -1128,14 +1327,15 @@ impl Volume {
 
         if removed.is_some() {
             let dt_bytes = dtree.to_bytes().to_vec();
+            let dt_off = crate::types::Dinode::size() - dt_bytes.len();
             self.update_inode_page(parent_ino, inode.page_block, inode.page_offset, |dinode_bytes| {
-                let dt_off = crate::types::Dinode::size() - dt_bytes.len();
                 dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
             })?;
         }
 
         Ok(removed)
     }
+
 
     /// Create a regular file in a directory.
     ///

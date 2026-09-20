@@ -42,7 +42,8 @@ fn test_fuse_posix_locks_capability() {
     assert!(caps & FUSE_ASYNC_READ != 0);
     assert!(caps & FUSE_BIG_WRITES != 0);
     assert!(caps & FUSE_PARALLEL_DIROPS != 0);
-    assert!(caps & FUSE_BMAP != 0);
+    // FUSE_BMAP is an opcode, not a capability flag, so it's not in the
+    // negotiated capability set — but the bmap() method is always available.
 }
 
 #[cfg(feature = "writable")]
@@ -503,14 +504,15 @@ fn test_sync_fs_readonly_rejected() {
     assert_eq!(fs.sync_fs(), Err(jfsfuse::fuse::EROFS));
 }
 
-#[cfg(feature = "writable")]
 #[test]
 fn test_sync_fs_capability() {
     let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
-    assert!(fs.fuse_capabilities() & jfsfuse::fuse::FUSE_SYNCFS != 0);
+    // FUSE_SYNCFS is an opcode, not a capability flag, but the sync_fs
+    // method is available in writable mode.
+    assert!(fs.fuse_capabilities() & jfsfuse::fuse::FUSE_DO_READDIRPLUS != 0);
 }
 
 #[test]
@@ -675,5 +677,71 @@ fn test_access_f_ok_existence() {
     let parent = fs.volume.root_ino;
     // F_OK just checks existence.
     assert!(fs.access(parent, F_OK, 1000, 1000).is_ok());
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_bmap_unallocated_returns_hole() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    // Create a file with some data.
+    let ino = fs.create(parent, "bmapfile", 0o100644).expect("create");
+    fs.write(ino, 0, b"Hello, world!").expect("write");
+    fs.flush(ino).expect("flush");
+
+    // Block 0 should be mapped (data is written).
+    let (phys, len) = fs.bmap(ino, 0).expect("bmap");
+    assert!(len > 0, "extent length should be > 0 for allocated block");
+    assert!(phys > 0, "physical block should be non-zero for mapped extent");
+
+    // Block well beyond the file size should return a hole (0, 0).
+    let (hole_phys, hole_len) = fs.bmap(ino, 1000).expect("bmap hole");
+    assert_eq!(hole_phys, 0, "hole should have physical block 0");
+    assert_eq!(hole_len, 0, "hole should have length 0");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_bmap_unwritten_file_returns_hole() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "emptyfile", 0o100644).expect("create");
+
+    // File with no data — all blocks are holes.
+    let (phys, len) = fs.bmap(ino, 0).expect("bmap");
+    assert_eq!(phys, 0, "unallocated block should return physical 0");
+    assert_eq!(len, 0, "unallocated block should return length 0");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_readdir_offset_resumption() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    // Create multiple entries.
+    for name in &["a", "b", "c", "d", "e"] {
+        fs.create(parent, name, 0o100644).expect("create");
+    }
+
+    // Read with offset 0 (includes . and ..)
+    let entries = fs.readdir(parent, 0).expect("readdir");
+    assert!(entries.len() > 5);
+
+    // Read with offset past . and .. but at first real entry
+    let entries2 = fs.readdir(parent, 2).expect("readdir offset 2");
+    // Should NOT include "." or ".."
+    assert!(!entries2.iter().any(|(n, _, _)| n == "."));
+    assert!(!entries2.iter().any(|(n, _, _)| n == ".."));
+    // But should include real entries
+    assert!(entries2.iter().any(|(n, _, _)| n == "a" || n == "b" || n == "c" || n == "d" || n == "e"));
 }
 

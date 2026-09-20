@@ -284,15 +284,93 @@ fn test_setattr_rejected_in_readonly_mode() {
 
 #[cfg(feature = "writable")]
 #[test]
-fn test_rename_returns_eopnotsupp() {
+fn test_rename_file_in_same_directory() {
     let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
+
+    // Create a file named "foo".
+    let ino = fs.create(parent, "foo", 0o100644).expect("create should succeed");
+
+    // Rename "foo" to "bar" in the same directory.
+    let result = fs.rename(parent, "foo", parent, "bar");
+    assert!(result.is_ok());
+
+    // "foo" should no longer exist.
+    assert_eq!(fs.lookup(parent, "foo"), None);
+    // "bar" should exist with the same inode.
+    assert_eq!(fs.lookup(parent, "bar"), Some(ino));
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_to_existing_overwrites_file() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    let ino_a = fs.create(parent, "a", 0o100644).expect("create should succeed");
+    let _ino_b = fs.create(parent, "b", 0o100644).expect("create should succeed");
+
+    // Rename "a" to "b", overwriting "b".
+    let result = fs.rename(parent, "a", parent, "b");
+    assert!(result.is_ok());
+
+    // "a" should no longer exist.
+    assert_eq!(fs.lookup(parent, "a"), None);
+    // "b" should now point to ino_a (the renamed file).
+    assert_eq!(fs.lookup(parent, "b"), Some(ino_a));
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_nonexistent_source_fails() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    let result = fs.rename(parent, "nonexistent", parent, "newname");
+    assert!(result.is_err());
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_rejects_readonly() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+
+    let parent = fs.volume.root_ino;
     let result = fs.rename(parent, "a", parent, "b");
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), 95); // EOPNOTSUPP
+    assert_eq!(result.unwrap_err(), EROFS);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_directory_same_parent() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Create a directory named "mydir".
+    let ino = fs.mkdir(parent, "mydir", 0o040755).expect("mkdir should succeed");
+
+    // Rename "mydir" to "yourdir" in the same directory.
+    let result = fs.rename(parent, "mydir", parent, "yourdir");
+    assert!(result.is_ok());
+
+    // "mydir" should no longer exist.
+    assert_eq!(fs.lookup(parent, "mydir"), None);
+    // "yourdir" should exist with the same inode.
+    assert_eq!(fs.lookup(parent, "yourdir"), Some(ino));
 }
 
 #[cfg(feature = "writable")]

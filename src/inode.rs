@@ -29,10 +29,19 @@ impl Inode {
     /// Read an inode by number from the filesystem.
     ///
     /// Maps the inode number to its location on disk via the IAG/imap,
-    /// then reads the dinode structure.
+    /// then reads the dinode structure. Checks the page cache first so
+    /// that reads within a transaction observe in-flight modifications.
     pub fn read(volume: &mut crate::volume::Volume, ino: u32) -> StorageResult<Self> {
         let (block, offset) = Self::find_inode_page(volume, ino)?;
-        let data = volume.read_page(block)?;
+
+        // Check the page cache first for transactional consistency: if an
+        // earlier update_inode_page within the same transaction modified
+        // this inode's block, we must see the modified version, not stale
+        // data from backing storage.
+        let data = match volume.page_cache.peek(ino, block) {
+            Some(page) => page.data,
+            None => volume.read_page(block)?,
+        };
 
         let mut dinode = Dinode::default();
         let dinode_bytes = &data[offset..offset + std::mem::size_of::<Dinode>()];
@@ -78,7 +87,10 @@ impl Inode {
             if block_num >= volume.agg_size {
                 continue;
             }
-            let data = volume.read_page(block_num)?;
+            let data = match volume.page_cache.peek_block(block_num) {
+                Some(page) => page.data,
+                None => volume.read_page(block_num)?,
+            };
 
             for i in 0..INOSPERPAGE {
                 let off = (i as usize) * DISIZE;

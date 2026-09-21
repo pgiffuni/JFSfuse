@@ -572,6 +572,30 @@ impl PageCache {
         self.cache.get(&(inode, block)).cloned()
     }
 
+    /// Peek at a cached page without LRU promotion. Returns a clone if present.
+    ///
+    /// Unlike `get`, this does not mutate the LRU order, so it can be called
+    /// from `&self` contexts (e.g. `Inode::read` / `find_inode_page` which
+    /// may only have `&self` or `&mut` access). This ensures that reads within
+    /// a transaction observe PageCache modifications made by earlier
+    /// `update_inode_page` calls, rather than stale data from backing storage.
+    pub fn peek(&self, inode: u32, block: BlockNo) -> Option<CachedPage> {
+        self.cache.peek(&(inode, block)).cloned()
+    }
+
+    /// Peek at any cached page for a given physical block (regardless of
+    /// which inode key was used). Returns a clone if present.
+    ///
+    /// This is used by `find_inode_page` to scan the inode table: the block
+    /// may be cached under a different inode number (e.g. a previously-seen
+    /// inode in the same table block), so we search by block number alone.
+    pub fn peek_block(&self, block: BlockNo) -> Option<CachedPage> {
+        self.cache
+            .iter()
+            .find(|((_, b), _)| *b == block)
+            .map(|(_, p)| p.clone())
+    }
+
     /// Get a page, fetching from storage if not cached. Returns a clone.
     ///
     /// If another inode's page for the **same** physical block is already

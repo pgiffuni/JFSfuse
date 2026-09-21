@@ -930,3 +930,98 @@ fn test_access_directory_search_permission() {
     // Another user without search permission.
     assert_eq!(fs.access(ino, X_OK, 2000, 2000), Err(EACCES));
 }
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_cross_directory_with_overwrite() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let root = fs.volume.root_ino;
+
+    // Create two subdirectories.
+    let dir1 = fs.mkdir(root, "dir1", 0o040755).expect("mkdir dir1");
+    let dir2 = fs.mkdir(root, "dir2", 0o040755).expect("mkdir dir2");
+
+    // Create "source" in dir1 with data.
+    let src_ino = fs.create(dir1, "source", 0o100644).expect("create source");
+    fs.write(src_ino, 0, b"moved data").expect("write source");
+
+    // Create "target" in dir2 (will be overwritten by rename).
+    let tgt_ino = fs.create(dir2, "target", 0o100644).expect("create target");
+    fs.write(tgt_ino, 0, b"old data").expect("write target");
+
+    // Cross-directory rename: dir1/source -> dir2/target (overwrite).
+    let result = fs.rename(dir1, "source", dir2, "target");
+    assert!(result.is_ok(), "cross-dir rename should succeed: {:?}", result.err());
+
+    // "source" should be gone from dir1.
+    assert_eq!(fs.lookup(dir1, "source"), None);
+
+    // "target" in dir2 should now point to src_ino (the renamed file).
+    assert_eq!(fs.lookup(dir2, "target"), Some(src_ino));
+
+    // src_ino should have its original data (not the target's data).
+    let data = fs.read(src_ino, 0, 100).expect("read renamed file");
+    assert_eq!(&data[..], b"moved data", "renamed file should retain source data");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_cross_directory_simple_move() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let root = fs.volume.root_ino;
+
+    let dir1 = fs.mkdir(root, "cd_a", 0o040755).expect("mkdir dir1");
+    let dir2 = fs.mkdir(root, "cd_b", 0o040755).expect("mkdir dir2");
+
+    let src_ino = fs.create(dir1, "file", 0o100644).expect("create file");
+    let data = b"cross dir move data";
+    fs.write(src_ino, 0, data).expect("write file");
+
+    // Move from dir1 to dir2 (no existing target).
+    let result = fs.rename(dir1, "file", dir2, "moved");
+    assert!(result.is_ok(), "cross-dir rename should succeed: {:?}", result.err());
+
+    // Source name gone from dir1.
+    assert_eq!(fs.lookup(dir1, "file"), None);
+    // Dest name present in dir2 with same inode.
+    assert_eq!(fs.lookup(dir2, "moved"), Some(src_ino));
+
+    // Data preserved.
+    let read_back = fs.read(src_ino, 0, data.len()).expect("read after rename");
+    assert_eq!(&read_back[..], data, "data should be preserved after cross-dir rename");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_rename_cross_directory_directory() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let root = fs.volume.root_ino;
+
+    let dir1 = fs.mkdir(root, "xr1", 0o040755).expect("mkdir dir1");
+    let dir2 = fs.mkdir(root, "xr2", 0o040755).expect("mkdir dir2");
+
+    // Create a subdirectory in dir1 with a file inside.
+    let subdir = fs.mkdir(dir1, "subdir", 0o040755).expect("mkdir subdir");
+    let _ = fs.create(subdir, "inner", 0o100644).expect("create inner file");
+
+    // Rename the subdirectory across directories.
+    let result = fs.rename(dir1, "subdir", dir2, "subdir2");
+    assert!(result.is_ok(), "cross-dir dir rename should succeed: {:?}", result.err());
+
+    // Should be gone from dir1.
+    assert_eq!(fs.lookup(dir1, "subdir"), None);
+    // Should be present in dir2.
+    assert_eq!(fs.lookup(dir2, "subdir2"), Some(subdir));
+
+    // Inner file should still exist.
+    assert!(fs.lookup(subdir, "inner").is_some(), "inner file should survive dir move");
+}

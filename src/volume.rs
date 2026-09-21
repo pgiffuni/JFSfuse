@@ -1097,7 +1097,10 @@ impl Volume {
             if block_num >= self.agg_size {
                 continue;
             }
-            let data = self.storage.read_block(block_num)?;
+            let data = match self.page_cache.peek_block(block_num) {
+                Some(page) => page.data,
+                None => self.storage.read_block(block_num)?,
+            };
              for i in 0..crate::types::INOSPERPAGE {
                 let off = (i as usize) * crate::types::DISIZE;
                 if off + crate::types::DISIZE > data.len() {

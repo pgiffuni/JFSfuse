@@ -24,8 +24,8 @@ use crate::transaction::{CommitResult, TransactionId, TransactionManager};
 #[cfg(feature = "writable")]
 use crate::alloc::dmap::BlockAllocMap;
 use crate::types::{
-    self, AGGREGATE_I, BMAP_I, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JFS_MAGIC, JfsSuperblock, LOG_I,
-    LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_B, SUPER1_OFF,
+    self, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JfsSuperblock,
+    LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_OFF,
 };
 
 /// A mounted JFS volume.
@@ -801,12 +801,20 @@ impl Volume {
     /// Transfers extent references directly from the source file's xtree to
     /// the destination file's xtree, avoiding a round-trip through read →
     /// write. The physical blocks are *reowned* by the destination — no data
-    /// copy, no block allocation, and no block freeing occurs.
+    /// copy, no block allocation, and no block freeing occurs (unless the
+    /// destination already had data in the target range, in which case those
+    /// blocks are freed before the new extents are inserted).
     ///
-    /// Returns `Some(n)` if the optimized path handled the copy, or `None`
-    /// if the request could not be served via extent transfer (e.g. the
-    /// source has no allocated blocks in the range — sparse region) and the
-    /// caller should fall back to the read → write path.
+    /// Only handles block-aligned offsets and length: if `src_offset`,
+    /// `dst_offset`, or `len` are not multiples of `BLOCK_SIZE`, returns
+    /// `Ok(None)` so the caller falls back to the read → write path, which
+    /// handles partial blocks correctly.
+    ///
+    /// Returns `Some(n)` if the optimized path handled the copy (n = the
+    /// full `len` for block-aligned ranges), or `None` if the request could
+    /// not be served via extent transfer (e.g. sparse source region, non-
+    /// block-aligned offsets, or xtroot full) and the caller should fall back
+    /// to the read → write path.
     #[cfg(feature = "writable")]
     pub fn copy_file_range_extent(
         &mut self,
@@ -818,10 +826,16 @@ impl Volume {
     ) -> StorageResult<Option<usize>> {
         let bs = BLOCK_SIZE as u64;
 
+        // Only block-aligned copies can use the extent-stealing path.
+        // Non-aligned offsets would copy the wrong bytes (entire blocks
+        // including prefix/suffix data that is not part of the range).
+        if src_offset % bs != 0 || dst_offset % bs != 0 || (len as u64) % bs != 0 || len == 0 {
+            return Ok(None);
+        }
+
         let src_fsb_start = src_offset / bs;
-        let src_fsb_end = (src_offset + len as u64 + bs - 1) / bs;
+        let src_fsb_end = src_fsb_start + (len as u64) / bs;
         let dst_fsb_start = dst_offset / bs;
-        let dst_fsb_end = (dst_offset + len as u64 + bs - 1) / bs;
 
         self.begin_transaction()?;
 
@@ -851,6 +865,20 @@ impl Volume {
         let dst_inode = crate::inode::Inode::read(self, dst_ino)?;
         let mut dst_xtree = crate::btree::xtree::Xtree::from_inode_data(dst_inode.xtroot_bytes())?;
 
+        // Free any destination extents that overlap the target range,
+        // otherwise their physical blocks would be leaked (orphaned).
+        let dst_fsb_end = dst_fsb_start + (len as u64) / bs;
+        let freed_blocks = dst_xtree.punch_extents(dst_fsb_start as i64, dst_fsb_end as i64);
+        if let Some(bmap) = self.bmap.as_mut() {
+            for (addr, block_count) in &freed_blocks {
+                let mut pxd = crate::types::Pxd::default();
+                pxd.set_length(*block_count);
+                pxd.set_address(*addr);
+                let _ = bmap.free_extent(&pxd);
+            }
+        }
+
+        // Insert the stolen extents into the destination.
         for &(src_logical, length, physical_addr) in &taken {
             let dst_logical = dst_fsb_start as i64 + (src_logical - src_fsb_start as i64);
             if !dst_xtree.insert_taken_extent(dst_logical, length, physical_addr) {

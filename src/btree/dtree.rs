@@ -11,8 +11,8 @@
 
 use byteorder::{ByteOrder, LittleEndian};
 
-use crate::storage::{BLOCK_SIZE, Result as StorageResult};
-use crate::types::{DTENTRYSTART, DTROOTMAXSLOT, DTSLOTSIZE, DtSlot, LdtEntry};
+use crate::storage::Result as StorageResult;
+use crate::types::{DTENTRYSTART, DTROOTMAXSLOT, DTSLOTSIZE, LdtEntry};
 
 /// A directory entry found via dtree lookup.
 #[derive(Debug, Clone)]

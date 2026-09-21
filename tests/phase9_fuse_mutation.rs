@@ -513,6 +513,253 @@ fn test_copy_file_range_same_file() {
 
 #[cfg(feature = "writable")]
 #[test]
+fn test_copy_file_range_large_copy() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Create a file with larger-than-64KB data.
+    let src_ino = fs.create(parent, "bigsrc", 0o100644).expect("create src");
+    let large_data: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+    let written = fs.write(src_ino, 0, &large_data).expect("write src");
+    assert_eq!(written, large_data.len());
+    fs.flush(src_ino).expect("flush src");
+
+    // Create destination file.
+    let dst_ino = fs.create(parent, "bigdst", 0o100644).expect("create dst");
+
+    // Copy the full 200KB — should use internal looping, not just one 64KB chunk.
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(
+        src_ino, 0, dst_ino, 0, large_data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+    );
+    assert!(copied.is_ok(), "copy_file_range should succeed: {:?}", copied.err());
+    assert_eq!(
+        copied.unwrap(),
+        large_data.len(),
+        "should copy all bytes (not just one 64KB chunk)"
+    );
+
+    // Verify destination content matches.
+    let read_back = fs.read(dst_ino, 0, large_data.len()).expect("should read dst");
+    assert_eq!(&read_back[..], &large_data[..], "destination content should match source");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_move_overwrites_destination() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Source file with data.
+    let src_ino = fs.create(parent, "src", 0o100644).expect("create src");
+    let src_data = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    fs.write(src_ino, 0, src_data).expect("write src");
+    fs.flush(src_ino).expect("flush src");
+
+    // Destination file with different data — will be overwritten.
+    let dst_ino = fs.create(parent, "dst", 0o100644).expect("create dst");
+    let dst_data = b"XXXXXXXXXXXXXXXXXXXXX";
+    fs.write(dst_ino, 0, dst_data).expect("write dst");
+    fs.flush(dst_ino).expect("flush dst");
+
+    // MOVE data from src to dst (overwriting dst content).
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(
+        src_ino, 0, dst_ino, 0, src_data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+    );
+    assert!(copied.is_ok(), "copy_file_range MOVE should succeed: {:?}", copied.err());
+    assert_eq!(copied.unwrap(), src_data.len());
+
+    // Destination should now contain source data.
+    let read_dst = fs.read(dst_ino, 0, src_data.len()).expect("read dst");
+    assert_eq!(&read_dst[..], src_data, "destination should contain source data after MOVE");
+
+    // Source should have holes (data was moved, not copied).
+    let read_src = fs.read(src_ino, 0, src_data.len()).expect("read src after MOVE");
+    assert!(
+        read_src.iter().all(|&b| b == 0),
+        "source should be zeroed after MOVE, got: {:?}",
+        read_src
+    );
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_move_preserves_source_size() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Source file with data.
+    let src_ino = fs.create(parent, "srcsize", 0o100644).expect("create src");
+    let data = b"Some test data for size preservation";
+    fs.write(src_ino, 0, data).expect("write src");
+    fs.flush(src_ino).expect("flush src");
+
+    let src_attr_before = fs.getattr(src_ino).expect("getattr src");
+    let src_size_before = u64::from_le_bytes(src_attr_before.di_size);
+
+    // Destination.
+    let dst_ino = fs.create(parent, "dstsize", 0o100644).expect("create dst");
+
+    // MOVE — should preserve source file size (data moved, not deleted).
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(
+        src_ino, 0, dst_ino, 0, data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+    );
+    assert!(copied.is_ok(), "MOVE should succeed: {:?}", copied.err());
+
+    // Source size should be unchanged (MOVE keeps file size).
+    let src_attr_after = fs.getattr(src_ino).expect("getattr src after");
+    let src_size_after = u64::from_le_bytes(src_attr_after.di_size);
+    assert_eq!(
+        src_size_after, src_size_before,
+        "source file size should be preserved after MOVE"
+    );
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_block_aligned_move() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Write a full block of data (4096 bytes, block-aligned).
+    let src_ino = fs.create(parent, "alignsrc", 0o100644).expect("create src");
+    let block_data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+    fs.write(src_ino, 0, &block_data).expect("write src");
+    fs.flush(src_ino).expect("flush src");
+
+    let dst_ino = fs.create(parent, "aligndst", 0o100644).expect("create dst");
+
+    // Block-aligned MOVE — should use the optimized extent-stealing path.
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(
+        src_ino, 0, dst_ino, 0, 4096, FUSE_COPY_FILE_RANGE_MOVE,
+    );
+    assert!(copied.is_ok(), "aligned MOVE should succeed: {:?}", copied.err());
+    assert_eq!(copied.unwrap(), 4096);
+
+    // Verify destination data matches.
+    let read_dst = fs.read(dst_ino, 0, 4096).expect("read dst");
+    assert_eq!(&read_dst[..], &block_data[..], "destination data should match");
+
+    // Source should have holes.
+    let read_src = fs.read(src_ino, 0, 4096).expect("read src after MOVE");
+    assert!(
+        read_src.iter().all(|&b| b == 0),
+        "source should be zeroed after aligned MOVE"
+    );
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_non_move_does_not_punch_source() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    let src_ino = fs.create(parent, "srcnm", 0o100644).expect("create src");
+    let data = b"Non-move copy data";
+    fs.write(src_ino, 0, data).expect("write src");
+    fs.flush(src_ino).expect("flush src");
+
+    let dst_ino = fs.create(parent, "dstnm", 0o100644).expect("create dst");
+
+    // Non-MOVE copy (flags=0) — source data should be preserved.
+    let copied = fs.copy_file_range(src_ino, 0, dst_ino, 0, data.len(), 0);
+    assert!(copied.is_ok());
+    assert_eq!(copied.unwrap(), data.len());
+
+    // Destination should contain the data.
+    let read_dst = fs.read(dst_ino, 0, data.len()).expect("read dst");
+    assert_eq!(&read_dst[..], data, "destination should contain source data");
+
+    // Source should still have its original data (copy, not move).
+    let read_src = fs.read(src_ino, 0, data.len()).expect("read src");
+    assert_eq!(&read_src[..], data, "source should retain data after copy");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_partial_offset_copy() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Create source with data at known positions.
+    let src_ino = fs.create(parent, "partsrc", 0o100644).expect("create src");
+    let data = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    fs.write(src_ino, 0, data).expect("write src");
+    fs.flush(src_ino).expect("flush src");
+
+    let dst_ino = fs.create(parent, "partdst", 0o100644).expect("create dst");
+
+    // Copy from offset 5, length 10 (non-block-aligned) — should fall back
+    // to read/write path and copy exactly the right bytes.
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(
+        src_ino, 5, dst_ino, 0, 10, FUSE_COPY_FILE_RANGE_MOVE,
+    );
+    assert!(copied.is_ok(), "copy should succeed: {:?}", copied.err());
+    assert_eq!(copied.unwrap(), 10);
+
+    // Destination should contain bytes 5..15 from source.
+    let read_dst = fs.read(dst_ino, 0, 10).expect("read dst");
+    assert_eq!(&read_dst[..], &data[5..15], "destination should contain partial source data");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_copy_file_range_move_destination_extends_size() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Small source file.
+    let src_ino = fs.create(parent, "srcsmall", 0o100644).expect("create src");
+    let data = b"small";
+    fs.write(src_ino, 0, data).expect("write src");
+    fs.flush(src_ino).expect("flush src");
+
+    // Empty destination.
+    let dst_ino = fs.create(parent, "dstdst", 0o100644).expect("create dst");
+
+    // MOVE to destination at a non-zero offset — extends destination size.
+    const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
+    let copied = fs.copy_file_range(src_ino, 0, dst_ino, 100, data.len(), FUSE_COPY_FILE_RANGE_MOVE);
+    assert!(copied.is_ok(), "MOVE should succeed: {:?}", copied.err());
+    assert_eq!(copied.unwrap(), data.len());
+
+    // Destination size should reflect the offset + data length.
+    let dst_attr = fs.getattr(dst_ino).expect("getattr dst");
+    let dst_size = u64::from_le_bytes(dst_attr.di_size);
+    assert_eq!(dst_size, 100 + data.len() as u64, "destination size should be 100 + data len");
+
+    // Data at offset 100 should match source.
+    let read_dst = fs.read(dst_ino, 100, data.len()).expect("read dst at offset");
+    assert_eq!(&read_dst[..], data, "destination data at offset should match");
+}
+
+#[cfg(feature = "writable")]
+#[test]
 fn test_mknod_creates_fifo() {
     let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);

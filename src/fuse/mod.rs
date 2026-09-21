@@ -977,13 +977,21 @@ impl FuseFs {
     ///
     /// **Optimized MOVE path:** When `FUSE_COPY_FILE_RANGE_MOVE` is set and
     /// both inodes share the same on-disk block (e.g. they reside in the same
-    /// inode table page), the method first attempts an extent-reference
-    /// transfer: it "steals" extents from the source xtree and inserts them
-    /// into the destination xtree, avoiding an actual data copy.
+    /// FUSE_COPY_FILE_RANGE — copy data between files.
     ///
-    /// If the optimized path cannot apply (e.g. sparse source region, or
-    /// non-MOVE semantics), it falls back to a read → write cycle. For MOVE,
-    /// the source range is punched (freed) after a successful copy.
+    /// When the `FUSE_COPY_FILE_RANGE_MOVE` flag is set and the source and
+    /// destination are different files, this method first attempts an
+    /// extent-reference transfer: it "steals" extents from the source xtree
+    /// and inserts them into the destination xtree, avoiding an actual data
+    /// copy (write-in-place semantics).
+    ///
+    /// For non-MOVE copies or when the optimized path cannot apply (sparse
+    /// source region, non-block-aligned offsets, xtroot full), it falls back
+    /// to a read → write cycle. For MOVE, the source range is punched (freed)
+    /// after a successful copy.
+    ///
+    /// The full requested `len` bytes are copied via internal looping; a
+    /// single return value always reflects the total bytes transferred.
     #[cfg(feature = "writable")]
     pub fn copy_file_range(
         &mut self,
@@ -998,6 +1006,7 @@ impl FuseFs {
         const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
         const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
         const FALLOC_FL_PUNCH_KEEP: u32 = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+        const CHUNK_SIZE: usize = 65536;
 
         if !self.writable {
             return Err(EROFS);
@@ -1007,38 +1016,59 @@ impl FuseFs {
             return Err(EINVAL);
         }
 
-        let to_copy = std::cmp::min(len, 65536);
         let is_move = flags & FUSE_COPY_FILE_RANGE_MOVE != 0;
+        let mut total_copied = 0usize;
+        let mut cur_src = src_offset;
+        let mut cur_dst = dst_offset;
 
-        // Try the optimized extent-reference transfer for MOVE.
-        if is_move && src_ino != dst_ino {
-            if let Ok(Some(n)) = self
-                .volume
-                .copy_file_range_extent(src_ino, src_offset, dst_ino, dst_offset, to_copy)
-            {
-                return Ok(n);
+        while total_copied < len {
+            let remaining = len - total_copied;
+            let chunk = std::cmp::min(remaining, CHUNK_SIZE);
+
+            let copied = if is_move && src_ino != dst_ino {
+                match self
+                    .volume
+                    .copy_file_range_extent(src_ino, cur_src, dst_ino, cur_dst, chunk)
+                {
+                    Ok(Some(n)) => n,
+                    _ => {
+                        // Optimized path not applicable or failed —
+                        // fall through to read → write.
+                        let data = self.read(src_ino, cur_src, chunk).ok_or(EIO)?;
+                        let written = self.write(dst_ino, cur_dst, &data).unwrap_or(0);
+
+                        if written > 0 && is_move {
+                            let _ = self.volume.fallocate(
+                                src_ino,
+                                cur_src,
+                                written as u64,
+                                FALLOC_FL_PUNCH_KEEP,
+                            );
+                        }
+
+                        written
+                    }
+                }
+            } else {
+                let data = self.read(src_ino, cur_src, chunk).ok_or(EIO)?;
+                let written = self.write(dst_ino, cur_dst, &data).unwrap_or(0);
+                written
+            };
+
+            if copied == 0 {
+                break;
             }
-            // Optimized path not applicable — fall through to read → write.
+
+            total_copied += copied;
+            cur_src += copied as u64;
+            cur_dst += copied as u64;
         }
 
-        // Fallback: read → write.
-        let data = self.read(src_ino, src_offset, to_copy).ok_or(EIO)?;
-        let written = self.write(dst_ino, dst_offset, &data).unwrap_or(0);
-
-        if written > 0 && is_move {
-            let _ = self.volume.fallocate(
-                src_ino,
-                src_offset,
-                written as u64,
-                FALLOC_FL_PUNCH_KEEP,
-            );
-        }
-
-        if written == 0 {
+        if total_copied == 0 {
             return Err(EIO);
         }
 
-        Ok(written)
+        Ok(total_copied)
     }
 
     /// Remove a file (write-supported, gated behind `writable`).

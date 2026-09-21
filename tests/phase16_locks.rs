@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Phase 16: POSIX advisory byte-range lock tests.
 //!
-//! Tests `FUSE_GETLK`, `FUSE_SETLK`, and `FUSE_SETLKW` (via `getlk`,
-//! `setlk`, `setlkw`) on a generated JFS image loaded into MemoryStorage.
+//! Tests `FuseFs::setlk`, `setlkw`, `getlk` and `flock` methods on a generated
+//! JFS image loaded into MemoryStorage.
+//!
+//! Note: fuse3 0.7's `Filesystem` trait does not include `setlk`/`getlk`/`flock`
+//! methods (they require the `file-lock` feature which is not enabled). These
+//! tests exercise the `FuseFs` internal lock API directly, which is used by the
+//! FUSE adapter when those features become available.
 //!
 //! Runs only with `cargo test --features writable`.
 
 use std::sync::Arc;
 
 use jfsfuse::fuse::{
-    EACCES, EAGAIN, EINTR, EINVAL, ENOENT, EROFS, FuseFs, F_RDLCK, F_UNLCK, F_WRLCK, FUSE_BMAP,
-    FUSE_BIG_WRITES, FUSE_FLOCK_LOCKS, FUSE_ASYNC_READ, FUSE_PARALLEL_DIROPS, FUSE_POSIX_LOCKS,
-    InterruptManager, InterruptToken, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, SEEK_SET,     F_OK, R_OK, Statfs, W_OK, X_OK,
+    EACCES, EAGAIN, EINTR, EINVAL, ENOENT, EROFS, EOPNOTSUPP, FuseFs, F_RDLCK, F_UNLCK, F_WRLCK,
+    FUSE_BIG_WRITES, FUSE_ASYNC_READ, FUSE_DO_READDIRPLUS, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO,
+    InterruptManager, InterruptToken, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, SEEK_SET,
+    F_OK, R_OK, Statfs, W_OK, X_OK,
 };
 use jfsfuse::mkfs;
 use jfsfuse::storage::Storage;
@@ -33,17 +39,18 @@ fn make_flock(l_type: i16, offset: i64, length: i64) -> jfsfuse::fuse::Flock {
 
 #[cfg(feature = "writable")]
 #[test]
-fn test_fuse_posix_locks_capability() {
+fn test_fuse_capabilities_conservative() {
     let vol = load_image_to_memory();
     let fs = FuseFs::new(vol);
     let caps = fs.fuse_capabilities();
-    assert!(caps & FUSE_POSIX_LOCKS != 0);
-    assert!(caps & FUSE_FLOCK_LOCKS != 0);
+    // POSIX locks and flock are NOT advertised because fuse3 0.7's
+    // Filesystem trait doesn't include those methods (file-lock feature off).
+    assert!(caps & FUSE_DO_READDIRPLUS != 0);
+    assert!(caps & FUSE_READDIRPLUS_AUTO != 0);
     assert!(caps & FUSE_ASYNC_READ != 0);
     assert!(caps & FUSE_BIG_WRITES != 0);
     assert!(caps & FUSE_PARALLEL_DIROPS != 0);
-    // FUSE_BMAP is an opcode, not a capability flag, so it's not in the
-    // negotiated capability set — but the bmap() method is always available.
+    // BMAP is an opcode, not a capability flag.
 }
 
 #[cfg(feature = "writable")]
@@ -534,6 +541,36 @@ fn test_readdirplus_returns_attrs() {
     let dot_entry = &entries[0];
     assert_eq!(dot_entry.0, ".", "first entry should be .");
     assert_eq!(dot_entry.1, parent, "dot should reference parent");
+}
+
+#[test]
+fn test_readdirplus_lookup_reference_accounting() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "liforef", 0o100644).expect("create");
+
+    // After create, lookup_count = 1.
+    assert_eq!(fs.lookup_count(ino), 1);
+
+    // READDIRPLUS returns child entries AND increments their lookup references.
+    // After readdirplus, the child's lookup_count should be higher.
+    let entries = fs.readdirplus(parent, 0).expect("readdirplus");
+    // The child should have been accounted for in readdirplus.
+    let plus_count = fs.lookup_count(ino);
+    assert!(plus_count >= 2,
+        "readdirplus should increment lookup reference (was {})", plus_count);
+
+    // FORGET should decrement by 1 (readdirplus added 1 ref).
+    fs.forget(ino, 1);
+    assert!(fs.lookup_count(ino) >= 1, "forget after readdirplus should leave refs");
+
+    // Full forget down to 0.
+    let remaining = fs.lookup_count(ino);
+    fs.forget(ino, remaining);
+    assert_eq!(fs.lookup_count(ino), 0, "all refs should be released");
 }
 
 #[test]

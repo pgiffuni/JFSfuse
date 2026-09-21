@@ -267,19 +267,22 @@ impl FuseFs {
     /// [`abi`](self::abi) module and match the Linux FUSE ABI.
     ///
     /// ## Implemented
-    /// - [`FUSE_POSIX_LOCKS`] — POSIX fcntl-style byte-range locks (SETLK/GETLK)
-    /// - [`FUSE_FLOCK_LOCKS`] — BSD-style `flock(2)` locks
     /// - [`FUSE_ASYNC_READ`] — asynchronous read (reads may be reordered)
     /// - [`FUSE_BIG_WRITES`] — writes larger than 4 KB are accepted
     /// - [`FUSE_PARALLEL_DIROPS`] — concurrent directory operations
     /// - [`FUSE_BMAP`] (opcode) — file block to physical block mapping via Xtree
     /// - [`FUSE_DO_READDIRPLUS`] / [`FUSE_READDIRPLUS_AUTO`] — readdir with attributes
     ///
-    /// ## Partially implemented
-    /// - [`FUSE_SETLKW`] — blocking lock request is dispatched to `setlkw()`,
-    ///   but the semantics are incomplete: conflicts return `EAGAIN` instead
-    ///   of blocking. A real wait mechanism (request queueing per file) is
-    ///   needed for correct behavior. See `setlkw()` documentation.
+    /// ## Not requested (incomplete)
+    /// - [`FUSE_POSIX_LOCKS`] — `FuseFs` has `setlk`/`getlk`/`setlkw` methods, but
+    ///   the `file-lock` feature is not enabled in `fuse3`, so `GETLK`/`SETLK`/`SETLKW`
+    ///   are not dispatched at the FUSE protocol level. The in-memory lock table is
+    ///   dead code until the feature is enabled.
+    /// - [`FUSE_FLOCK_LOCKS`] — `FuseFs` has a `flock` method, but `fuse3` 0.7 does
+    ///   not expose a `flock` callback in the `Filesystem` trait. Same dead-code caveat.
+    ///
+    /// ## Partially implemented (see FuseFs documentation)
+    /// - [`FUSE_SETLKW`] semantics: conflicts return `EAGAIN` instead of blocking.
     ///
     /// ## Not requested
     /// - [`FUSE_DEFAULT_PERMISSIONS`] — access checks are performed in the
@@ -291,9 +294,7 @@ impl FuseFs {
     ///
     /// [`FUSE_INTERRUPT`]: abi::FUSE_INTERRUPT
     pub fn fuse_capabilities(&self) -> u32 {
-        FUSE_POSIX_LOCKS
-            | FUSE_FLOCK_LOCKS
-            | FUSE_ASYNC_READ
+        FUSE_ASYNC_READ
             | FUSE_BIG_WRITES
             | FUSE_PARALLEL_DIROPS
             | FUSE_DO_READDIRPLUS
@@ -556,6 +557,7 @@ impl FuseFs {
 
         // `.` entry
         if !cursor.is_entry() {
+            self.add_node_state(ino);
             if let Some(attr) = self.getattr(ino) {
                 result.push((".".to_string(), ino, 0x04, attr));
             }
@@ -565,6 +567,7 @@ impl FuseFs {
         if dtroot.len() >= 24 {
             let parent_ino = u32::from_le_bytes(dtroot[20..24].try_into().unwrap());
             if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
+                self.add_node_state(parent_ino);
                 if let Some(attr) = self.getattr(parent_ino) {
                     result.push(("..".to_string(), parent_ino, 0x04, attr));
                 }
@@ -591,6 +594,7 @@ impl FuseFs {
                         .trim_end_matches('\0')
                         .to_string();
                     let file_type = self.infer_file_type(e.inumber);
+                    self.add_node_state(e.inumber);
                     if let Some(attr) = self.getattr(e.inumber) {
                         result.push((name, e.inumber, file_type, attr));
                     }
@@ -601,6 +605,7 @@ impl FuseFs {
                         .trim_end_matches('\0')
                         .to_string();
                     let file_type = self.infer_file_type(e.inumber);
+                    self.add_node_state(e.inumber);
                     if let Some(attr) = self.getattr(e.inumber) {
                         result.push((name, e.inumber, file_type, attr));
                     }

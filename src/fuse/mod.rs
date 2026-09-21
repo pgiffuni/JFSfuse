@@ -658,6 +658,9 @@ impl FuseFs {
     /// - Else if gid matches the file's gid, use group bits
     /// - Else use other bits
     /// - CAP_DAC_OVERRIDE (root uid 0) bypasses all checks
+    /// - Symlinks: ACCESS always passes (symlink mode is 0777)
+    /// - For directories, X_OK means "search" (traverse) permission
+    /// - For regular files, X_OK means execute permission
     ///
     /// Returns `EACCES` if access is denied, `ENOENT` if inode doesn't exist.
     pub fn access(&mut self, ino: u32, mask: u32, uid: u32, gid: u32) -> FuseResult<()> {
@@ -666,6 +669,11 @@ impl FuseFs {
 
         // Root (uid 0) bypasses permission checks.
         if uid == 0 {
+            return Ok(());
+        }
+
+        // Symlinks always allow access (their mode is 0777).
+        if dinode.is_symlink() {
             return Ok(());
         }
 
@@ -686,11 +694,7 @@ impl FuseFs {
             return Err(EACCES);
         }
         if mask & X_OK != 0 && perms & 0o1 == 0 {
-            // Execute permission also requires at least one execute bit
-            // set anywhere in the mode for regular files.
-            if mode & 0o111 == 0 {
-                return Err(EACCES);
-            }
+            return Err(EACCES);
         }
 
         Ok(())

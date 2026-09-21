@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
-use jfsfuse::fuse::{EEXIST, ENOENT, ENOTEMPTY, EROFS};
+use jfsfuse::fuse::{EEXIST, ENOENT, ENOTEMPTY, EROFS, EPERM, R_OK, W_OK, X_OK, EACCES, F_OK};
 use jfsfuse::mkfs;
 use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
@@ -649,4 +649,37 @@ fn test_forget_unknown_inode_is_noop() {
     assert_eq!(fs.lookup_count(99999), 0);
     fs.batch_forget(&[(99999, 1)]);
     assert_eq!(fs.lookup_count(99999), 0);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_access_symlink_always_allows() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let _ino = fs.symlink(parent, "link", "/tmp/target").expect("symlink");
+    let link_ino = fs.lookup(parent, "link").expect("should find symlink");
+
+    // ACCESS on a symlink should always succeed (symlink mode is 0777).
+    assert!(fs.access(link_ino, R_OK | W_OK | X_OK, 1000, 1000).is_ok());
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_access_directory_search_permission() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.mkdir(parent, "dir", 0o040700).expect("mkdir");
+    fs.setattr(ino, Some(0o040700), Some(1000), Some(1000), None, None).expect("setattr");
+
+    // Owner has execute (search) permission on directory.
+    assert!(fs.access(ino, X_OK, 1000, 1000).is_ok());
+
+    // Another user without search permission.
+    assert_eq!(fs.access(ino, X_OK, 2000, 2000), Err(EACCES));
 }

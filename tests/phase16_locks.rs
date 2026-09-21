@@ -697,6 +697,23 @@ fn test_access_other_permissions() {
 }
 
 #[test]
+fn test_access_execute_denied_without_owner_execute() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "accexec", 0o100644).expect("create");
+    // Set owner to 1000:1000 and mode 0651 (owner rw, group r-x, other --x).
+    // Owner does NOT have execute, but "other" does.
+    // ACCESS for the owner (uid 1000) should return EACCES for X_OK.
+    fs.setattr(ino, Some(0o100651), Some(1000), Some(1000), None, None).expect("setattr");
+
+    // Owner: no execute bit → EACCES even though "other" has execute.
+    assert_eq!(fs.access(ino, X_OK, 1000, 1000), Err(EACCES));
+}
+
+#[test]
 fn test_access_f_ok_existence() {
     let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);

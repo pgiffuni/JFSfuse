@@ -510,3 +510,143 @@ fn test_copy_file_range_same_file() {
     assert!(result.is_err(), "should reject same-inode copy");
     assert_eq!(result.unwrap_err(), jfsfuse::fuse::EINVAL);
 }
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_mknod_creates_fifo() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // S_IFIFO | 0644 = 0x1000 | 0x1A4 = 0x11A4
+    let ino = fs.mknod(parent, "fifo", 0x11A4, 0).expect("mknod should succeed");
+
+    // The inode should exist and be a FIFO.
+    let dinode = fs.getattr(ino).expect("should getattr fifo");
+    let mode = u32::from_le_bytes(dinode.di_mode);
+    assert_eq!(mode & 0xf000, 0x1000, "mode should be S_IFIFO");
+    assert_eq!(mode & 0o777, 0o644, "permission bits should be 0644");
+
+    // The entry should be visible via lookup.
+    assert_eq!(fs.lookup(parent, "fifo"), Some(ino));
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_mknod_rejects_regular_file_type() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // S_IFREG should be rejected by mknod (use create instead).
+    let result = fs.mknod(parent, "reg", 0x81A4, 0);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), jfsfuse::fuse::EPERM);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_mknod_rejects_directory_type() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // S_IFDIR should be rejected by mknod (use mkdir instead).
+    let result = fs.mknod(parent, "dir", 0x41ED, 0);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), jfsfuse::fuse::EPERM);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_mknod_rejects_readonly() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+
+    let parent = fs.volume.root_ino;
+    let result = fs.mknod(parent, "fifo", 0x11A4, 0);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), EROFS);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_forget_tracks_nlookup_refcount() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Create a file — FUSEFs::create increments lookup_count to 1.
+    let ino = fs.create(parent, "f", 0o100644).expect("create");
+    assert_eq!(fs.lookup_count(ino), 1);
+
+    // Explicit lookup increments to 2.
+    let _ = fs.lookup(parent, "f");
+    assert_eq!(fs.lookup_count(ino), 2);
+
+    // Partial FORGET: decrement by 1, count should be 1 (not zero).
+    fs.forget(ino, 1);
+    assert_eq!(fs.lookup_count(ino), 1);
+
+    // Full FORGET: decrement by 1 more, count reaches 0.
+    fs.forget(ino, 1);
+    assert_eq!(fs.lookup_count(ino), 0);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_batch_forget_decrements_properly() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Create two files (count = 1 each).
+    let ino1 = fs.create(parent, "f1", 0o100644).expect("create f1");
+    let ino2 = fs.create(parent, "f2", 0o100644).expect("create f2");
+    assert_eq!(fs.lookup_count(ino1), 1);
+    assert_eq!(fs.lookup_count(ino2), 1);
+
+    // Look up both (count = 2 each).
+    let _ = fs.lookup(parent, "f1");
+    let _ = fs.lookup(parent, "f2");
+    assert_eq!(fs.lookup_count(ino1), 2);
+    assert_eq!(fs.lookup_count(ino2), 2);
+
+    // Batch forget with partial counts (2 -> 1 for each).
+    fs.batch_forget(&[(ino1, 1), (ino2, 1)]);
+    assert_eq!(fs.lookup_count(ino1), 1);
+    assert_eq!(fs.lookup_count(ino2), 1);
+
+    // Batch forget with full counts (1 -> 0 for each).
+    fs.batch_forget(&[(ino1, 1), (ino2, 1)]);
+    assert_eq!(fs.lookup_count(ino1), 0);
+    assert_eq!(fs.lookup_count(ino2), 0);
+
+    // Empty batch forget should not panic.
+    fs.batch_forget(&[]);
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_forget_unknown_inode_is_noop() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    // Forgetting an inode that was never looked up should be a no-op.
+    // Should not panic.
+    fs.forget(99999, 1);
+    assert_eq!(fs.lookup_count(99999), 0);
+    fs.batch_forget(&[(99999, 1)]);
+    assert_eq!(fs.lookup_count(99999), 0);
+}

@@ -1509,6 +1509,84 @@ impl Volume {
         Ok(child_ino)
     }
 
+    /// Create a special file (FIFO, character device, block device, or socket)
+    /// in a parent directory.
+    ///
+    /// 1. Validate file type and permissions.
+    /// 2. Allocate inode.
+    /// 3. Initialize inode with the given mode, nlink=1, empty size.
+    ///    For device files, stores rdev in the PXD field.
+    /// 4. Insert directory entry in parent.
+    /// 5. Commit.
+    #[cfg(feature = "writable")]
+    pub fn mknod(&mut self, parent_ino: u32, name: &str, mode: u32, rdev: u64) -> StorageResult<u32> {
+        let _ = self.begin_transaction()?;
+
+        // Validate name length.
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        if name_u16.is_empty() || name_u16.len() > 11 {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid filename length".to_string()));
+        }
+
+        // Validate file type.
+        let file_type = mode & 0xf000;
+        if !matches!(file_type, 0x1000 | 0x2000 | 0x6000 | 0xC000) {
+            self.abort_transaction();
+            return Err(StorageError::Other("invalid file type for mknod".to_string()));
+        }
+
+        // Allocate a new inode.
+        let (child_ino, child_block, child_off) = self.allocate_inode()?;
+
+        // Initialize the child inode.
+        // For FIFOs and sockets: regular file storage with special mode,
+        // no data blocks, nlink=1.
+        // For chr/blk devices: store rdev in the PXD field.
+        self.update_inode_page(child_ino, child_block, child_off, |dinode_bytes| {
+            // Set mode.
+            LittleEndian::write_u32(&mut dinode_bytes[52..56], mode);
+            // Set size to 0
+            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+            // Set nblocks to 0
+            LittleEndian::write_u64(&mut dinode_bytes[32..40], 0);
+            // Set nlink to 1
+            LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
+            // Set fileset and inode number.
+            LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+
+            // For device files, store rdev in the PXD field (bytes 16-24).
+            // This is non-standard for JDS but works for our FUSE implementation
+            // since device nodes don't use extent descriptors.
+            if file_type == 0x2000 || file_type == 0x6000 {
+                LittleEndian::write_u64(&mut dinode_bytes[16..24], rdev);
+            }
+        })?;
+        self.mark_page_dirty(child_ino, child_block)?;
+
+        // Insert directory entry in parent.
+        let index = {
+            let parent = crate::inode::Inode::read(self, parent_ino)?;
+            let dtree = crate::btree::dtree::Dtree::from_inode_data(parent.dtroot_bytes())?;
+            dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
+        };
+        let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
+        if !inserted {
+            self.abort_transaction();
+            return Err(StorageError::Other("directory entry already exists".to_string()));
+        }
+
+        // Mark parent page dirty.
+        let parent = crate::inode::Inode::read(self, parent_ino)?;
+        self.mark_page_dirty(parent_ino, parent.page_block)?;
+
+        // Commit.
+        self.commit_transaction()?;
+
+        Ok(child_ino)
+    }
+
     /// Remove a directory (rmdir).
     ///
     /// 1. Look up entry in parent's dtroot.

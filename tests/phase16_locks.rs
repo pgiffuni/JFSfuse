@@ -553,26 +553,53 @@ fn test_readdirplus_not_directory() {
 fn test_forget_evicts_page_cache() {
     let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    // Load root inode data into page cache by doing a readdir.
-    let _ = fs.readdir(parent, 0);
 
-    // Forget should not panic.
-    fs.forget(parent, 1);
-    fs.forget(parent, 1);
+    // Create a file (lookup_count starts at 1).
+    let ino = fs.create(parent, "ftest", 0o100644).expect("create");
+    assert_eq!(fs.lookup_count(ino), 1);
+
+    // Look up the file again (lookup_count = 2).
+    let _ = fs.lookup(parent, "ftest");
+    assert_eq!(fs.lookup_count(ino), 2);
+
+    // Partial forget (count 2 -> 1): node state should remain tracked.
+    fs.forget(ino, 1);
+    assert_eq!(fs.lookup_count(ino), 1);
+
+    // Full forget (count 1 -> 0): node state removed.
+    fs.forget(ino, 1);
+    assert_eq!(fs.lookup_count(ino), 0);
 }
 
 #[test]
 fn test_batch_forget_multiple_inodes() {
     let vol = load_image_to_memory();
     let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino1 = fs.lookup(parent, ".").unwrap_or(2);
 
-    // Batch forget should handle multiple entries.
-    fs.batch_forget(&[(parent, 1), (ino1, 1)]);
+    // Create files (count = 1 each) and look them up (count = 2 each).
+    let ino1 = fs.create(parent, "bf1", 0o100644).expect("create");
+    let ino2 = fs.create(parent, "bf2", 0o100644).expect("create");
+    let _ = fs.lookup(parent, "bf1");
+    let _ = fs.lookup(parent, "bf2");
+
+    // Batch forget with partial counts (2 -> 1 for each).
+    // Counts should remain tracked (not zero).
+    fs.batch_forget(&[(ino1, 1), (ino2, 1)]);
+    assert_eq!(fs.lookup_count(ino1), 1);
+    assert_eq!(fs.lookup_count(ino2), 1);
+
+    // Batch forget with full counts (1 -> 0 for each).
+    // Counts should reach zero and node states removed.
+    fs.batch_forget(&[(ino1, 1), (ino2, 1)]);
+    assert_eq!(fs.lookup_count(ino1), 0);
+    assert_eq!(fs.lookup_count(ino2), 0);
+
     // Should not panic on empty list.
     fs.batch_forget(&[]);
 }

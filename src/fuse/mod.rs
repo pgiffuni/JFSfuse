@@ -132,6 +132,37 @@ impl FlockLock {
 pub type FuseResult<T> = Result<T, i32>;
 
 /// FUSE filesystem operations.
+/// Tracks per-inode state on the FUSE server side.
+///
+/// The kernel maintains a reference count (`nlookup`) for each inode
+/// it has sent to userspace via FUSE_LOOKUP / FUSE_CREATE / FUSE_MKNOD.
+/// For each such lookup, the kernel later sends FUSE_FORGET with the
+/// number of references to release. Only when the count drops to zero
+/// can cached data be safely evicted.
+#[derive(Debug, Clone, Default)]
+pub struct NodeState {
+    /// Lookup reference count (incremented by LOOKUP, decremented by FORGET).
+    lookup_count: u64,
+}
+
+impl NodeState {
+    pub fn new() -> Self {
+        Self { lookup_count: 1 }
+    }
+
+    pub fn increment(&mut self, n: u64) {
+        self.lookup_count += n;
+    }
+
+    pub fn decrement(&mut self, n: u64) {
+        self.lookup_count = self.lookup_count.saturating_sub(n);
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.lookup_count == 0
+    }
+}
+
 pub struct FuseFs {
     /// Mounted volume.
     pub volume: Volume,
@@ -141,6 +172,8 @@ pub struct FuseFs {
     locks: HashMap<u32, Vec<PosixLock>>,
     /// BSD-style flock locks, keyed by inode number.
     flock_locks: HashMap<u32, Vec<FlockLock>>,
+    /// Per-inode lookup reference counts, keyed by inode number.
+    node_states: HashMap<u32, NodeState>,
     /// Tracks in-flight requests for FUSE_INTERRUPT cancellation.
     #[allow(dead_code)]
     interrupt_mgr: InterruptManager,
@@ -180,6 +213,7 @@ impl FuseFs {
             writable: false,
             locks: HashMap::new(),
             flock_locks: HashMap::new(),
+            node_states: HashMap::new(),
             interrupt_mgr: InterruptManager::new(),
         }
     }
@@ -369,7 +403,10 @@ impl FuseFs {
     /// Handles `.` and `..` as special cases (implicit entries).
     pub fn lookup(&mut self, parent_ino: u32, name: &str) -> Option<u32> {
         match name {
-            "." => Some(parent_ino),
+            "." => {
+                self.add_node_state(parent_ino);
+                Some(parent_ino)
+            }
             ".." => {
                 let parent = Inode::read(&mut self.volume, parent_ino).ok()?;
                 if !parent.is_dir() {
@@ -377,9 +414,11 @@ impl FuseFs {
                 }
                 let dtroot = parent.dtroot_bytes();
                 if dtroot.len() >= 24 {
-                    Some(u32::from_le_bytes(
+                    let ino = u32::from_le_bytes(
                         dtroot[20..24].try_into().unwrap(),
-                    ))
+                    );
+                    self.add_node_state(ino);
+                    Some(ino)
                 } else {
                     None
                 }
@@ -392,6 +431,7 @@ impl FuseFs {
                 let dtree = Dtree::from_inode_data(parent.dtroot_bytes()).ok()?;
                 let name_u16: Vec<u16> = name.encode_utf16().collect();
                 let entry = dtree.lookup(&name_u16).ok()??;
+                self.add_node_state(entry.inumber);
                 Some(entry.inumber)
             }
         }
@@ -813,7 +853,9 @@ impl FuseFs {
         if !self.writable {
             return None;
         }
-        self.volume.create_file(parent_ino, name).ok()
+        let ino = self.volume.create_file(parent_ino, name).ok()?;
+        self.add_node_state(ino);
+        Some(ino)
     }
 
     /// Write data to an open file (write-supported, gated behind `writable`).
@@ -1004,18 +1046,23 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.mkdir(parent_ino, name).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("already exists") {
-                EEXIST
-            } else if msg.contains("invalid filename") {
-                EINVAL
-            } else if msg.contains("no free inode") {
-                ENOSPC
-            } else {
-                EIO
-            }
-        })
+        self.volume.mkdir(parent_ino, name)
+            .map(|ino| {
+                self.add_node_state(ino);
+                ino
+            })
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    EEXIST
+                } else if msg.contains("invalid filename") {
+                    EINVAL
+                } else if msg.contains("no free inode") {
+                    ENOSPC
+                } else {
+                    EIO
+                }
+            })
     }
 
     /// Remove a directory (write-supported, gated behind `writable`).
@@ -1066,6 +1113,12 @@ impl FuseFs {
         self.volume.release_file(ino).map_err(|_| EIO)
     }
 
+    /// Returns the current lookup reference count for an inode (for
+    /// diagnostics/testing). Returns 0 if the inode is not tracked.
+    pub fn lookup_count(&self, ino: u32) -> u64 {
+        self.node_states.get(&ino).map(|s| s.lookup_count).unwrap_or(0)
+    }
+
     /// FUSE_FORGET — decrement the reference count on an inode.
     ///
     /// `nlookup` is the number of lookups to forget (kernel sends this in
@@ -1076,20 +1129,47 @@ impl FuseFs {
     /// count per inode node and sends FUSE_FORGET when entries are evicted
     /// from the dentry cache.
     pub fn forget(&mut self, ino: u32, nlookup: u64) {
-        // In the current JFS model, inodes are looked up from disk on each
-        // access (no long-lived inode cache). FORGET is acknowledged by
-        // evicting any cached page-cache entries for this inode.
-        self.volume.page_cache.evict(ino);
+        let should_evict = self.decrement_node_state(ino, nlookup);
+        if should_evict {
+            self.volume.page_cache.evict(ino);
+        }
     }
 
     /// FUSE_BATCH_FORGET — decrement refcounts on multiple inodes at once.
     ///
-    /// `entries` is a list of (inode, nlookup) pairs. Each inode's cached
-    /// pages are evicted if their refcount reaches zero.
+    /// `entries` is a list of (inode, nlookup) pairs. Each inode's lookup
+    /// count is decremented by its `nlookup`; cached pages are evicted only
+    /// for inodes whose count reaches zero.
     pub fn batch_forget(&mut self, entries: &[(u32, u64)]) {
-        for &(ino, _nlookup) in entries {
-            self.volume.page_cache.evict(ino);
+        for &(ino, nlookup) in entries {
+            let should_evict = self.decrement_node_state(ino, nlookup);
+            if should_evict {
+                self.volume.page_cache.evict(ino);
+            }
         }
+    }
+
+    /// Increment the lookup reference count for an inode (called on LOOKUP/CREATE/MKNOD).
+    fn add_node_state(&mut self, ino: u32) {
+        self.node_states
+            .entry(ino)
+            .and_modify(|s| s.increment(1))
+            .or_insert_with(NodeState::new);
+    }
+
+    /// Decrement the lookup reference count by `nlookup`.
+    /// Returns `true` if the count reached zero (page cache can be evicted).
+    fn decrement_node_state(&mut self, ino: u32, nlookup: u64) -> bool {
+        let should_evict = if let Some(state) = self.node_states.get_mut(&ino) {
+            state.decrement(nlookup);
+            state.is_zero()
+        } else {
+            false
+        };
+        if should_evict {
+            self.node_states.remove(&ino);
+        }
+        should_evict
     }
 
     /// Set file attributes (writable builds only).
@@ -1201,20 +1281,56 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.symlink(parent_ino, name, target).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("already exists") {
-                EEXIST
-            } else if msg.contains("invalid filename") {
-                EINVAL
-            } else if msg.contains("no free inode") {
-                ENOSPC
-            } else if msg.contains("long symlinks not yet supported") {
-                EOPNOTSUPP
-            } else {
-                EIO
-            }
-        })
+        self.volume.symlink(parent_ino, name, target)
+            .map(|ino| {
+                self.add_node_state(ino);
+                ino
+            })
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    EEXIST
+                } else if msg.contains("invalid filename") {
+                    EINVAL
+                } else if msg.contains("no free inode") {
+                    ENOSPC
+                } else if msg.contains("long symlinks not yet supported") {
+                    EOPNOTSUPP
+                } else {
+                    EIO
+                }
+            })
+    }
+
+    /// Create a special file (FIFO, char/block device, socket) in a directory.
+    ///
+    /// Unlike `create` (which always creates regular files), `mknod` supports
+    /// special file types via the mode's file-type bits.
+    #[cfg(feature = "writable")]
+    pub fn mknod(&mut self, parent_ino: u32, name: &str, mode: u32, rdev: u64) -> FuseResult<u32> {
+        if !self.writable {
+            return Err(EROFS);
+        }
+        self.volume
+            .mknod(parent_ino, name, mode, rdev)
+            .map(|ino| {
+                self.add_node_state(ino);
+                ino
+            })
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    EEXIST
+                } else if msg.contains("invalid filename") {
+                    EINVAL
+                } else if msg.contains("invalid file type") {
+                    EPERM
+                } else if msg.contains("no free inode") {
+                    ENOSPC
+                } else {
+                    EIO
+                }
+            })
     }
 
     /// Read the target of a symbolic link (writable builds only).

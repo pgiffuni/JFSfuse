@@ -237,13 +237,23 @@ impl FuseFs {
     /// [`abi`](self::abi) module and match the Linux FUSE ABI.
     ///
     /// ## Implemented
-    /// - [`FUSE_POSIX_LOCKS`] — POSIX fcntl-style byte-range locks
+    /// - [`FUSE_POSIX_LOCKS`] — POSIX fcntl-style byte-range locks (SETLK/GETLK)
     /// - [`FUSE_FLOCK_LOCKS`] — BSD-style `flock(2)` locks
     /// - [`FUSE_ASYNC_READ`] — asynchronous read (reads may be reordered)
     /// - [`FUSE_BIG_WRITES`] — writes larger than 4 KB are accepted
     /// - [`FUSE_PARALLEL_DIROPS`] — concurrent directory operations
     /// - [`FUSE_BMAP`] (opcode) — file block to physical block mapping via Xtree
     /// - [`FUSE_DO_READDIRPLUS`] / [`FUSE_READDIRPLUS_AUTO`] — readdir with attributes
+    ///
+    /// ## Partially implemented
+    /// - [`FUSE_SETLKW`] — blocking lock request is dispatched to `setlkw()`,
+    ///   but the semantics are incomplete: conflicts return `EAGAIN` instead
+    ///   of blocking. A real wait mechanism (request queueing per file) is
+    ///   needed for correct behavior. See `setlkw()` documentation.
+    ///
+    /// ## Not requested
+    /// - [`FUSE_DEFAULT_PERMISSIONS`] — access checks are performed in the
+    ///   FUSE server via `ACCESS`, not delegated to the kernel.
     ///
     /// Long-running operations are made cancellable via [`FUSE_INTERRUPT`]
     /// — each request gets an identifiable [`RequestId`]
@@ -1433,11 +1443,13 @@ impl FuseFs {
 
     /// Set file lock (blocking, FUSE_SETLKW).
     ///
-    /// If a conflicting lock exists, blocking is indicated by returning
-    /// `EWOULDBLOCK` (mapped to `EAGAIN`). In a kernel FUSE context the
-    /// filesystem would hold the request until the lock becomes available;
-    /// in this in-memory implementation we return `EAGAIN` so the caller
-    /// can retry.
+    /// **Note:** This implementation is **not semantically complete**. When a
+    /// conflicting lock exists, it returns `EAGAIN` instead of blocking the
+    /// request. In a kernel FUSE context the filesystem would hold the
+    /// request open until the lock becomes available; this in-memory
+    /// implementation returns `EAGAIN` so the caller can retry. Properly
+    /// implementing blocking semantics would require per-file request
+    /// queues with condition variables — out of scope for this phase.
     pub fn setlkw(&mut self, ino: u32, flock: &Flock, owner: u64) -> FuseResult<()> {
         if !self.writable {
             return Err(EROFS);
@@ -1463,6 +1475,13 @@ impl FuseFs {
     /// - `LOCK_NB` — OR'd with LOCK_SH/LOCK_EX for non-blocking
     ///
     /// Returns `EAGAIN` if the lock would block and `LOCK_NB` is set.
+    ///
+    /// **Note:** This implements an in-memory lock table specific to this
+    /// FUSE server. FreeBSD's native FUSE uses vnode locking as a fallback
+    /// for `flock` when the FUSE_FLOCK_LOCKS capability is not negotiated;
+    /// in this implementation all `flock` semantics are handled by the
+    /// filesystem itself via the `FUSE_FLOCK_LOCKS` capability. This is
+    /// acceptable for a userland implementation but not fully FreeBSD-equivalent.
     pub fn flock(&mut self, ino: u32, operation: u32, owner: u64) -> FuseResult<()> {
         if !self.writable {
             return Err(EROFS);

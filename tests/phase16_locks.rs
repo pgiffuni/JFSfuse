@@ -541,6 +541,7 @@ fn test_readdirplus_returns_attrs() {
     let dot_entry = &entries[0];
     assert_eq!(dot_entry.0, ".", "first entry should be .");
     assert_eq!(dot_entry.1, parent, "dot should reference parent");
+    assert_eq!(dot_entry.4, 0, "dot entry should have cookie 0");
 }
 
 #[test]
@@ -709,7 +710,7 @@ fn test_access_owner_permissions() {
     // Create a file owned by uid 1000, mode 0644.
     let ino = fs.create(parent, "acctest", 0o100644).expect("create");
     // Set owner to 1000:1000 and mode 0600.
-    fs.setattr(ino, Some(0o100600), Some(1000), Some(1000), None, None).expect("setattr");
+    fs.setattr(ino, Some(0o100600), Some(1000), Some(1000), None, None, None).expect("setattr");
 
     // Owner has read/write.
     assert!(fs.access(ino, R_OK, 1000, 1000).is_ok());
@@ -726,7 +727,7 @@ fn test_access_other_permissions() {
 
     let parent = fs.volume.root_ino;
     let ino = fs.create(parent, "accother", 0o100644).expect("create");
-    fs.setattr(ino, Some(0o100644), Some(1000), Some(1000), None, None).expect("setattr");
+    fs.setattr(ino, Some(0o100644), Some(1000), Some(1000), None, None, None).expect("setattr");
 
     // Another user (uid 2000) — other perms (r--): read ok, write denied.
     assert!(fs.access(ino, R_OK, 2000, 2000).is_ok());
@@ -744,7 +745,7 @@ fn test_access_execute_denied_without_owner_execute() {
     // Set owner to 1000:1000 and mode 0651 (owner rw, group r-x, other --x).
     // Owner does NOT have execute, but "other" does.
     // ACCESS for the owner (uid 1000) should return EACCES for X_OK.
-    fs.setattr(ino, Some(0o100651), Some(1000), Some(1000), None, None).expect("setattr");
+    fs.setattr(ino, Some(0o100651), Some(1000), Some(1000), None, None, None).expect("setattr");
 
     // Owner: no execute bit → EACCES even though "other" has execute.
     assert_eq!(fs.access(ino, X_OK, 1000, 1000), Err(EACCES));
@@ -820,9 +821,133 @@ fn test_readdir_offset_resumption() {
     // Read with offset past . and .. but at first real entry
     let entries2 = fs.readdir(parent, 2).expect("readdir offset 2");
     // Should NOT include "." or ".."
-    assert!(!entries2.iter().any(|(n, _, _)| n == "."));
-    assert!(!entries2.iter().any(|(n, _, _)| n == ".."));
+    assert!(!entries2.iter().any(|(n, _, _, _)| n == "."));
+    assert!(!entries2.iter().any(|(n, _, _, _)| n == ".."));
     // But should include real entries
-    assert!(entries2.iter().any(|(n, _, _)| n == "a" || n == "b" || n == "c" || n == "d" || n == "e"));
+    assert!(entries2.iter().any(|(n, _, _, _)| n == "a" || n == "b" || n == "c" || n == "d" || n == "e"));
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_open_unlink_read_close_lifetime() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "lifetest", 0o100644).expect("create");
+
+    // Open, write, unlink, read, close — data should still be accessible.
+    fs.open(ino).expect("open");
+    fs.write(ino, 0, b"hello lifetime").expect("write");
+    fs.unlink(parent, "lifetest").expect("unlink");
+
+    // Read back the data while still open.
+    let data = fs.read(ino, 0, 14).expect("read after unlink");
+    assert_eq!(&data[..14], b"hello lifetime");
+
+    fs.release(ino).expect("release");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_open_unlink_close_reclaim() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Open a file, unlink it, then close — inode and blocks should be reclaimable.
+    let ino = fs.create(parent, "reclaimtest", 0o100644).expect("create");
+    fs.open(ino).expect("open");
+    fs.write(ino, 0, b"data to reclaim").expect("write");
+
+    fs.unlink(parent, "reclaimtest").expect("unlink");
+    fs.release(ino).expect("release should free the inode");
+
+    // After release, the inode should be gone — readdir should not list it.
+    let entries = fs.readdir(parent, 0).expect("readdir");
+    assert!(
+        !entries.iter().any(|(n, _, _, _)| n == "reclaimtest"),
+        "unlinked+released file should not appear in readdir"
+    );
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_readdir_cookies_are_logical() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+
+    // Add a few entries.
+    let _ = fs.create(parent, "alpha", 0o100644).expect("create alpha");
+    let _ = fs.create(parent, "beta", 0o100644).expect("create beta");
+    let _ = fs.create(parent, "gamma", 0o100644).expect("create gamma");
+
+    // Offset 0: should return . with cookie 0, .. with cookie 1, and entries.
+    let entries = fs.readdir(parent, 0).expect("readdir");
+    assert_eq!(entries[0].0, ".", "first entry should be .");
+    assert_eq!(entries[0].3, 0, "cookie for . should be 0");
+
+    // If .. exists as second entry, its cookie should be 1.
+    if entries.len() > 1 && entries[1].0 == ".." {
+        assert_eq!(entries[1].3, 1, "cookie for .. should be 1");
+    }
+
+    // The first real entry should have cookie ENTRY_BASE (2).
+    let first_real = entries.iter().find(|(n, _, _, _)| n != "." && n != "..");
+    assert!(first_real.is_some(), "should have at least one real entry");
+    let (_, _, _, cookie) = first_real.unwrap();
+    assert_eq!(*cookie, 2, "first real entry should have cookie 2");
+
+    // Resuming from offset 2 should NOT return . or ...
+    let entries2 = fs.readdir(parent, 2).expect("readdir offset 2");
+    assert!(!entries2.iter().any(|(n, _, _, _)| n == "."));
+    assert!(!entries2.iter().any(|(n, _, _, _)| n == ".."));
+    // First entry should have cookie 2.
+    assert_eq!(entries2[0].3, 2, "first entry at offset 2 should have cookie 2");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_getxattr_size_query() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "xattrtest", 0o100644).expect("create");
+
+    // Set a user xattr.
+    fs.setxattr(ino, "user.comment", b"hello", 0).expect("setxattr");
+
+    // listxattr should reverse-translate the internal name to "user.comment".
+    let names = fs.listxattr(ino).expect("listxattr");
+    assert!(names.iter().any(|n| n == "user.comment"), "user.comment should appear with prefix");
+}
+
+#[cfg(feature = "writable")]
+#[test]
+fn test_fallocate_unsupported_flags() {
+    let vol = load_image_to_memory();
+    let mut fs = FuseFs::new(vol);
+    fs.enable_writable().unwrap();
+
+    let parent = fs.volume.root_ino;
+    let ino = fs.create(parent, "fatest", 0o100644).expect("create");
+
+    // FALLOC_FL_COLLAPSE_RANGE is not supported.
+    let result = fs.fallocate(ino, 0, 4096, 0x08);
+    assert!(result.is_err(), "collapse range should fail");
+    assert_eq!(result.unwrap_err(), EOPNOTSUPP, "should be EOPNOTSUPP");
+
+    // FALLOC_FL_ZERO_RANGE is not supported.
+    let result = fs.fallocate(ino, 0, 4096, 0x10);
+    assert!(result.is_err(), "zero range should fail");
+    assert_eq!(result.unwrap_err(), EOPNOTSUPP, "should be EOPNOTSUPP");
 }
 

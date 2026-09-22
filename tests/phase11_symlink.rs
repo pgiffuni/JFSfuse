@@ -66,7 +66,7 @@ fn test_symlink_lookup_resolves() {
 
     // Verify readdir includes the symlink entry.
     let entries = fs.readdir(parent, 0).expect("readdir should succeed");
-    let found = entries.iter().find(|(name, _, _)| name == link_name);
+    let found = entries.iter().find(|(name, _, _, _)| name == link_name);
     assert!(found.is_some(), "symlink should appear in readdir");
 
     let _ = fs.unlink(parent, link_name);

@@ -172,7 +172,7 @@ fn test_setattr_mode() {
     let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
 
     // Change mode to 0600.
-    let result = fs.setattr(ino, Some(0o100600), None, None, None, None);
+    let result = fs.setattr(ino, Some(0o100600), None, None, None, None, None);
     assert!(result.is_ok(), "setattr should succeed: {:?}", result.err());
 
     // Verify the mode was updated.
@@ -198,7 +198,7 @@ fn test_setattr_uid_gid() {
     let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
 
     // Change uid and gid.
-    let result = fs.setattr(ino, None, Some(1000), Some(2000), None, None);
+    let result = fs.setattr(ino, None, Some(1000), Some(2000), None, None, None);
     assert!(result.is_ok(), "setattr should succeed: {:?}", result.err());
 
     let dinode = fs.getattr(ino).expect("should getattr");
@@ -277,7 +277,7 @@ fn test_setattr_rejected_in_readonly_mode() {
     let mut fs = FuseFs::new(vol);
     // Don't call enable_writable.
 
-    let result = fs.setattr(1, Some(0o100600), None, None, None, None);
+    let result = fs.setattr(1, Some(0o100600), None, None, None, None, None);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), EROFS);
 }
@@ -922,7 +922,7 @@ fn test_access_directory_search_permission() {
 
     let parent = fs.volume.root_ino;
     let ino = fs.mkdir(parent, "dir", 0o040700).expect("mkdir");
-    fs.setattr(ino, Some(0o040700), Some(1000), Some(1000), None, None).expect("setattr");
+    fs.setattr(ino, Some(0o040700), Some(1000), Some(1000), None, None, None).expect("setattr");
 
     // Owner has execute (search) permission on directory.
     assert!(fs.access(ino, X_OK, 1000, 1000).is_ok());

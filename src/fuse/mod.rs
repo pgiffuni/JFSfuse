@@ -25,7 +25,7 @@ use fuse3::raw::Request;
 use fuse3::{FileType, Timestamp};
 use futures_util::stream::Stream;
 
-use crate::btree::dtree::{Dtree, DirectoryCursor};
+use crate::btree::dtree::{Dtree, DirectoryCursor, DirEntry};
 use crate::btree::xtree::Xtree;
 pub mod abi;
 pub mod interrupt;
@@ -56,6 +56,37 @@ pub const EPERM: i32 = 1;
 pub const EBADF: i32 = 9;
 pub const EAGAIN: i32 = 11;
 pub const EINTR: i32 = 4;
+pub const ERANGE: i32 = 34;
+
+/// Translate a FreeBSD extattr namespace name to its internal JFS xattr name.
+///
+/// FreeBSD uses `user.foo` and `system.foo` as the canonical spelling;
+/// JFS stores extattr names with the namespace prefix already stripped.
+/// However, when interfacing through FUSE on Linux, the names arrive as
+/// `user.foo` / `system.foo`. We normalize: if the name already has a
+/// `user.` or `system.` prefix, strip it before passing to the volume layer.
+/// If it has no recognized prefix, treat it as a `user.` attribute.
+pub fn translate_xattr_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("user.") {
+        rest.to_string()
+    } else if let Some(rest) = name.strip_prefix("system.") {
+        format!("system.{}", rest)
+    } else if name.starts_with("system.") || name.starts_with("user.") {
+        name.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Reverse of [`translate_xattr_name`]: add `user.` prefix to bare names
+/// for listxattr output.
+pub fn reverse_xattr_name(name: &str) -> String {
+    if name.starts_with("user.") || name.starts_with("system.") {
+        name.to_string()
+    } else {
+        format!("user.{}", name)
+    }
+}
 
 /// Lock types (POSIX fcntl `l_type`).
 pub const F_RDLCK: i16 = 0;
@@ -485,7 +516,7 @@ impl FuseFs {
     /// required by FUSE READDIR — the kernel passes a cookie offset to
     /// resume from a previous position.
     /// Includes `.` and `..` entries. Real entries come from the dtree stbl order.
-    pub fn readdir(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8)>> {
+    pub fn readdir(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8, u64)>> {
         let inode = Inode::read(&mut self.volume, ino).ok()?;
         if !inode.is_dir() {
             return None;
@@ -496,7 +527,7 @@ impl FuseFs {
 
         // `.` entry — points to self (always emitted; FUSE may skip if offset > 0)
         if !cursor.is_entry() {
-            result.push((".".to_string(), ino, 0x04));
+            result.push((".".to_string(), ino, 0x04, DirectoryCursor::DOT_OFFSET));
         }
 
         // `..` entry — parent from dtroot header
@@ -504,36 +535,30 @@ impl FuseFs {
         if dtroot.len() >= 24 {
             let parent_ino = u32::from_le_bytes(dtroot[20..24].try_into().unwrap());
             if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
-                result.push(("..".to_string(), parent_ino, 0x04));
+                result.push(("..".to_string(), parent_ino, 0x04, DirectoryCursor::DOTDOT_OFFSET));
             }
         }
 
         // Real entries from the dtree, starting from the cursor's position
-        if cursor.is_entry() {
-            if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
-                if let Ok(entries) = dtree.entries() {
-                    let start_idx = cursor.entry_index().unwrap_or(0);
-                    for e in entries.iter().skip(start_idx) {
-                        let name = String::from_utf16_lossy(&e.name)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        let file_type = self.infer_file_type(e.inumber);
-                        result.push((name, e.inumber, file_type));
-                    }
-                }
+        let start_idx = cursor.entry_index().unwrap_or(0);
+        let entries: Option<Vec<DirEntry>> = if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
+            if let Ok(entries) = dtree.entries() {
+                Some(entries.into_iter().skip(start_idx).collect::<Vec<_>>())
+            } else {
+                None
             }
         } else {
-            // Offset was at . or .., so include all real entries
-            if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
-                if let Ok(entries) = dtree.entries() {
-                    for e in &entries {
-                        let name = String::from_utf16_lossy(&e.name)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        let file_type = self.infer_file_type(e.inumber);
-                        result.push((name, e.inumber, file_type));
-                    }
-                }
+            None
+        };
+
+        if let Some(entries) = entries {
+            for (idx, e) in entries.iter().enumerate() {
+                let name = String::from_utf16_lossy(&e.name)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let file_type = self.infer_file_type(e.inumber);
+                let cookie = DirectoryCursor::ENTRY_BASE + start_idx as u64 + idx as u64;
+                result.push((name, e.inumber, file_type, cookie));
             }
         }
 
@@ -545,7 +570,7 @@ impl FuseFs {
     /// Like `readdir` but also fetches the `Dinode` (stat) and type for
     /// each child. This reduces subsequent LOOKUP + GETATTR round-trips.
     /// Supports offset-based resumption via [`DirectoryCursor`].
-    pub fn readdirplus(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8, Dinode)>> {
+    pub fn readdirplus(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8, Dinode, u64)>> {
         let inode = Inode::read(&mut self.volume, ino).ok()?;
         if !inode.is_dir() {
             return None;
@@ -559,7 +584,7 @@ impl FuseFs {
         if !cursor.is_entry() {
             self.add_node_state(ino);
             if let Some(attr) = self.getattr(ino) {
-                result.push((".".to_string(), ino, 0x04, attr));
+                result.push((".".to_string(), ino, 0x04, attr, DirectoryCursor::DOT_OFFSET));
             }
         }
 
@@ -569,15 +594,15 @@ impl FuseFs {
             if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
                 self.add_node_state(parent_ino);
                 if let Some(attr) = self.getattr(parent_ino) {
-                    result.push(("..".to_string(), parent_ino, 0x04, attr));
+                    result.push(("..".to_string(), parent_ino, 0x04, attr, DirectoryCursor::DOTDOT_OFFSET));
                 }
             }
         }
 
         // Real entries
-        let entries = if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
+        let start_idx = cursor.entry_index().unwrap_or(0);
+        let entries: Option<Vec<DirEntry>> = if let Ok(dtree) = Dtree::from_inode_data(inode.dtroot_bytes()) {
             if let Ok(entries) = dtree.entries() {
-                let start_idx = cursor.entry_index().unwrap_or(0);
                 Some(entries.into_iter().skip(start_idx).collect::<Vec<_>>())
             } else {
                 None
@@ -587,28 +612,15 @@ impl FuseFs {
         };
 
         if let Some(entries) = entries {
-            if !cursor.is_entry() {
-                // Offset was at . or .., include all entries
-                for e in &entries {
-                    let name = String::from_utf16_lossy(&e.name)
-                        .trim_end_matches('\0')
-                        .to_string();
-                    let file_type = self.infer_file_type(e.inumber);
-                    self.add_node_state(e.inumber);
-                    if let Some(attr) = self.getattr(e.inumber) {
-                        result.push((name, e.inumber, file_type, attr));
-                    }
-                }
-            } else {
-                for e in &entries {
-                    let name = String::from_utf16_lossy(&e.name)
-                        .trim_end_matches('\0')
-                        .to_string();
-                    let file_type = self.infer_file_type(e.inumber);
-                    self.add_node_state(e.inumber);
-                    if let Some(attr) = self.getattr(e.inumber) {
-                        result.push((name, e.inumber, file_type, attr));
-                    }
+            for (idx, e) in entries.iter().enumerate() {
+                let name = String::from_utf16_lossy(&e.name)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let file_type = self.infer_file_type(e.inumber);
+                let cookie = DirectoryCursor::ENTRY_BASE + start_idx as u64 + idx as u64;
+                self.add_node_state(e.inumber);
+                if let Some(attr) = self.getattr(e.inumber) {
+                    result.push((name, e.inumber, file_type, attr, cookie));
                 }
             }
         }
@@ -1038,6 +1050,15 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
+        const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+        const FALLOC_FL_PUNCH_KEEP: u32 = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+        const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+        const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+        const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+        if mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE | FALLOC_FL_INSERT_RANGE) != 0 {
+            return Err(EOPNOTSUPP);
+        }
         self.volume
             .fallocate(ino, offset, len, mode)
             .map_err(|e| {
@@ -1297,8 +1318,8 @@ impl FuseFs {
 
     /// Set file attributes (writable builds only).
     ///
-    /// Supports chmod (mode), chown (uid/gid), and utimens (atime/mtime).
-    /// Unspecified attributes are left unchanged.
+    /// Supports chmod (mode), chown (uid/gid), utimens (atime/mtime),
+    /// and truncate (size). Unspecified attributes are left unchanged.
     #[cfg(feature = "writable")]
     pub fn setattr(
         &mut self,
@@ -1308,9 +1329,13 @@ impl FuseFs {
         gid: Option<u32>,
         atime: Option<u64>,
         mtime: Option<u64>,
+        size: Option<u64>,
     ) -> FuseResult<()> {
         if !self.writable {
             return Err(EROFS);
+        }
+        if let Some(new_size) = size {
+            self.truncate(ino, new_size).ok_or(EIO)?;
         }
         self.volume
             .setattr(ino, mode, uid, gid, atime, mtime)
@@ -1370,7 +1395,8 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.setxattr(ino, name, value, flags).map_err(|e| {
+        let name = translate_xattr_name(name);
+        self.volume.setxattr(ino, &name, value, flags).map_err(|e| {
             let msg = e.to_string();
             if msg.contains("already exists") {
                 EEXIST
@@ -1392,7 +1418,8 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.getxattr(ino, name).map_err(|_| EIO)
+        let name = translate_xattr_name(name);
+        self.volume.getxattr(ino, &name).map_err(|_| EIO)
     }
 
     /// Create a symbolic link (writable builds only).
@@ -1478,7 +1505,8 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.removexattr(ino, name).map_err(|_| EIO).and_then(|ok| {
+        let name = translate_xattr_name(name);
+        self.volume.removexattr(ino, &name).map_err(|_| EIO).and_then(|ok| {
             if ok {
                 Ok(())
             } else {
@@ -1493,7 +1521,8 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.listxattr(ino).map_err(|_| EIO)
+        let names = self.volume.listxattr(ino).map_err(|_| EIO)?;
+        Ok(names.into_iter().map(|n| reverse_xattr_name(&n)).collect())
     }
 
     /// Create a hard link (writable builds only).
@@ -1759,11 +1788,12 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyAttr>> + Send + '_>> {
         let ino = inode as u32;
         let ttl = Duration::from_secs(5);
-        let uid = set_attr.uid;
+         let uid = set_attr.uid;
         let gid = set_attr.gid;
         let mode = set_attr.mode.map(|m| m as u32);
         let atime = set_attr.atime.map(|t| t.sec as u64);
         let mtime = set_attr.mtime.map(|t| t.sec as u64);
+        let size = set_attr.size;
         let _ = req;
 
         Box::pin(async move {
@@ -1775,6 +1805,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                     gid,
                     atime,
                     mtime,
+                    size,
                 ) {
                     Ok(()) => {
                         let dinode = fs.getattr(ino).ok_or(ENOENT)?;
@@ -2078,7 +2109,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                         .map_err(errno_to_fuse3)?;
                     let written = fs.write(ino, offset, &data_vec).ok_or(EIO)?;
                     if write_flags & 1 != 0 {
-                        let _ = fs.flush(ino);
+                        fs.flush(ino).ok_or(EIO)?;
                     }
                     Ok(ReplyWrite { written: written as u32 })
                 }
@@ -2119,16 +2150,16 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         flush: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
         let ino = inode as u32;
-        let _lock_owner = lock_owner;
         Box::pin(async move {
             self.with_inner(|fs| {
                 #[cfg(feature = "writable")]
                 {
                     if flush {
-                        let _ = fs.flush(ino);
+                        fs.flush(ino).ok_or(EIO)?;
                     }
                     let _ = fs.release_handle(fh);
                     fs.release_locks(ino, lock_owner);
+                    fs.release(ino).map_err(errno_to_fuse3)?;
                     Ok(())
                 }
                 #[cfg(not(feature = "writable"))]
@@ -2147,10 +2178,10 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                 #[cfg(feature = "writable")]
                 {
                     if datasync {
-                        let _ = fs.flush(ino);
+                        fs.flush(ino).ok_or(EIO)?;
                     } else {
-                        let _ = fs.sync_fs();
-                        let _ = fs.flush(ino);
+                        fs.sync_fs().map_err(errno_to_fuse3)?;
+                        fs.flush(ino).ok_or(EIO)?;
                     }
                     Ok(())
                 }
@@ -2202,9 +2233,8 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         name: &std::ffi::OsStr,
         size: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyXAttr>> + Send + '_>> {
-        let ino = inode as u32;
+         let ino = inode as u32;
         let name_str = name.to_string_lossy().to_string();
-        let _ = size;
 
         Box::pin(async move {
             self.with_inner(|fs| {
@@ -2215,13 +2245,21 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                         errno_to_fuse3(code)
                     })?;
                     match result {
-                        Some(data) => Ok(ReplyXAttr::Data(data.into())),
+                        Some(data) => {
+                            if size == 0 {
+                                Ok(ReplyXAttr::Size(data.len() as u32))
+                            } else if (data.len() as u32) <= size {
+                                Ok(ReplyXAttr::Data(data.into()))
+                            } else {
+                                Err(fuse3::Errno::from(ERANGE))
+                            }
+                        }
                         None => Err(fuse3::Errno::from(ENOENT)),
                     }
                 }
                 #[cfg(not(feature = "writable"))]
                 {
-                    let _ = (ino, name_str);
+                    let _ = (ino, name_str, size);
                     Err(EROFS.into())
                 }
             })
@@ -2230,7 +2268,6 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
 
     fn listxattr(&self, _req: Request, inode: fuse3::Inode, size: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyXAttr>> + Send + '_>> {
         let ino = inode as u32;
-        let _ = size;
 
         Box::pin(async move {
             self.with_inner(|fs| {
@@ -2246,11 +2283,17 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                         buf.extend_from_slice(bytes);
                         buf.push(0);
                     }
-                    Ok(ReplyXAttr::Data(buf.into()))
+                    if size == 0 {
+                        Ok(ReplyXAttr::Size(buf.len() as u32))
+                    } else if buf.len() as u32 <= size {
+                        Ok(ReplyXAttr::Data(buf.into()))
+                    } else {
+                        Err(fuse3::Errno::from(ERANGE))
+                    }
                 }
                 #[cfg(not(feature = "writable"))]
                 {
-                    let _ = ino;
+                    let _ = (ino, size);
                     Err(EROFS.into())
                 }
             })
@@ -2326,30 +2369,31 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
             dyn std::future::Future<
                     Output = fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a>>>,
                 > + Send + 'a,
-        >,
+            >,
     > {
         let parent_ino = parent as u32;
         let off = offset as u64;
         let _ = req;
-        let _ = fh;
 
         Box::pin(async move {
-            let entries = self.with_inner(|fs| fs.readdir(parent_ino, off));
+            let entries = self.with_inner(|fs| -> Result<_, fuse3::Errno> {
+                Self::validate_handle_static(&fs.handles, fh, parent_ino, true)
+                    .map_err(errno_to_fuse3)?;
+                Ok(fs.readdir(parent_ino, off))
+            });
 
-            let stream_items: Vec<std::result::Result<DirectoryEntry, fuse3::Errno>> = match entries {
+            let stream_items: Vec<std::result::Result<DirectoryEntry, fuse3::Errno>> = match entries? {
                 Some(entries) => {
                     let mut items = Vec::new();
-                    let mut cookie: i64 = 1;
-                    for (name, ino, kind) in entries {
+                    for (name, ino, kind, cookie) in entries {
                         let file_type = Self::fuse_file_type(kind);
                         let entry = DirectoryEntry {
                             inode: ino as u64,
                             kind: file_type,
                             name: std::ffi::OsString::from(name),
-                            offset: offset + cookie,
+                            offset: cookie as i64,
                         };
                         items.push(Ok(entry));
-                        cookie += 1;
                     }
                     items
                 }
@@ -2362,9 +2406,21 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         })
     }
 
-    fn releasedir(&self, _req: Request, _inode: fuse3::Inode, fh: u64, _flags: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
+    fn releasedir(&self, _req: Request, inode: fuse3::Inode, fh: u64, _flags: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
+        let ino = inode as u32;
         Box::pin(async move {
-            let _ = self.with_inner(|fs| fs.release_handle(fh));
+            self.with_inner(|fs| -> FuseResult<()> {
+                #[cfg(feature = "writable")]
+                {
+                    let _ = fs.release_handle(fh);
+                    fs.release(ino)?;
+                }
+                #[cfg(not(feature = "writable"))]
+                {
+                    let _ = fs.release_handle(fh);
+                }
+                Ok(())
+            })?;
             Ok(())
         })
     }
@@ -2374,7 +2430,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
             self.with_inner(|fs| {
                 #[cfg(feature = "writable")]
                 {
-                    let _ = fs.sync_fs();
+                    fs.sync_fs().map_err(|e| errno_to_fuse3(e))?;
                     Ok(())
                 }
                 #[cfg(not(feature = "writable"))]
@@ -2519,29 +2575,24 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
             dyn std::future::Future<
                     Output = fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>>,
                 > + Send + 'a,
-        >,
+            >,
     > {
         let parent_ino = parent as u32;
-        let _ = (req, fh, lock_owner);
+        let _ = (req, lock_owner);
         let ttl = Duration::from_secs(5);
 
          Box::pin(async move {
-            let entries = self.with_inner(|fs| {
-                let result = fs.readdirplus(parent_ino, offset);
-                if let Some(ref entries) = result {
-                    for (_name, ino, _kind, _dinode) in entries.iter() {
-                        fs.add_node_state(*ino);
-                    }
-                }
-                result
+            let entries = self.with_inner(|fs| -> Result<_, fuse3::Errno> {
+                Self::validate_handle_static(&fs.handles, fh, parent_ino, true)
+                    .map_err(errno_to_fuse3)?;
+                Ok(fs.readdirplus(parent_ino, offset))
             });
             let attr_ttl = Duration::from_secs(5);
 
-            let stream_items: Vec<std::result::Result<DirectoryEntryPlus, fuse3::Errno>> = match entries {
+            let stream_items: Vec<std::result::Result<DirectoryEntryPlus, fuse3::Errno>> = match entries? {
                 Some(entries) => {
                     let mut items = Vec::new();
-                    let mut cookie: i64 = 1;
-                    for (name, ino, kind, dinode) in entries {
+                    for (name, ino, kind, dinode, cookie) in entries {
                         let file_type = match kind {
                             0x04 => FileType::Directory,
                             0x08 => FileType::RegularFile,
@@ -2554,13 +2605,12 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                             generation: dinode.generation() as u64,
                             kind: file_type,
                             name: std::ffi::OsString::from(name),
-                            offset: offset as i64 + cookie,
+                            offset: cookie as i64,
                             attr,
                             entry_ttl: ttl,
                             attr_ttl,
                         };
                         items.push(Ok(entry));
-                        cookie += 1;
                     }
                     items
                 }
@@ -2658,7 +2708,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         length: u64,
         flags: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyCopyFileRange>> + Send + '_>> {
-        let src_ino = inode as u32;
+         let src_ino = inode as u32;
         let dst_ino = inode_out as u32;
         let _ = req;
 
@@ -2668,6 +2718,11 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                 {
                     if src_ino == dst_ino && off_in == off_out {
                         return Err(EINVAL.into());
+                    }
+                    // FreeBSD sends flags=0. Reject all unknown flag
+                    // combinations rather than inventing behavior.
+                    if flags != 0 {
+                        return Err(EOPNOTSUPP.into());
                     }
                     Self::validate_handle_static(&fs.handles, fh_in, src_ino, false)
                         .map_err(errno_to_fuse3)?;

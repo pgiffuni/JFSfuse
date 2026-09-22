@@ -255,6 +255,6 @@ fn test_readdir_after_fallocate() {
 
     // Verify the file shows up in readdir.
     let entries = fs.readdir(parent, 0).expect("readdir should succeed");
-    let found = entries.iter().any(|(name, _, _)| name == "tf15readdir");
+    let found = entries.iter().any(|(name, _, _, _)| name == "tf15readdir");
     assert!(found, "file should appear in parent readdir");
 }

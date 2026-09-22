@@ -27,8 +27,8 @@ fn find_test_file(fs: &mut FuseFs) -> Option<u32> {
     let entries = fs.readdir(fs.volume.root_ino, 0)?;
     entries
         .iter()
-        .find(|(name, _, _)| name != "." && name != ".." && !name.is_empty())
-        .map(|(_, ino, _)| *ino)
+        .find(|(name, _, _, _)| name != "." && name != ".." && !name.is_empty())
+        .map(|(_, ino, _, _)| *ino)
 }
 
 #[cfg(feature = "writable")]

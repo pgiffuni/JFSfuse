@@ -37,6 +37,9 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+pub mod device_size;
+pub use device_size::get_storage_size;
+
 /// Re-export block types from the types module.
 pub use crate::types::{BLOCK_SIZE, BlockLength, BlockNo, PSIZE};
 
@@ -166,33 +169,8 @@ impl FileStorage {
             .read(true)
             .write(!read_only)
             .open(path)?;
-        let size = {
-            use std::os::unix::fs::FileTypeExt;
-            let meta = file.metadata()?;
-            if meta.file_type().is_block_device() {
-                Self::block_device_size(&file)?
-            } else {
-                meta.len()
-            }
-        };
+        let size = get_storage_size(&file)?;
         Ok(Self { file, size, read_only })
-    }
-
-    /// Query the size of a block device using ioctl(BLKGETSIZE64).
-    /// On Linux, `stat()` returns 0 for block devices, so we must use ioctl
-    /// to get the actual capacity.
-    fn block_device_size(file: &std::fs::File) -> Result<u64> {
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
-        // BLKGETSIZE64 = 0x80081272 on Linux
-        let mut size: u64 = 0;
-        let ret = unsafe {
-            libc::ioctl(fd, 0x80081272u64, &mut size as *mut u64)
-        };
-        if ret < 0 {
-            return Err(StorageError::Io(std::io::Error::last_os_error()));
-        }
-        Ok(size)
     }
 
     pub fn block_to_offset(&self, block: BlockNo) -> u64 {

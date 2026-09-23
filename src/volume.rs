@@ -71,7 +71,7 @@ impl Volume {
     /// Reads the superblock, validates it, reads the journal,
     /// and runs recovery if needed — all before returning.
     pub fn open(path: &str) -> StorageResult<Self> {
-        let storage = Arc::new(FileStorage::open(Path::new(path))?);
+        let storage = Arc::new(FileStorage::open_readonly(Path::new(path))?);
         Self::open_from_storage(storage)
     }
 

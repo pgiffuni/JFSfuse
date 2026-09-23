@@ -406,9 +406,10 @@ impl Volume {
         self.page_cache.flush_all(&*self.storage)?;
 
         // 2. Commit outstanding transactions (journal + metadata).
-        //    If there's an active transaction, commit it. If not, this
-        //    is a no-op (returns Err for "no active transaction" internally).
-        let _ = self.commit_transaction();
+        //    If there's no active transaction, this is a no-op.
+        if self.tx_mgr.has_active_transaction() {
+            self.commit_transaction()?;
+        }
 
         // 3. Flush the journal.
         if let Some(log) = &mut self.log {
@@ -619,8 +620,10 @@ impl Volume {
         self.mark_page_dirty(ino, inode.page_block)?;
 
         // Commit the transaction: journal metadata, flush, write metadata.
-        let result = self.commit_transaction()?;
-        let _ = result;
+        if let Err(e) = self.commit_transaction() {
+            self.abort_transaction();
+            return Err(e);
+        }
 
         Ok(written)
     }
@@ -642,14 +645,23 @@ impl Volume {
         let mut xtree = crate::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
 
         let new_size_val = new_size;
-        let new_eof_fsb = (new_size + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
-        let current_eof_fsb = (inode.size() + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+        let block = BLOCK_SIZE as u64;
+        let new_eof_fsb = (new_size + block - 1) / block;
+        let current_eof_fsb = (inode.size() + block - 1) / block;
 
         if new_eof_fsb < current_eof_fsb {
-            // Shrinking: truncate extents.
+            // Shrinking: truncate extents and free blocks.
             let freed = xtree.truncate_extents(new_eof_fsb as i64);
-            // Record freed blocks (allocator is a stub — not actually freed).
-            let _ = freed;
+
+            // Free the deallocated blocks to the allocator.
+            if let Some(bmap) = self.bmap.as_mut() {
+                for (addr, len) in &freed {
+                    let mut pxd = crate::types::Pxd::default();
+                    pxd.set_length(*len);
+                    pxd.set_address(*addr);
+                    let _ = bmap.free_extent(&pxd);
+                }
+            }
 
             // Update nblocks (number of blocks allocated to the file).
             let new_nblocks = self.compute_nblocks(&xtree, inode.dinode.nblocks())? as u64;
@@ -661,7 +673,25 @@ impl Volume {
                 LittleEndian::write_u64(&mut dinode_bytes[32..40], new_nblocks);
             })?;
         } else if new_eof_fsb > current_eof_fsb {
-            // Growing: add a hole, just update size.
+            // Growing: if extending into a new fragment block, zero the
+            // partial region to prevent stale-data exposure from
+            // previously freed blocks.
+            let old_size = inode.size();
+            let old_byte_offset = old_size % block;
+            if old_byte_offset > 0 && old_byte_offset < block {
+                // Zero-fill the tail of the current block to prevent stale data.
+                let fsb = old_size / block;
+                let extents = xtree.map_blocks(fsb, 1)?;
+                for (block_addr, block_count) in extents {
+                    if block_addr != 0 && block_count > 0 {
+                        let mut block_data = self.storage.read_block(block_addr)?;
+                        for b in old_byte_offset as usize..block as usize {
+                            block_data[b] = 0;
+                        }
+                        self.storage.write_block(block_addr, &block_data)?;
+                    }
+                }
+            }
             self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
                 LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size_val);
             })?;

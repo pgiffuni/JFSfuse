@@ -95,6 +95,11 @@ impl TransactionManager {
         }
     }
 
+    /// Returns `true` if there is an active (uncommitted) transaction.
+    pub fn has_active_transaction(&self) -> bool {
+        self.active.is_some()
+    }
+
     /// Mark a page dirty and associate it with the current transaction.
     ///
     /// The page must already be in the cache. This method records the page
@@ -164,37 +169,47 @@ impl TransactionManager {
         let dirty_pages = active.dirty_pages.clone();
 
         // 1. Flush data blocks first (ordered-data model).
-        storage.flush_data()?;
+        if let Err(e) = storage.flush_data() {
+            self.abort_pages(cache, &dirty_pages);
+            return Err(e);
+        }
 
         // 2. Append journal records for dirty metadata.
         if let Some(jm) = journal {
             for (inode, block) in &dirty_pages {
                 if let Some(page) = cache.get(*inode, *block) {
-                    jm.append_log_record(txid, *block, &page.data)?;
+                    if let Err(e) = jm.append_log_record(txid, *block, &page.data) {
+                        self.abort_pages(cache, &dirty_pages);
+                        return Err(e);
+                    }
                 }
             }
             // Write LOG_COMMIT record and flush the journal.
-            jm.commit_transaction(txid)?;
+            if let Err(e) = jm.commit_transaction(txid) {
+                self.abort_pages(cache, &dirty_pages);
+                return Err(e);
+            }
         }
 
         // 3. Write dirty metadata pages to disk.
         let mut written = 0usize;
         for (inode, block) in &dirty_pages {
             if let Some(page) = cache.get(*inode, *block) {
-                storage.write_block(*block, &page.data)?;
+                if let Err(e) = storage.write_block(*block, &page.data) {
+                    self.abort_pages(cache, &dirty_pages);
+                    return Err(e);
+                }
                 written += 1;
             }
         }
 
         // 4. Flush metadata to durable storage.
-        storage.flush_metadata()?;
+        if let Err(e) = storage.flush_metadata() {
+            self.abort_pages(cache, &dirty_pages);
+            return Err(e);
+        }
 
-        // 5. Invalidate cache pages that were written back. We discard the
-        //    cached copy (rather than just clearing the dirty flag) so that
-        //    the next access re-reads from storage. This is necessary because
-        //    multiple inodes can share the same on-disk block: a page cached
-        //    under inode A may be stale if inode B later committed changes to
-        //    the same block. Removing the entry forces a fresh read.
+        // 5. Invalidate cache pages that were written back.
         for (inode, block) in &dirty_pages {
             cache.unpin_page(*inode, *block);
             cache.release(*inode, *block);
@@ -206,6 +221,19 @@ impl TransactionManager {
             pages_written: written,
             txid,
         })
+    }
+
+    /// Clean up dirty pages from a failed commit, restoring cache state.
+    fn abort_pages(&mut self, cache: &mut PageCache, dirty_pages: &[(u32, u64)]) {
+        for (inode, block) in dirty_pages {
+            if let Some(mut p) = cache.get(*inode, *block) {
+                p.dirty = false;
+                p.txid = 0;
+                p.unpin();
+                let _ = cache.put(*inode, p);
+            }
+            cache.unpin_page(*inode, *block);
+        }
     }
 
     /// Abort the transaction: discard all dirty pages, free allocated

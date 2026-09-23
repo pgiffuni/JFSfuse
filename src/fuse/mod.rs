@@ -809,6 +809,11 @@ impl FuseFs {
         let size = inode.size();
         let block = crate::storage::BLOCK_SIZE as u64;
 
+        // At or past EOF: no data or hole to report.
+        if offset >= size {
+            return None;
+        }
+
         match seek_type {
             SEEK_DATA => {
                 let xtree = Xtree::from_inode_data(inode.xtroot_bytes()).ok()?;
@@ -826,14 +831,15 @@ impl FuseFs {
                     }
                 }
 
-                Some(size)
+                // No data extent at or after offset.
+                None
             }
             SEEK_HOLE => {
                 let xtree = Xtree::from_inode_data(inode.xtroot_bytes()).ok()?;
 
                 for ext in xtree.iter_extents() {
                     let ext_start = ext.offset as u64 * block;
-                    let ext_end = ext_start + ext.length as u64 * block;
+                    let ext_end = std::cmp::min(ext_start + ext.length as u64 * block, size);
 
                     if ext_start > offset {
                         return Some(offset);
@@ -844,10 +850,11 @@ impl FuseFs {
                     }
                 }
 
+                // No more extents — the hole starts at EOF.
                 Some(size)
             }
             _ => None,
-    }
+        }
     }
 }
 
@@ -1234,11 +1241,11 @@ impl FuseFs {
         }
     }
 
-    /// Open a file or directory (writable builds only).
+    /// Open a file or directory.
     ///
     /// Validates that the inode exists and increments the open-handle count
     /// for open-unlinked semantics (inode is retained while open handles exist).
-    #[cfg(feature = "writable")]
+    /// Available in both read-only and writable builds.
     pub fn open(&mut self, ino: u32) -> FuseResult<()> {
         let result = self.volume.open_file(ino);
         match result {
@@ -1247,14 +1254,22 @@ impl FuseFs {
         }
     }
 
-    /// Release an open file handle (writable builds only).
+    /// Release an open file handle.
     ///
     /// Decrements the open-handle count. If the inode's nlink dropped to 0
     /// (via unlink while open) and this was the last handle, the inode's
-    /// data blocks are freed.
-    #[cfg(feature = "writable")]
+    /// data blocks are freed. Available in both read-only and writable builds;
+    /// in read-only mode, no reclamation is needed.
     pub fn release(&mut self, ino: u32) -> FuseResult<()> {
-        self.volume.release_file(ino).map_err(|_| EIO)
+        #[cfg(feature = "writable")]
+        {
+            self.volume.release_file(ino).map_err(|_| EIO)
+        }
+        #[cfg(not(feature = "writable"))]
+        {
+            let _ = ino;
+            Ok(())
+        }
     }
 
     /// Returns the current lookup reference count for an inode (for
@@ -1483,8 +1498,7 @@ impl FuseFs {
             })
     }
 
-    /// Read the target of a symbolic link (writable builds only).
-    #[cfg(feature = "writable")]
+    /// Read the target of a symbolic link.
     pub fn readlink(&mut self, ino: u32) -> FuseResult<Vec<u8>> {
         if !self.writable {
             return Err(EROFS);
@@ -1721,6 +1735,18 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
     }
 
     fn destroy(&self, _req: Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        #[cfg(feature = "writable")]
+        {
+            self.with_inner(|fs| {
+                if fs.is_writable() {
+                    let _ = fs.volume.umount();
+                }
+            })
+        }
+        #[cfg(not(feature = "writable"))]
+        {
+            let _ = req;
+        }
         Box::pin(async {})
     }
 
@@ -2047,23 +2073,15 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         let ino = inode as u32;
         let _ = req;
 
-        Box::pin(async move {
+         Box::pin(async move {
             self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.open(ino).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })?;
-                    let fh = fs.open_handle(ino, false);
-                    let _ = flags;
-                    Ok(ReplyOpen { fh, flags: 0 })
-                }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, flags);
-                    Err(EROFS.into())
-                }
+                fs.open(ino).map_err(|e| {
+                    let code: i32 = e;
+                    errno_to_fuse3(code)
+                })?;
+                let fh = fs.open_handle(ino, false);
+                let _ = flags;
+                Ok(ReplyOpen { fh, flags: 0 })
             })
         })
     }
@@ -2164,7 +2182,9 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                 }
                 #[cfg(not(feature = "writable"))]
                 {
+                    let _ = (flush, lock_owner);
                     let _ = fs.release_handle(fh);
+                    fs.release(ino)?;
                     Ok(())
                 }
             })
@@ -2410,15 +2430,8 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         let ino = inode as u32;
         Box::pin(async move {
             self.with_inner(|fs| -> FuseResult<()> {
-                #[cfg(feature = "writable")]
-                {
-                    let _ = fs.release_handle(fh);
-                    fs.release(ino)?;
-                }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = fs.release_handle(fh);
-                }
+                let _ = fs.release_handle(fh);
+                fs.release(ino)?;
                 Ok(())
             })?;
             Ok(())
@@ -2476,6 +2489,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                     let ino = fs.create(parent_ino, &name_str, mode).ok_or(EIO)?;
                     let dinode = fs.getattr(ino).ok_or(ENOENT)?;
                     let attr = Self::dinode_attr(fs, ino, &dinode);
+                    fs.open(ino).map_err(|e| errno_to_fuse3(e))?;
                     let fh = fs.open_handle(ino, false);
                     Ok(ReplyCreated {
                         ttl,

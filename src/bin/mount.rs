@@ -19,10 +19,28 @@ async fn main() -> ExitCode {
     let read_only = args.iter().skip(3).any(|a| a == "--ro");
     let allow_other = args.iter().skip(3).any(|a| a == "--allow-other");
 
-    let vol = match Volume::open(device.to_str().unwrap()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error opening volume: {}", e);
+    let vol = if read_only {
+        match Volume::open(device.to_str().unwrap()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error opening volume: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        #[cfg(feature = "writable")]
+        {
+            match Volume::mount(device.to_str().unwrap()) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error mounting volume: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "writable"))]
+        {
+            eprintln!("Writable mount requested but filesystem built without writable feature");
             return ExitCode::from(1);
         }
     };
@@ -49,12 +67,11 @@ async fn main() -> ExitCode {
     let session = Session::new(mount_options);
 
     match session.mount(fuse_fs, &mountpoint).await {
-        Ok(_handle) => {
+        Ok(handle) => {
             println!("Mounted JFS at {}", mountpoint.display());
-            // The mount handle must be kept alive; dropping it unmounts.
-            // For a daemon, we'd daemonize and wait on a signal.
             eprintln!("Press Ctrl+C to unmount.");
             let _ = tokio::signal::ctrl_c().await;
+            let _ = handle.unmount().await;
             ExitCode::SUCCESS
         }
         Err(e) => {

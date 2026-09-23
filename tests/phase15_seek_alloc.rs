@@ -106,21 +106,13 @@ fn test_lseek_data_past_eof() {
     let data = vec![0x77u8; BLOCK_SIZE];
     fs.write(ino, 0, &data).expect("write should succeed");
 
-    // SEEK_DATA past EOF should return file size.
-    let result = fs.lseek_data_or_hole(ino, 10 * BLOCK_SIZE as u64, 3).expect("lseek should succeed");
-    assert_eq!(
-        result, BLOCK_SIZE as u64,
-        "SEEK_DATA past last extent should return file size"
-    );
+    // SEEK_DATA past EOF should return ENXIO (None → converted to error).
+    let result = fs.lseek_data_or_hole(ino, 10 * BLOCK_SIZE as u64, 3);
+    assert!(result.is_none(), "SEEK_DATA past EOF should return ENXIO");
 
-    // SEEK_HOLE past last extent should return file size.
-    let result = fs
-        .lseek_data_or_hole(ino, 10 * BLOCK_SIZE as u64, 4)
-        .expect("lseek should succeed");
-    assert_eq!(
-        result, BLOCK_SIZE as u64,
-        "SEEK_HOLE past last extent should return file size"
-    );
+    // SEEK_HOLE past EOF should return ENXIO (None → converted to error).
+    let result = fs.lseek_data_or_hole(ino, 10 * BLOCK_SIZE as u64, 4);
+    assert!(result.is_none(), "SEEK_HOLE past EOF should return ENXIO");
 }
 
 #[cfg(feature = "writable")]

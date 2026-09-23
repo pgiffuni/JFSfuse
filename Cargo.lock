@@ -199,6 +199,7 @@ dependencies = [
  "byteorder",
  "fuse3",
  "futures-util",
+ "libc",
  "log",
  "lru",
  "thiserror",

@@ -22,6 +22,7 @@ uuid = { version = "1.10", features = ["v4"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+libc = "0.2"
 
 [[bin]]
 name = "jfsfuse-mount"

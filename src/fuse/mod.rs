@@ -2504,10 +2504,14 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
         })
     }
 
-    fn bmap(&self, _req: Request, inode: fuse3::Inode, _blocksize: u32, idx: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<fuse3::raw::reply::ReplyBmap>> + Send + '_>> {
+    fn bmap(&self, _req: Request, inode: fuse3::Inode, blocksize: u32, idx: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<fuse3::raw::reply::ReplyBmap>> + Send + '_>> {
         let ino = inode as u32;
         Box::pin(async move {
             self.with_inner(|fs| {
+                let fs_block_size = crate::storage::BLOCK_SIZE as u32;
+                if blocksize != 0 && blocksize != fs_block_size {
+                    return Err(EINVAL.into());
+                }
                 let (block, _nblocks) = fs.bmap(ino, idx).map_err(|e| {
                     let code: i32 = e;
                     errno_to_fuse3(code)

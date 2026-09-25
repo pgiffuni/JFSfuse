@@ -81,6 +81,36 @@ pub enum StorageError {
     },
     #[error("operation interrupted by FUSE_INTERRUPT")]
     Interrupted,
+    #[error("xattr not found")]
+    XattrNotFound,
+    #[error("xattr already exists")]
+    XattrAlreadyExists,
+    #[error("xattr name too long")]
+    XattrNameTooLong,
+    #[error("xattr value too large")]
+    XattrValueTooLarge,
+    #[error("xattr data too large for inline storage")]
+    XattrDataTooLarge,
+    #[error("directory entry already exists")]
+    AlreadyExists,
+    #[error("invalid filename or name")]
+    InvalidName,
+    #[error("no free inodes available")]
+    NoFreeInode,
+    #[error("not a directory")]
+    NotADirectory,
+    #[error("directory not empty")]
+    DirectoryNotEmpty,
+    #[error("not found")]
+    NotFound,
+    #[error("invalid file type for operation")]
+    InvalidFileType,
+    #[error("operation not supported")]
+    NotSupported,
+    #[error("cannot hard-link a directory")]
+    CannotLinkDir,
+    #[error("xattr buffer too small, needed {needed} bytes")]
+    XattrBufferTooSmall { needed: usize },
     #[error("{0}")]
     Other(String),
 }

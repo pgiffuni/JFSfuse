@@ -1155,7 +1155,7 @@ impl Volume {
             }
         }
 
-        Err(StorageError::Other("no free inode found".to_string()))
+        Err(StorageError::NoFreeInode)
     }
 
     /// Insert a directory entry for `child_ino` with the given name in the
@@ -1226,7 +1226,7 @@ impl Volume {
                 }
                 None => {
                     self.abort_transaction();
-                    return Err(StorageError::Other("no such file or directory".to_string()));
+                    return Err(StorageError::NotFound);
                 }
             }
         };
@@ -1423,7 +1423,7 @@ impl Volume {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         if name_u16.is_empty() || name_u16.len() > 11 {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid filename length".to_string()));
+            return Err(StorageError::InvalidName);
         }
 
         // Initialize the child inode: regular file mode (0x81a4), empty size.
@@ -1451,7 +1451,7 @@ impl Volume {
         let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
         if !inserted {
             self.abort_transaction();
-            return Err(StorageError::Other("directory entry already exists".to_string()));
+            return Err(StorageError::AlreadyExists);
         }
 
         // 4. Update parent link count (directories have link counts; regular
@@ -1483,7 +1483,7 @@ impl Volume {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         if name_u16.is_empty() || name_u16.len() > 11 {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid filename length".to_string()));
+            return Err(StorageError::InvalidName);
         }
 
         // 3. Initialize the child inode as a directory.
@@ -1558,7 +1558,7 @@ impl Volume {
         let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
         if !inserted {
             self.abort_transaction();
-            return Err(StorageError::Other("directory entry already exists".to_string()));
+            return Err(StorageError::AlreadyExists);
         }
 
         // 5. Increment parent's link count (directories have subdirectory link count).
@@ -1592,14 +1592,14 @@ impl Volume {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         if name_u16.is_empty() || name_u16.len() > 11 {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid filename length".to_string()));
+            return Err(StorageError::InvalidName);
         }
 
         // Validate file type.
         let file_type = mode & 0xf000;
         if !matches!(file_type, 0x1000 | 0x2000 | 0x6000 | 0xC000) {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid file type for mknod".to_string()));
+            return Err(StorageError::InvalidFileType);
         }
 
         // Allocate a new inode.
@@ -1640,7 +1640,7 @@ impl Volume {
         let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
         if !inserted {
             self.abort_transaction();
-            return Err(StorageError::Other("directory entry already exists".to_string()));
+            return Err(StorageError::AlreadyExists);
         }
 
         // Mark parent page dirty.
@@ -1682,7 +1682,7 @@ impl Volume {
         let child = crate::inode::Inode::read(self, child_ino)?;
         if !child.is_dir() {
             self.abort_transaction();
-            return Err(StorageError::Other("not a directory".to_string()));
+            return Err(StorageError::NotADirectory);
         }
 
         // 3. Verify the directory is empty (only `.` and `..`).
@@ -1690,7 +1690,7 @@ impl Volume {
         let num_entries = dtree.len_entries();
         if num_entries > 2 {
             self.abort_transaction();
-            return Err(StorageError::Other("directory not empty".to_string()));
+            return Err(StorageError::DirectoryNotEmpty);
         }
 
         // 4. Free the child inode (set mode to 0 = unused).
@@ -1750,7 +1750,7 @@ impl Volume {
         // Directories can only have nlink == 0 (already removed via rmdir).
         if is_dir {
             self.abort_transaction();
-            return Err(StorageError::Other("use rmdir for directories".to_string()));
+            return Err(StorageError::InvalidFileType);
         }
 
         let new_nlink = current_nlink.saturating_sub(1);
@@ -1824,14 +1824,14 @@ impl Volume {
         // 2. Reject hard links to directories.
         if target.is_dir() {
             let _ = self.abort_transaction();
-            return Err(StorageError::Other("cannot hard-link a directory".to_string()));
+            return Err(StorageError::CannotLinkDir);
         }
 
         // 3. Validate name.
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         if name_u16.is_empty() || name_u16.len() > 11 {
             let _ = self.abort_transaction();
-            return Err(StorageError::Other("invalid filename length".to_string()));
+            return Err(StorageError::InvalidName);
         }
 
         // 4. Insert directory entry in parent.
@@ -1843,7 +1843,7 @@ impl Volume {
         let inserted = self.insert_dir_entry(parent_ino, &name_u16, target_ino, index)?;
         if !inserted {
             let _ = self.abort_transaction();
-            return Err(StorageError::Other("directory entry already exists".to_string()));
+            return Err(StorageError::AlreadyExists);
         }
 
         // 5. Increment target's nlink.
@@ -1900,7 +1900,7 @@ impl Volume {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         if name_u16.is_empty() || name_u16.len() > 11 {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid filename length".to_string()));
+            return Err(StorageError::InvalidName);
         }
 
         // 3. Initialize the child inode as a symlink.
@@ -1909,7 +1909,7 @@ impl Volume {
 
         if !use_inline {
             self.abort_transaction();
-            return Err(StorageError::Other("long symlinks not yet supported".to_string()));
+            return Err(StorageError::NotSupported);
         }
 
         self.update_inode_page(child_ino, _child_block, _child_off, |dinode_bytes| {
@@ -1944,7 +1944,7 @@ impl Volume {
         let inserted = self.insert_dir_entry(parent_ino, &name_u16, child_ino, index)?;
         if !inserted {
             self.abort_transaction();
-            return Err(StorageError::Other("directory entry already exists".to_string()));
+            return Err(StorageError::AlreadyExists);
         }
 
         // 5. Mark parent dirty.
@@ -2046,11 +2046,11 @@ impl Volume {
 
         if name_bytes.len() > 255 {
             self.abort_transaction();
-            return Err(StorageError::Other("xattr name too long".to_string()));
+            return Err(StorageError::XattrNameTooLong);
         }
         if value.len() > crate::types::IXATTRSIZE {
             self.abort_transaction();
-            return Err(StorageError::Other("xattr value too large for inline storage".to_string()));
+            return Err(StorageError::XattrValueTooLarge);
         }
 
         // Parse existing xattrs from the inode's union area.
@@ -2061,11 +2061,11 @@ impl Volume {
         let exists = parsed.iter().any(|(n, _)| n == name_bytes);
         if flags & XATTR_CREATE != 0 && exists {
             self.abort_transaction();
-            return Err(StorageError::Other("xattr already exists".to_string()));
+            return Err(StorageError::XattrAlreadyExists);
         }
         if flags & XATTR_REPLACE != 0 && !exists {
             self.abort_transaction();
-            return Err(StorageError::Other("xattr does not exist".to_string()));
+            return Err(StorageError::XattrNotFound);
         }
 
         // Build new xattr list: replace existing entry or append.
@@ -2084,7 +2084,7 @@ impl Volume {
         // Check total size fits in IXATTRSIZE (128 bytes).
         if new_list.len() > crate::types::IXATTRSIZE {
             self.abort_transaction();
-            return Err(StorageError::Other("xattr data too large".to_string()));
+            return Err(StorageError::XattrDataTooLarge);
         }
 
         let ea_size = new_list.len() as u32;

@@ -27,6 +27,7 @@ use futures_util::stream::Stream;
 
 use crate::btree::dtree::{Dtree, DirectoryCursor, DirEntry};
 use crate::btree::xtree::Xtree;
+use crate::storage::StorageError;
 pub mod abi;
 pub mod interrupt;
 pub use interrupt::{InterruptFlag, InterruptManager, InterruptToken, RequestId};
@@ -1411,18 +1412,7 @@ impl FuseFs {
             return Err(EROFS);
         }
         let name = translate_xattr_name(name);
-        self.volume.setxattr(ino, &name, value, flags).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("already exists") {
-                EEXIST
-            } else if msg.contains("does not exist") {
-                ENOENT
-            } else if msg.contains("too long") || msg.contains("too large") {
-                EOPNOTSUPP
-            } else {
-                EIO
-            }
-        })
+        self.volume.setxattr(ino, &name, value, flags).map_err(|e| storage_error_to_errno(&e))
     }
 
     /// Get an extended attribute value (writable builds only).
@@ -1434,7 +1424,7 @@ impl FuseFs {
             return Err(EROFS);
         }
         let name = translate_xattr_name(name);
-        self.volume.getxattr(ino, &name).map_err(|_| EIO)
+        self.volume.getxattr(ino, &name).map_err(|e| storage_error_to_errno(&e))
     }
 
     /// Create a symbolic link (writable builds only).
@@ -1451,20 +1441,7 @@ impl FuseFs {
                 self.add_node_state(ino);
                 ino
             })
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("already exists") {
-                    EEXIST
-                } else if msg.contains("invalid filename") {
-                    EINVAL
-                } else if msg.contains("no free inode") {
-                    ENOSPC
-                } else if msg.contains("long symlinks not yet supported") {
-                    EOPNOTSUPP
-                } else {
-                    EIO
-                }
-            })
+            .map_err(|e| storage_error_to_errno(&e))
     }
 
     /// Create a special file (FIFO, char/block device, socket) in a directory.
@@ -1482,20 +1459,7 @@ impl FuseFs {
                 self.add_node_state(ino);
                 ino
             })
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("already exists") {
-                    EEXIST
-                } else if msg.contains("invalid filename") {
-                    EINVAL
-                } else if msg.contains("invalid file type") {
-                    EPERM
-                } else if msg.contains("no free inode") {
-                    ENOSPC
-                } else {
-                    EIO
-                }
-            })
+            .map_err(|e| storage_error_to_errno(&e))
     }
 
     /// Read the target of a symbolic link.
@@ -1520,11 +1484,11 @@ impl FuseFs {
             return Err(EROFS);
         }
         let name = translate_xattr_name(name);
-        self.volume.removexattr(ino, &name).map_err(|_| EIO).and_then(|ok| {
+        self.volume.removexattr(ino, &name).map_err(|e| storage_error_to_errno(&e)).and_then(|ok| {
             if ok {
                 Ok(())
             } else {
-                Err(ENOENT)
+                Err(ENODATA)
             }
         })
     }
@@ -1535,7 +1499,7 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        let names = self.volume.listxattr(ino).map_err(|_| EIO)?;
+        let names = self.volume.listxattr(ino).map_err(|e| storage_error_to_errno(&e))?;
         Ok(names.into_iter().map(|n| reverse_xattr_name(&n)).collect())
     }
 
@@ -1548,18 +1512,7 @@ impl FuseFs {
         if !self.writable {
             return Err(EROFS);
         }
-        self.volume.link_file(parent_ino, name, target_ino).map(|_| ()).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("already exists") {
-                EEXIST
-            } else if msg.contains("cannot hard-link a directory") {
-                EPERM
-            } else if msg.contains("invalid filename") {
-                EINVAL
-            } else {
-                EIO
-            }
-        })
+        self.volume.link_file(parent_ino, name, target_ino).map(|_| ()).map_err(|e| storage_error_to_errno(&e))
     }
 
     /// Get file lock (FUSE_GETLK).
@@ -1695,6 +1648,52 @@ pub struct Fuse3Fs {
 /// Convert an i32 errno to a `fuse3::Errno`.
 pub fn errno_to_fuse3(code: i32) -> fuse3::Errno {
     fuse3::Errno::from(code)
+}
+
+/// FreeBSD-compatible errno constants.
+///
+/// These use Linux errno values because the FUSE protocol requires them.
+/// On FreeBSD, `ENOSYS` is preferred over `EOPNOTSUPP` for filesystem
+/// operations; we normalize via [`errno_to_fuse3`] at the call site.
+pub const ENODATA: i32 = 61;
+pub const E2BIG: i32 = 7;
+pub const ENAMETOOLONG: i32 = 36;
+
+/// Map a `StorageError` to a FUSE errno code.
+///
+/// This replaces the old string-matching approach with proper variant checks.
+/// On FreeBSD, `ENOSYS` (78) is preferred over `EOPNOTSUPP` (95) for
+/// unsupported operations — the FUSE daemon normalizes both to the Linux
+/// errno value as the FUSE protocol requires.
+pub fn storage_error_to_errno(e: &StorageError) -> i32 {
+    use StorageError::*;
+    match e {
+        XattrNotFound => ENODATA,
+        XattrAlreadyExists | AlreadyExists => EEXIST,
+        XattrNameTooLong => ENAMETOOLONG,
+        XattrValueTooLarge | XattrDataTooLarge => E2BIG,
+        XattrBufferTooSmall { .. } => ERANGE,
+        NoFreeInode => ENOSPC,
+        InvalidName => EINVAL,
+        NotADirectory => ENOTDIR,
+        DirectoryNotEmpty => ENOTEMPTY,
+        NotFound => ENOENT,
+        InvalidFileType | CannotLinkDir => EPERM,
+        NotSupported => EOPNOTSUPP,
+        Interrupted => EINTR,
+        FaultInjection => EIO,
+        _ => EIO,
+    }
+}
+
+/// FreeBSD-compatible errno for unsupported operations.
+///
+/// On FreeBSD, `ENOSYS` (78) is preferred over `EOPNOTSUPP` (95) for
+/// filesystem-level "not supported" conditions. Both are valid; callers
+/// targeting FreeBSD should use this function.
+#[cfg(target_os = "freebsd")]
+pub fn unsupported_errno() -> i32 {
+    78 // ENOSYS
 }
 
 impl Fuse3Fs {
@@ -2274,7 +2273,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                                 Err(fuse3::Errno::from(ERANGE))
                             }
                         }
-                        None => Err(fuse3::Errno::from(ENOENT)),
+                        None => Err(fuse3::Errno::from(ENODATA)),
                     }
                 }
                 #[cfg(not(feature = "writable"))]
@@ -2829,5 +2828,64 @@ impl Fuse3Fs {
             Some(_) => Err(EBADF),
             None => Err(EBADF),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::StorageError;
+
+    #[test]
+    fn test_xattr_errno_mapping() {
+        assert_eq!(storage_error_to_errno(&StorageError::XattrNotFound), ENODATA);
+        assert_eq!(storage_error_to_errno(&StorageError::XattrAlreadyExists), EEXIST);
+        assert_eq!(storage_error_to_errno(&StorageError::XattrNameTooLong), ENAMETOOLONG);
+        assert_eq!(storage_error_to_errno(&StorageError::XattrValueTooLarge), E2BIG);
+        assert_eq!(
+            storage_error_to_errno(&StorageError::XattrDataTooLarge),
+            E2BIG
+        );
+        assert_eq!(
+            storage_error_to_errno(&StorageError::XattrBufferTooSmall { needed: 128 }),
+            ERANGE
+        );
+    }
+
+    #[test]
+    fn test_fs_errno_mapping() {
+        assert_eq!(storage_error_to_errno(&StorageError::AlreadyExists), EEXIST);
+        assert_eq!(storage_error_to_errno(&StorageError::InvalidName), EINVAL);
+        assert_eq!(storage_error_to_errno(&StorageError::NoFreeInode), ENOSPC);
+        assert_eq!(storage_error_to_errno(&StorageError::NotADirectory), ENOTDIR);
+        assert_eq!(storage_error_to_errno(&StorageError::DirectoryNotEmpty), ENOTEMPTY);
+        assert_eq!(storage_error_to_errno(&StorageError::NotFound), ENOENT);
+        assert_eq!(storage_error_to_errno(&StorageError::InvalidFileType), EPERM);
+        assert_eq!(storage_error_to_errno(&StorageError::NotSupported), EOPNOTSUPP);
+        assert_eq!(storage_error_to_errno(&StorageError::CannotLinkDir), EPERM);
+        assert_eq!(storage_error_to_errno(&StorageError::Interrupted), EINTR);
+    }
+
+    #[test]
+    fn test_fallback_errno_mapping() {
+        assert_eq!(storage_error_to_errno(&StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "test"
+        ))), EIO);
+        assert_eq!(storage_error_to_errno(&StorageError::Other("something".to_string())), EIO);
+    }
+
+    #[test]
+    fn test_translate_xattr_name() {
+        assert_eq!(translate_xattr_name("user.foo"), "foo");
+        assert_eq!(translate_xattr_name("system.bar"), "system.bar");
+        assert_eq!(translate_xattr_name("bare"), "bare");
+    }
+
+    #[test]
+    fn test_reverse_xattr_name() {
+        assert_eq!(reverse_xattr_name("foo"), "user.foo");
+        assert_eq!(reverse_xattr_name("user.foo"), "user.foo");
+        assert_eq!(reverse_xattr_name("system.bar"), "system.bar");
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 use std::path::PathBuf;
 use std::process::ExitCode;
 

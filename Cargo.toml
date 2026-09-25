@@ -3,7 +3,7 @@ name = "jfsfuse"
 version = "0.1.0"
 edition = "2024"
 description = "JFS for FUSE on Rust"
-license = "MIT OR GPL-2.0-or-later"
+license = "BSD-2-Clause OR GPL-2.0-or-later"
 
 [features]
 default = ["std", "writable"]
@@ -38,3 +38,4 @@ path = "src/bin/newjfs.rs"
 
 [dev-dependencies]
 byteorder = "1.5"
+tempfile = "3"

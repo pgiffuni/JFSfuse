@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! FUSE_INTERRUPT support — cancellable long-running operations.
 //!
 //! ## Design

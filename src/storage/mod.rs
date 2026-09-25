@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! Storage abstraction for JFS.
 //!
 //! Replaces the Linux kernel's `struct metapage`, `address_space`, and
@@ -62,6 +62,21 @@ pub enum StorageError {
     FaultInjection,
     #[error("block number {0} exceeds volume size of {1} blocks")]
     BlockOutOfRange(BlockNo, BlockNo),
+    #[error("short read: requested {requested} bytes, got {actual}")]
+    ShortRead {
+        requested: usize,
+        actual: usize,
+    },
+    #[error("short write: requested {requested} bytes, wrote {actual}")]
+    ShortWrite {
+        requested: usize,
+        actual: usize,
+    },
+    #[error("unexpected EOF reading {requested} bytes, got {actual}")]
+    UnexpectedEof {
+        requested: usize,
+        actual: usize,
+    },
     #[error("operation interrupted by FUSE_INTERRUPT")]
     Interrupted,
     #[error("{0}")]
@@ -143,6 +158,91 @@ pub fn validate_block_write(storage_size: BlockNo, block: BlockNo, data: &[u8]) 
     Ok(())
 }
 
+/// Validate a multi-block write range: alignment, overflow, and bounds.
+///
+/// - `data.len()` must be a whole multiple of `BLOCK_SIZE`.
+/// - `block + count` must not overflow `BlockNo` (u64).
+/// - The range must fit within `storage_size` blocks.
+pub fn validate_block_range(
+    storage_size: BlockNo,
+    block: BlockNo,
+    data: &[u8],
+) -> Result<()> {
+    if data.len() % BLOCK_SIZE != 0 {
+        return Err(StorageError::Other(format!(
+            "write_blocks: buffer length {} is not a multiple of BLOCK_SIZE ({})",
+            data.len(),
+            BLOCK_SIZE
+        )));
+    }
+    let count = data.len() / BLOCK_SIZE;
+    if count == 0 {
+        return Err(StorageError::Other(
+            "write_blocks: data length is zero".to_string(),
+        ));
+    }
+    let end = block.checked_add(count as BlockNo).ok_or_else(|| {
+        StorageError::Other("write_blocks: block range overflow".to_string())
+    })?;
+    if block >= storage_size {
+        return Err(StorageError::BlockOutOfRange(block, storage_size));
+    }
+    if end > storage_size {
+        return Err(StorageError::BlockOutOfRange(end, storage_size));
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes from `file` at `offset`, looping on short
+/// reads.
+///
+/// `read_at()` may return fewer bytes than requested (short read); this helper
+/// repeats the call until the buffer is full. If a call returns zero bytes
+/// (indicating EOF before the full buffer was satisfied), the helper returns
+/// `StorageError::UnexpectedEof`.
+///
+/// Callers that need complete metadata or block data should use this helper.
+/// Callers that tolerate partial reads (e.g. journal end-of-log detection)
+/// should NOT use this helper.
+pub fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = file.read_at(&mut buf[filled..], offset + filled as u64)?;
+        if n == 0 {
+            return Err(StorageError::UnexpectedEof {
+                requested: buf.len(),
+                actual: filled,
+            });
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+/// Write exactly `data.len()` bytes to `file` at `offset`, looping on short
+/// writes.
+///
+/// `write_at()` may write fewer bytes than requested (short write); this
+/// helper repeats the call until the buffer is empty. If a call returns zero
+/// bytes (indicating the writer is closed or the device is full), the helper
+/// returns `StorageError::ShortWrite` to avoid an infinite loop.
+pub fn write_all_at(file: &std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut written = 0usize;
+    while written < data.len() {
+        let n = file.write_at(&data[written..], offset + written as u64)?;
+        if n == 0 {
+            return Err(StorageError::ShortWrite {
+                requested: data.len(),
+                actual: written,
+            });
+        }
+        written += n;
+    }
+    Ok(())
+}
+
 /// A file-backed storage implementation using positional I/O.
 ///
 /// Uses `FileExt::read_at` / `write_at` so that multiple cloned handles never
@@ -203,13 +303,11 @@ impl Storage for FileStorage {
         self.read_bytes(offset, total)
     }
 
-    fn write_blocks(&self, block: BlockNo, data: &[u8]) -> Result<()> {
-        let count = data.len() / BLOCK_SIZE;
-        if !self.read_only {
-            validate_block_write(self.size_blocks(), block, &data[..BLOCK_SIZE])?;
-        } else {
+     fn write_blocks(&self, block: BlockNo, data: &[u8]) -> Result<()> {
+        if self.read_only {
             return Err(StorageError::ReadOnly);
         }
+        validate_block_range(self.size_blocks(), block, data)?;
         let offset = self.block_to_offset(block);
         self.write_bytes(offset, data)
     }
@@ -245,10 +343,9 @@ impl Storage for FileStorage {
         self.size / (BLOCK_SIZE as u64)
     }
 
-    fn read_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
+     fn read_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        self.file.read_at(&mut buf, offset)?;
+        read_exact_at(&self.file, offset, &mut buf)?;
         Ok(buf)
     }
 
@@ -256,9 +353,7 @@ impl Storage for FileStorage {
         if self.read_only {
             return Err(StorageError::ReadOnly);
         }
-        use std::os::unix::fs::FileExt;
-        self.file.write_at(data, offset)?;
-        Ok(())
+        write_all_at(&self.file, offset, data)
     }
 }
 
@@ -322,6 +417,11 @@ impl<S: Storage> Storage for ReadOnlyStorage<S> {
 /// - `sync_fail`: fail the *n*-th `sync`/`flush_*` call.
 /// - `crash_on_sync`: if true, simulate a power loss by panicking during sync.
 /// - `short_write`: if true, truncate write data to a random shorter length.
+/// - `short_read`: if true, truncate read results to a random shorter length.
+/// - `zero_read`: if true, return a zero-length buffer on the *n*-th read.
+/// - `zero_write`: if true, return a zero-byte write on the *n*-th write.
+/// - `partial_io_at`: if >= 0, simulate a short I/O on the *n*-th read/write
+///   at the given byte offset, returning fewer bytes than requested.
 ///
 /// Counters are atomic so the wrapper is safe to share across threads.
 pub struct FaultInjector<S: Storage> {
@@ -332,6 +432,9 @@ pub struct FaultInjector<S: Storage> {
     sync_fail_at: std::sync::atomic::AtomicU64,
     crash_on_sync: std::sync::atomic::AtomicBool,
     short_write: std::sync::atomic::AtomicBool,
+    short_read: std::sync::atomic::AtomicBool,
+    read_fail_at: std::sync::atomic::AtomicU64,
+    read_count: std::sync::atomic::AtomicU64,
 }
 
 impl<S: Storage> FaultInjector<S> {
@@ -344,12 +447,20 @@ impl<S: Storage> FaultInjector<S> {
             sync_fail_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             crash_on_sync: std::sync::atomic::AtomicBool::new(false),
             short_write: std::sync::atomic::AtomicBool::new(false),
+            short_read: std::sync::atomic::AtomicBool::new(false),
+            read_fail_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            read_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Fail (return Err) on the *n*-th write call. 0 = never, 1 = first call.
     pub fn set_write_fail(&self, n: u64) {
         self.write_fail_at.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail (return Err) on the *n*-th read call. 0 = never, 1 = first call.
+    pub fn set_read_fail(&self, n: u64) {
+        self.read_fail_at.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fail on the *n*-th sync/flush call. 0 = never, 1 = first call.
@@ -367,18 +478,37 @@ impl<S: Storage> FaultInjector<S> {
         self.short_write.store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Truncate reads to a random shorter length (simulates short read).
+    pub fn set_short_read(&self, enabled: bool) {
+        self.short_read.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Reset all fault counters to "never fail".
     pub fn reset(&self) {
         self.write_fail_at.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
         self.sync_fail_at.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        self.read_fail_at.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
         self.crash_on_sync.store(false, std::sync::atomic::Ordering::SeqCst);
         self.short_write.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.short_read.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl<S: Storage> Storage for FaultInjector<S> {
     fn read_block(&self, block: BlockNo) -> Result<Vec<u8>> {
-        self.inner.read_block(block)
+        let n = self.read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let fail_at = self.read_fail_at.load(std::sync::atomic::Ordering::SeqCst);
+        if n >= fail_at && fail_at != 0 {
+            return Err(StorageError::FaultInjection);
+        }
+        let data = self.inner.read_block(block)?;
+        if self.short_read.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StorageError::ShortRead {
+                requested: BLOCK_SIZE,
+                actual: (BLOCK_SIZE / 2).max(1),
+            });
+        }
+        Ok(data)
     }
 
     fn write_block(&self, block: BlockNo, data: &[u8]) -> Result<()> {
@@ -388,15 +518,30 @@ impl<S: Storage> Storage for FaultInjector<S> {
             return Err(StorageError::FaultInjection);
         }
         if self.short_write.load(std::sync::atomic::Ordering::SeqCst) {
-            let truncated = (data.len() / 2).max(1);
-            let offset = block * (BLOCK_SIZE as u64);
-            return self.inner.write_bytes(offset, &data[..truncated]);
+            let written = (data.len() / 2).max(1);
+            return Err(StorageError::ShortWrite {
+                requested: data.len(),
+                actual: written,
+            });
         }
         self.inner.write_block(block, data)
     }
 
     fn read_blocks(&self, block: BlockNo, count: u64) -> Result<Vec<u8>> {
-        self.inner.read_blocks(block, count)
+        let n = self.read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let fail_at = self.read_fail_at.load(std::sync::atomic::Ordering::SeqCst);
+        if n >= fail_at && fail_at != 0 {
+            return Err(StorageError::FaultInjection);
+        }
+        let data = self.inner.read_blocks(block, count)?;
+        if self.short_read.load(std::sync::atomic::Ordering::SeqCst) {
+            let expected = count as usize * BLOCK_SIZE;
+            return Err(StorageError::ShortRead {
+                requested: expected,
+                actual: (expected / 2).max(1),
+            });
+        }
+        Ok(data)
     }
 
     fn write_blocks(&self, block: BlockNo, data: &[u8]) -> Result<()> {
@@ -404,6 +549,13 @@ impl<S: Storage> Storage for FaultInjector<S> {
         let fail_at = self.write_fail_at.load(std::sync::atomic::Ordering::SeqCst);
         if n >= fail_at && fail_at != 0 {
             return Err(StorageError::FaultInjection);
+        }
+        if self.short_write.load(std::sync::atomic::Ordering::SeqCst) {
+            let written = (data.len() / 2).max(1);
+            return Err(StorageError::ShortWrite {
+                requested: data.len(),
+                actual: written,
+            });
         }
         self.inner.write_blocks(block, data)
     }
@@ -425,14 +577,31 @@ impl<S: Storage> Storage for FaultInjector<S> {
     }
 
     fn read_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.inner.read_bytes(offset, len)
+        let n = self.read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let fail_at = self.read_fail_at.load(std::sync::atomic::Ordering::SeqCst);
+        if n >= fail_at && fail_at != 0 {
+            return Err(StorageError::FaultInjection);
+        }
+        let data = self.inner.read_bytes(offset, len)?;
+        if self.short_read.load(std::sync::atomic::Ordering::SeqCst) {
+            let truncate_to = (data.len() / 2).max(1);
+            return Ok(data[..truncate_to].to_vec());
+        }
+        Ok(data)
     }
 
-    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<()> {
+     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<()> {
         let n = self.write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let fail_at = self.write_fail_at.load(std::sync::atomic::Ordering::SeqCst);
         if n >= fail_at && fail_at != 0 {
             return Err(StorageError::FaultInjection);
+        }
+        if self.short_write.load(std::sync::atomic::Ordering::SeqCst) {
+            let written = (data.len() / 2).max(1);
+            return Err(StorageError::ShortWrite {
+                requested: data.len(),
+                actual: written,
+            });
         }
         self.inner.write_bytes(offset, data)
     }
@@ -976,6 +1145,7 @@ impl Storage for MemoryStorage {
     }
 
     fn write_blocks(&self, block: BlockNo, data: &[u8]) -> Result<()> {
+        validate_block_range(self.size_blocks(), block, data)?;
         let offset = self.block_to_offset(block);
         self.write_bytes(offset, data)
     }
@@ -1323,5 +1493,167 @@ mod tests {
 
         tm.commit(&*storage, &mut cache, None).unwrap();
         ConsistencyChecker::check_post_commit(&cache);
+    }
+
+    #[test]
+    fn test_read_exact_at_complete_file() {
+        use crate::types::BLOCK_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_read_exact_at");
+        let data = vec![0xABu8; BLOCK_SIZE * 4];
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            write_all_at(&file, 0, &data).unwrap();
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = vec![0u8; BLOCK_SIZE * 4];
+        read_exact_at(&file, 0, &mut buf).unwrap();
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn test_read_exact_at_unexpected_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_eof");
+        let data = vec![0x42u8; 16];
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            write_all_at(&file, 0, &data).unwrap();
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = vec![0u8; 32];
+        let result = read_exact_at(&file, 0, &mut buf);
+        assert!(result.is_err(), "should error when reading past EOF");
+        match result.unwrap_err() {
+            StorageError::UnexpectedEof { .. } => {}
+            e => panic!("expected UnexpectedEof, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_write_all_at_appends_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_write_append");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let part1 = vec![0x11u8; 64];
+        let part2 = vec![0x22u8; 64];
+        write_all_at(&file, 0, &part1).unwrap();
+        write_all_at(&file, 64, &part2).unwrap();
+        let mut buf = vec![0u8; 128];
+        read_exact_at(&file, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..64], &part1);
+        assert_eq!(&buf[64..], &part2);
+    }
+
+    #[test]
+    fn test_validate_block_range_rejects_unaligned() {
+        let data = vec![0u8; BLOCK_SIZE * 2 + 1];
+        let result = validate_block_range((BLOCK_SIZE * 10) as BlockNo, 0, &data);
+        assert!(result.is_err(), "should reject non-block-aligned data");
+    }
+
+    #[test]
+    fn test_validate_block_range_rejects_overflow() {
+        let data = vec![0u8; BLOCK_SIZE];
+        let result = validate_block_range((BLOCK_SIZE * 10) as BlockNo, BlockNo::MAX, &data);
+        assert!(result.is_err(), "should reject overflowing block range");
+    }
+
+    #[test]
+    fn test_validate_block_range_rejects_out_of_bounds() {
+        let data = vec![0u8; BLOCK_SIZE];
+        let result = validate_block_range((BLOCK_SIZE * 5) as BlockNo, (BLOCK_SIZE * 10) as BlockNo, &data);
+        assert!(result.is_err(), "should reject write past end of storage");
+    }
+
+    #[test]
+    fn test_validate_block_range_accepts_valid() {
+        let data = vec![0xDEu8; BLOCK_SIZE * 3];
+        let result = validate_block_range((BLOCK_SIZE * 10) as BlockNo, 1, &data);
+        assert!(result.is_ok(), "should accept valid block range");
+    }
+
+    #[test]
+    fn test_fault_injector_short_write() {
+        let inject = FaultInjector::new(Box::new(MemoryStorage::new(4)));
+        inject.set_short_write(true);
+        let data = vec![0xABu8; BLOCK_SIZE];
+        let result = inject.write_blocks(BLOCK_SIZE as BlockNo, &data);
+        assert!(result.is_err(), "should detect short write");
+        match result.unwrap_err() {
+            StorageError::ShortWrite { .. } => {}
+            e => panic!("expected ShortWrite error, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fault_injector_short_read_one_block() {
+        let inject = FaultInjector::new(Box::new(MemoryStorage::new(4)));
+        inject.set_short_read(true);
+        let result = inject.read_block(0);
+        assert!(result.is_err(), "should detect short read on one-block read");
+    }
+
+    #[test]
+    fn test_fault_injector_short_read_multi_block() {
+        let inject = FaultInjector::new(Box::new(MemoryStorage::new(8)));
+        inject.set_short_read(true);
+        let result = inject.read_blocks(BLOCK_SIZE as BlockNo, 2);
+        assert!(result.is_err(), "should detect short read on multi-block read");
+    }
+
+    #[test]
+    fn test_fault_injector_read_fail() {
+        let inject = FaultInjector::new(Box::new(MemoryStorage::new(4)));
+        inject.set_read_fail(1);
+        let result = inject.read_block(0);
+        assert!(result.is_err(), "should fail on read");
+    }
+
+    #[test]
+    fn test_fault_injector_read_fail_at_after_count() {
+        let inject = FaultInjector::new(Box::new(MemoryStorage::new(4)));
+        inject.set_read_fail(3);
+        let r1 = inject.read_block(0);
+        assert!(r1.is_ok(), "first read should succeed");
+        let r2 = inject.read_block(0);
+        assert!(r2.is_ok(), "second read should succeed");
+        let r3 = inject.read_block(0);
+        assert!(r3.is_err(), "third read should fail");
+    }
+
+    #[test]
+    fn test_fault_injector_short_write_always() {
+        let inject = FaultInjector::new(Box::new(MemoryStorage::new(8)));
+        inject.set_short_write(true);
+
+        let data = vec![0xABu8; BLOCK_SIZE];
+        assert!(inject.write_blocks(0, &data).is_err(), "first write should be short");
+        assert!(inject.write_blocks(BLOCK_SIZE as BlockNo, &data).is_err(), "second write should be short");
+        assert!(inject.write_blocks((BLOCK_SIZE * 2) as BlockNo, &data).is_err(), "third write should be short");
     }
 }

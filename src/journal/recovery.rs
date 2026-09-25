@@ -22,6 +22,24 @@ use crate::types::{
     LOG_XTREE, LOGPSIZE, LOGREDONE, LogSuper, Logpage, Lrd, PSIZE, Pxd,
 };
 
+/// Read up to `len` bytes from `storage` at `offset`.
+///
+/// Unlike `Storage::read_bytes` (which requires a complete read), this helper
+/// tolerates EOF: if the storage cannot supply the full `len` bytes, it
+/// returns a buffer padded with zeros to the requested length. This is used
+/// by log scanning where reading past the end of written log data signals
+/// end-of-log and is detected by an all-zero sentinel.
+fn read_bytes_eof_ok(storage: &dyn Storage, offset: u64, len: usize) -> StorageResult<Vec<u8>> {
+    match storage.read_bytes(offset, len) {
+        Ok(data) => Ok(data),
+        Err(StorageError::UnexpectedEof { .. }) => Ok(vec![0u8; len]),
+        Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(vec![0u8; len])
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Number of buffer pool slots (matches jfsutils `NBUFPOOL`).
 pub const NBUFPOOL: usize = 128;
 
@@ -344,13 +362,13 @@ impl<'a> LogReader<'a> {
         }
 
         // Check for zero page (end of written records).
-        let peek = self.log_storage.read_bytes(self.pos, 4)?;
+        let peek = read_bytes_eof_ok(self.log_storage, self.pos, 4)?;
         if peek.len() < 4 || (peek[0] == 0 && peek[1] == 0 && peek[2] == 0 && peek[3] == 0) {
             return Ok(None);
         }
 
         // Read the LRD.
-        let lrd_bytes = self.log_storage.read_bytes(self.pos, LRD_SIZE)?;
+        let lrd_bytes = read_bytes_eof_ok(self.log_storage, self.pos, LRD_SIZE)?;
         if lrd_bytes.len() < LRD_SIZE {
             return Ok(None);
         }
@@ -383,14 +401,14 @@ impl<'a> LogReader<'a> {
                 break;
             }
 
-            let lrd_bytes = self.log_storage.read_bytes(pos, 4)?;
+            let lrd_bytes = read_bytes_eof_ok(self.log_storage, pos, 4)?;
             if lrd_bytes.len() < 4
                 || (lrd_bytes[0] == 0 && lrd_bytes[1] == 0 && lrd_bytes[2] == 0 && lrd_bytes[3] == 0)
             {
                 break;
             }
 
-            let lrd_full = self.log_storage.read_bytes(pos, LRD_SIZE)?;
+            let lrd_full = read_bytes_eof_ok(self.log_storage, pos, LRD_SIZE)?;
             if lrd_full.len() < LRD_SIZE {
                 break;
             }
@@ -945,7 +963,7 @@ impl JournalRecovery {
             // LRD start marker, then decode. A simpler approach: scan
             // forward from log_data_start and find all syncpt records,
             // keeping the last one before log_end.
-            let lrd_bytes = log_storage.read_bytes(pos.saturating_sub(lrd_size), lrd_size as usize)?;
+            let lrd_bytes = read_bytes_eof_ok(log_storage, pos.saturating_sub(lrd_size), lrd_size as usize)?;
             if lrd_bytes.len() < 8 {
                 break;
             }

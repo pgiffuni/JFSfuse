@@ -47,7 +47,7 @@ cargo build --bin newjfs
 ```
 fusejfs/
 ├── Cargo.toml          # Package manifest (crate name: jfsfuse)
-├── LICENSE-MIT         # MIT license text
+├── LICENSE-BSD         # BSD 2-Clause license text
 ├── LICENSE-GPL         # GNU GPL v2 (or later) license text
 ├── README.md           # This file
 ├── src/                # Rust source tree
@@ -135,7 +135,7 @@ This project contains code with two different licenses:
 
 - **Original Rust code** — the storage abstraction layer, FUSE adapter, binaries,
   and crate root (`lib.rs`, `storage/mod.rs`, `fuse/mod.rs`, `bin/mount.rs`,
-  `bin/jfsck.rs`, `bin/newjfs.rs`) — are licensed under **MIT**.
+  `bin/jfsck.rs`, `bin/newjfs.rs`) — are licensed under **BSD-2-Clause**.
 
 Each source file carries an `SPDX-License-Identifier` header identifying its license.
 The package as a whole is distributed under `GPL-2.0-or-later` and should IBM or

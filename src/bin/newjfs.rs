@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! newjfs — Create a JFS filesystem image.
 //!
 //! Usage:

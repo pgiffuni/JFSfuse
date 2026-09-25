@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! jfsfuse — a Rust reimplementation of the Linux JFS filesystem, exposed over FUSE.
 //!
 //! The architecture mirrors the kernel JFS layout:

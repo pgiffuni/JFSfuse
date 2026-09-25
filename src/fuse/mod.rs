@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! FUSE filesystem operations adapter.
 //!
 //! Bridges JFS filesystem operations to the FUSE kernel interface.

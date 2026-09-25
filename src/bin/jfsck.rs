@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! `jfsck` — JFS consistency checker.
 //!
 //! Usage:

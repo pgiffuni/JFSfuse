@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-2-Clause
 //! Transaction manager — coordinates journaled metadata write transactions.
 //!
 //! ## Design

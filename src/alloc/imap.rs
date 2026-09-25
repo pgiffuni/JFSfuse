@@ -8,7 +8,7 @@
 //! Allocation uses summary bitmaps for O(1) free-inode lookup.
 
 use crate::storage::{Result as StorageResult, Storage};
-use crate::types::{BlockNo, Pxd};
+use crate::types::BlockNo;
 
 /// IAG (Inode Allocation Group) control structure.
 pub struct InodeAllocMap {

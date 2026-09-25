@@ -17,9 +17,8 @@ use crate::storage::{
     BLOCK_SIZE, BlockNo, BufferPool, Result as StorageResult, Storage, StorageError,
 };
 use crate::types::{
-    Dinode, FM_CLEAN, FM_LOGREDO, LOG_BTROOT, LOG_COMMIT, LOG_DATA, LOG_DTREE, LOG_INODE,
-    LOG_MOUNT, LOG_NOREDOINOEXT, LOG_NOREDOPAGE, LOG_REDOPAGE, LOG_SYNCPT, LOG_UPDATEMAP,
-    LOG_XTREE, LOGPSIZE, LOGREDONE, LogSuper, Logpage, Lrd, PSIZE, Pxd,
+    Dinode, LOG_BTROOT, LOG_COMMIT, LOG_DATA, LOG_DTREE, LOG_INODE, LOGPSIZE,
+    LOG_SYNCPT, LOG_XTREE, LOGREDONE, LogSuper, Logpage, Lrd, Pxd,
 };
 
 /// Read up to `len` bytes from `storage` at `offset`.

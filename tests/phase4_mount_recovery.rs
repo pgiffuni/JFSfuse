@@ -7,7 +7,7 @@ use std::sync::Arc;
 use jfsfuse::journal::LogManager;
 use jfsfuse::mkfs;
 use jfsfuse::storage::{BLOCK_SIZE, Storage};
-use jfsfuse::types::{LOGMAGIC, LOGREDONE, LOGWRAP, LOGVERSION, LogSuper};
+use jfsfuse::types::{LOGREDONE, LOGWRAP};
 use jfsfuse::volume::Volume;
 
 /// Read the inline log base from the JFS superblock.

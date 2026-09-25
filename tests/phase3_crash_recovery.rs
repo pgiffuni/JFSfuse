@@ -18,7 +18,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use jfsfuse::journal::{LogManager, JournalRecovery};
 use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
-use jfsfuse::types::{LOGMAGIC, LOGPSIZE, LOGVERSION, LOGWRAP, LOGPAGES, LogSuper};
+use jfsfuse::types::{LOGMAGIC, LOGVERSION, LOGWRAP, LOGPAGES, LogSuper};
 
 const NUM_BLOCKS: u64 = 50;
 
@@ -60,7 +60,7 @@ fn test_recovery_restores_metadata_after_crash() {
     // 3. Simulate crash: corrupt the metadata block on disk (old/stale data).
     //    The journal already has the after-image, so recovery should fix it.
     {
-        let mut zero_block = vec![0u8; BLOCK_SIZE];
+        let zero_block = vec![0u8; BLOCK_SIZE];
         storage.write_block(META_BLOCK, &zero_block).unwrap();
     }
 

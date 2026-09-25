@@ -13,9 +13,8 @@ use std::sync::Arc;
 
 use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
 use crate::types::{
-    LOGMAGIC, LOGPSIZE, LOGREDONE, LOGVERSION, LOGWRAP, LogSuper, Logpage, MAX_ACTIVE,
+    LOGMAGIC, LOGPSIZE, LOGREDONE, LOGVERSION, LOGWRAP, LogSuper, MAX_ACTIVE,
 };
-
 /// Log page flags
 pub const TBLK_LOG_START: u32 = 1;
 pub const TBLK_LOG_TAIL: u32 = 2;

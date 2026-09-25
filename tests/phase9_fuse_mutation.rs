@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
-use jfsfuse::fuse::{EEXIST, ENOENT, ENOTEMPTY, EROFS, EPERM, R_OK, W_OK, X_OK, EACCES, F_OK};
+use jfsfuse::fuse::{EEXIST, ENOENT, ENOTEMPTY, EROFS, R_OK, W_OK, X_OK, EACCES};
 use jfsfuse::mkfs;
 use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
@@ -417,7 +417,7 @@ fn test_rmdir_decrements_parent_nlink() {
     let parent_after_mkdir = fs.getattr(parent).expect("should getattr parent");
     let nlink_after_mkdir = u32::from_le_bytes(parent_after_mkdir.di_nlink);
 
-    let _ = fs.rmdir(parent, name).expect("rmdir should succeed");
+    fs.rmdir(parent, name).expect("rmdir should succeed");
 
     let parent_after_rmdir = fs.getattr(parent).expect("should getattr parent");
     let nlink_after_rmdir = u32::from_le_bytes(parent_after_rmdir.di_nlink);

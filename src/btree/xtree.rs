@@ -7,7 +7,7 @@
 //! Root can be inline in the inode (`xtroot_t`) or in external pages (`xtpage_t`).
 
 use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
-use crate::types::{BlockLength, BlockNo, Pxd, XTENTRYSTART, XTROOTMAXSLOT, Xad, XadFlag, XtRoot};
+use crate::types::{BlockLength, BlockNo, XTENTRYSTART, XTROOTMAXSLOT, Xad, XadFlag, XtRoot};
 
 /// An extent in the file's block map.
 #[derive(Debug, Clone, Copy)]

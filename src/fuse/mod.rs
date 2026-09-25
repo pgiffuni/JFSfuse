@@ -17,13 +17,12 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyBmap, ReplyCopyFileRange, ReplyCreated,
-    ReplyData, ReplyEntry, ReplyInit, ReplyLSeek, ReplyOpen, ReplyPoll, ReplyStatFs, ReplyWrite,
+    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyCopyFileRange, ReplyCreated,
+    ReplyData, ReplyEntry, ReplyInit, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite,
     ReplyXAttr, ReplyDirectory, ReplyDirectoryPlus,
 };
 use fuse3::raw::Request;
 use fuse3::{FileType, Timestamp};
-use futures_util::stream::Stream;
 
 use crate::btree::dtree::{Dtree, DirectoryCursor, DirEntry};
 use crate::btree::xtree::Xtree;
@@ -1722,6 +1721,7 @@ impl Fuse3Fs {
     }
 }
 
+#[allow(refining_impl_trait_reachable)]
 impl fuse3::raw::Filesystem for Fuse3Fs {
     type DirEntryStream<'a>
         = futures_util::stream::Iter<std::vec::IntoIter<std::result::Result<DirectoryEntry, fuse3::Errno>>>

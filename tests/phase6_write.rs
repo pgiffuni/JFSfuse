@@ -23,6 +23,7 @@ fn load_image_to_memory() -> Volume {
 }
 
 /// Find the first non-dot file entry in the root directory.
+#[allow(dead_code)]
 fn find_test_file(fs: &mut FuseFs) -> Option<u32> {
     let entries = fs.readdir(fs.volume.root_ino, 0)?;
     entries

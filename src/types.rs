@@ -774,7 +774,7 @@ impl Default for BtPage {
     }
 }
 
-/// B+-tree page flags. `BT_TYPE` (0x07) masks the page type.
+// B+-tree page flags. `BT_TYPE` (0x07) masks the page type.
 bitflags::bitflags! {
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1089,9 +1089,9 @@ impl Lrd {
 // ──────────────────────── Superblock ────────────────────────
 
 /// The aggregate superblock at fixed offset 0x8000.
-// Magic "JFS1", version 2, block size must be PSIZE (4096). The superblock
-// also carries inline log extent (s_logpxd), fsck work extent (s_fsckpxd),
-// and secondary AIM/AIT extents for aggregate inode table.
+/// Magic "JFS1", version 2, block size must be PSIZE (4096). The superblock
+/// also carries inline log extent (s_logpxd), fsck work extent (s_fsckpxd),
+/// and secondary AIM/AIT extents for aggregate inode table.
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

@@ -138,8 +138,8 @@ fn test_fallocate_allocates_space() {
     );
 
     // Allocated blocks should be readable as zeros.
-    let data = fs.read(ino, 0, BLOCK_SIZE as usize).expect("read should succeed");
-    assert_eq!(data.len(), BLOCK_SIZE as usize);
+    let data = fs.read(ino, 0, BLOCK_SIZE).expect("read should succeed");
+    assert_eq!(data.len(), BLOCK_SIZE);
     assert!(data.iter().all(|&b| b == 0), "allocated blocks should be zero-filled");
 }
 
@@ -206,12 +206,12 @@ fn test_fallocate_punch_hole() {
     );
 
     // First block should still have data.
-    let block = fs.read(ino, 0, BLOCK_SIZE as usize).expect("read should succeed");
+    let block = fs.read(ino, 0, BLOCK_SIZE).expect("read should succeed");
     assert_eq!(block[0], 0xBB, "first block should still have data");
 
     // Punched region should be zeros.
     let block = fs
-        .read(ino, BLOCK_SIZE as u64, BLOCK_SIZE as usize)
+        .read(ino, BLOCK_SIZE as u64, BLOCK_SIZE)
         .expect("read should succeed");
     assert_eq!(block[0], 0, "punched block should be zero");
 }

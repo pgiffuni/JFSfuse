@@ -7,7 +7,7 @@
 //!
 //! Opcodes identify the type of a FUSE request.
 
-/// Capability flags (negotiated in FUSE_INIT `flags` field, bits 0-31).
+//! Capability flags (negotiated in FUSE_INIT `flags` field, bits 0-31).
 
 /// Asynchronous read requests — reads may be reordered by the kernel.
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;

@@ -47,11 +47,10 @@ async fn main() -> ExitCode {
 
     let mut fs = FuseFs::new(vol);
     #[cfg(feature = "writable")]
-    if !read_only {
-        if let Err(e) = fs.enable_writable() {
+    if !read_only
+        && let Err(e) = fs.enable_writable() {
             eprintln!("Warning: could not enable writable mode: {}", e);
         }
-    }
 
     let fuse_fs = Fuse3Fs::new(fs);
 

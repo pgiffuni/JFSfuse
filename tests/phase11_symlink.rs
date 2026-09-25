@@ -62,7 +62,7 @@ fn test_symlink_lookup_resolves() {
     let link_name = "tf11res";
     let target = "/etc/hostname";
 
-    let ino = fs.symlink(parent, link_name, target).expect("symlink should succeed");
+    let _ino = fs.symlink(parent, link_name, target).expect("symlink should succeed");
 
     // Verify readdir includes the symlink entry.
     let entries = fs.readdir(parent, 0).expect("readdir should succeed");

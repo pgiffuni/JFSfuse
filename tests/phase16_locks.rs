@@ -14,10 +14,10 @@
 use std::sync::Arc;
 
 use jfsfuse::fuse::{
-    EACCES, EAGAIN, EINTR, EINVAL, ENOENT, EROFS, EOPNOTSUPP, FuseFs, F_RDLCK, F_UNLCK, F_WRLCK,
+    EACCES, EAGAIN, EINVAL, ENOENT, EROFS, EOPNOTSUPP, FuseFs, F_RDLCK, F_UNLCK, F_WRLCK,
     FUSE_BIG_WRITES, FUSE_ASYNC_READ, FUSE_DO_READDIRPLUS, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO,
-    InterruptManager, InterruptToken, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, SEEK_SET,
-    F_OK, R_OK, Statfs, W_OK, X_OK,
+    InterruptManager, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, SEEK_SET,
+    F_OK, R_OK, W_OK, X_OK,
 };
 use jfsfuse::mkfs;
 use jfsfuse::storage::Storage;
@@ -529,7 +529,7 @@ fn test_readdirplus_returns_attrs() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "plusdir", 0o100644).expect("create");
+    let _ino = fs.create(parent, "plusdir", 0o100644).expect("create");
 
     let entries = fs.readdirplus(parent, 0);
     assert!(entries.is_some(), "readdirplus should succeed");
@@ -558,7 +558,7 @@ fn test_readdirplus_lookup_reference_accounting() {
 
     // READDIRPLUS returns child entries AND increments their lookup references.
     // After readdirplus, the child's lookup_count should be higher.
-    let entries = fs.readdirplus(parent, 0).expect("readdirplus");
+    let _entries = fs.readdirplus(parent, 0).expect("readdirplus");
     // The child should have been accounted for in readdirplus.
     let plus_count = fs.lookup_count(ino);
     assert!(plus_count >= 2,

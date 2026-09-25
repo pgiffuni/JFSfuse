@@ -38,7 +38,9 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 pub mod device_size;
+pub mod geometry;
 pub use device_size::get_storage_size;
+pub use geometry::StorageGeometry;
 
 /// Re-export block types from the types module.
 pub use crate::types::{BLOCK_SIZE, BlockLength, BlockNo, PSIZE};
@@ -125,6 +127,9 @@ pub trait Storage: Send + Sync {
 
     /// Write a raw byte range.
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Downcast support for accessing concrete storage type.
+    fn as_any(&self) -> &dyn std::any::Any where Self: 'static;
 
     /// Flush file data to durable storage.
     ///
@@ -253,6 +258,8 @@ pub struct FileStorage {
     size: u64,
     /// If true, all write paths return errors.
     read_only: bool,
+    /// Device geometry (sector size, media size).
+    geometry: StorageGeometry,
 }
 
 impl FileStorage {
@@ -269,12 +276,18 @@ impl FileStorage {
             .read(true)
             .write(!read_only)
             .open(path)?;
-        let size = get_storage_size(&file)?;
-        Ok(Self { file, size, read_only })
+        let geometry = StorageGeometry::from_file(&file)?;
+        let size = geometry.media_size;
+        Ok(Self { file, size, read_only, geometry })
     }
 
     pub fn block_to_offset(&self, block: BlockNo) -> u64 {
         block * (BLOCK_SIZE as u64)
+    }
+
+    /// Device geometry (sector size, media size).
+    pub fn geometry(&self) -> &StorageGeometry {
+        &self.geometry
     }
 
     fn validate_write(&self, block: BlockNo, data: &[u8]) -> Result<()> {
@@ -286,6 +299,10 @@ impl FileStorage {
 }
 
 impl Storage for FileStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn read_block(&self, block: BlockNo) -> Result<Vec<u8>> {
         let offset = self.block_to_offset(block);
         self.read_bytes(offset, BLOCK_SIZE)
@@ -376,6 +393,9 @@ impl<S: Storage> ReadOnlyStorage<S> {
 }
 
 impl<S: Storage> Storage for ReadOnlyStorage<S> {
+    fn as_any(&self) -> &dyn std::any::Any where Self: 'static {
+        self
+    }
     fn read_block(&self, block: BlockNo) -> Result<Vec<u8>> {
         self.inner.read_block(block)
     }
@@ -495,6 +515,9 @@ impl<S: Storage> FaultInjector<S> {
 }
 
 impl<S: Storage> Storage for FaultInjector<S> {
+    fn as_any(&self) -> &dyn std::any::Any where Self: 'static {
+        self
+    }
     fn read_block(&self, block: BlockNo) -> Result<Vec<u8>> {
         let n = self.read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let fail_at = self.read_fail_at.load(std::sync::atomic::Ordering::SeqCst);
@@ -1071,6 +1094,9 @@ impl BufferPool {
 pub struct NullStorage;
 
 impl Storage for NullStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn read_block(&self, _block: BlockNo) -> Result<Vec<u8>> {
         Ok(vec![0u8; BLOCK_SIZE])
     }
@@ -1129,6 +1155,9 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn read_block(&self, block: BlockNo) -> Result<Vec<u8>> {
         let offset = self.block_to_offset(block);
         self.read_bytes(offset, BLOCK_SIZE)

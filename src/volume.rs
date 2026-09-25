@@ -84,6 +84,11 @@ impl Volume {
             return Err(StorageError::UnsupportedBlockSize(block_size));
         }
 
+        // Validate device geometry against the superblock.
+        if let Some(fs) = storage.as_any().downcast_ref::<FileStorage>() {
+            fs.geometry().validate_against_superblock(&sb)?;
+        }
+
         let l2bsize = sb.l2bsize();
         let agg_size = sb.aggregate_size();
         let ag_size = sb.agsize();

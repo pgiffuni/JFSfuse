@@ -18,10 +18,17 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
 
-/// FreeBSD `DIOCGMEDIASIZE` ioctl number: `_IOR('d', 128, off_t)`
-/// Encoded as: (IOC_READ << 30) | ('d' << 8) | 128 | (sizeof(off_t) << 16)
+<<<<<<< HEAD
+/// FreeBSD `DIOCGMEDIASIZE` ioctl number: `_IOR('d', 129, off_t)`
+/// Encoded as: (IOC_READ << 30) | ('d' << 8) | 129 | (sizeof(off_t) << 16)
 #[cfg(target_os = "freebsd")]
-const DIOCGMEDIASIZE: u64 = 0x8008_6480;
+const DIOCGMEDIASIZE: u64 = 0x8008_6481;
+=======
+/// FreeBSD `DIOCGMEDIASIZE` ioctl number: `_IOR('d', 129, off_t)`
+/// Encoded as: (IOC_READ << 30) | ('d' << 8) | 129 | (sizeof(off_t) << 16)
+#[cfg(target_os = "freebsd")]
+const DIOCGMEDIASIZE: u64 = 0x8008_6481;
+>>>>>>> 833b379 (fix: Correct FreeBSD ioctl numbers and add DIOCGSECTORSIZE support)
 
 #[cfg(target_os = "freebsd")]
 fn device_size(file: &File) -> Result<u64, std::io::Error> {

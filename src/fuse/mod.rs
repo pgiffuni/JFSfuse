@@ -1686,7 +1686,6 @@ pub fn storage_error_to_errno(e: &StorageError) -> i32 {
         InvalidName => EINVAL,
         NotADirectory => ENOTDIR,
         DirectoryNotEmpty => ENOTEMPTY,
-        NotFound => ENOENT,
         InvalidFileType | CannotLinkDir => EPERM,
         NotSupported => EOPNOTSUPP,
         Interrupted => EINTR,

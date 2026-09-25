@@ -55,7 +55,6 @@ fn device_size(file: &File) -> Result<u64, std::io::Error> {
 /// Regular files use `metadata().len()`; special devices (block devices on
 /// Linux, character devices on FreeBSD) use platform-specific ioctls.
 pub fn get_storage_size(file: &File) -> Result<u64, crate::storage::StorageError> {
-    use std::os::unix::fs::FileTypeExt;
     let meta = file.metadata()?;
     let ft = meta.file_type();
 

@@ -45,7 +45,6 @@ impl StorageGeometry {
     /// * Fallback: if the ioctl fails, fall back to `stat().st_size` and
     ///   a default sector size of 512.
     pub fn from_file(file: &File) -> Result<Self, StorageError> {
-        use std::os::unix::fs::FileTypeExt;
         let meta = file.metadata()?;
         let ft = meta.file_type();
 

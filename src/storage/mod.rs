@@ -363,7 +363,6 @@ impl Storage for FileStorage {
         if self.read_only {
             return Ok(());
         }
-        use std::os::unix::fs::FileExt;
         self.file.sync_all()?;
         Ok(())
     }
@@ -372,7 +371,6 @@ impl Storage for FileStorage {
         if self.read_only {
             return Ok(());
         }
-        use std::os::unix::fs::FileExt;
         self.file.sync_data()?;
         Ok(())
     }
@@ -381,7 +379,6 @@ impl Storage for FileStorage {
         if self.read_only {
             return Ok(());
         }
-        use std::os::unix::fs::FileExt;
         self.file.sync_all()?;
         Ok(())
     }

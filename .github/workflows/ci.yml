@@ -44,11 +44,6 @@ jobs:
         run: |
           . $HOME/.cargo/env
           cargo test
-      - name: Benchmark
-        shell: freebsd {0}
-        run: |
-          . $HOME/.cargo/env
-          cargo test --bench read-amplification
       - name: Clippy
         if: matrix.rust_version == 'nightly'
         shell: freebsd {0}

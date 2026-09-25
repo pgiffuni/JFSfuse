@@ -204,8 +204,13 @@ mod sys {
     use super::*;
     use std::os::unix::fs::FileTypeExt;
 
-    // DIOCGMEDIASIZE — returns off_t with media size.
-    // DIOCGSECTORSIZE — returns u_int with logical sector size.
+    /// FreeBSD `DIOCGMEDIASIZE` ioctl: `_IOR('d', 128, off_t)`
+    /// = (IOC_READ << 30) | ('d' << 8) | 128 | (8 << 16) = 0x80086480
+    const DIOCGMEDIASIZE: u64 = 0x8008_6480;
+
+    /// FreeBSD `DIOCGSECTORSIZE` ioctl: `_IOR('d', 129, u_int)`
+    /// = (IOC_READ << 30) | ('d' << 8) | 129 | (4 << 16) = 0x80046481
+    const DIOCGSECTORSIZE: u64 = 0x8004_6481;
 
     pub fn from_device(file: &File) -> Result<StorageGeometry, StorageError> {
         let ft = file.metadata()?.file_type();
@@ -213,15 +218,15 @@ mod sys {
         if ft.is_char_device() {
             let mut size: libc::off_t = 0;
             let ret = unsafe {
-                libc::ioctl(file.as_raw_fd(), libc::DIOCGMEDIASIZE, &mut size)
+                libc::ioctl(file.as_raw_fd(), DIOCGMEDIASIZE, &mut size)
             };
             if ret < 0 {
                 return Err(StorageError::Io(std::io::Error::last_os_error()));
             }
 
-            let mut sector_size: u_int = 512;
+            let mut sector_size: u32 = 512;
             let ret = unsafe {
-                libc::ioctl(file.as_raw_fd(), libc::DIOCGSECTORSIZE, &mut sector_size)
+                libc::ioctl(file.as_raw_fd(), DIOCGSECTORSIZE, &mut sector_size)
             };
             if ret < 0 {
                 log::warn!("DIOCGSECTORSIZE failed; assuming sector size 512");
@@ -232,7 +237,7 @@ mod sys {
             return Ok(StorageGeometry {
                 media_size: size as u64,
                 num_sectors: (size as u64) / sector_size as u64,
-                sector_size: sector_size as u32,
+                sector_size,
             });
         }
 

@@ -10,15 +10,24 @@
 //! | FreeBSD  | char device | `DIOCGMEDIASIZE`      |
 //!
 //! Regular files always use `metadata().len()`.
+//!
+//! On FreeBSD, `DIOCGMEDIASIZE` and `DIOCGSECTORSIZE` are not exposed by
+//! the Rust `libc` crate, so we use the raw ioctl numbers (matching
+//! FreeBSD's `_IOR('d', 128, off_t)` and `_IOR('d', 129, u_int)`).
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
+
+/// FreeBSD `DIOCGMEDIASIZE` ioctl number: `_IOR('d', 128, off_t)`
+/// Encoded as: (IOC_READ << 30) | ('d' << 8) | 128 | (sizeof(off_t) << 16)
+#[cfg(target_os = "freebsd")]
+const DIOCGMEDIASIZE: u64 = 0x8008_6480;
 
 #[cfg(target_os = "freebsd")]
 fn device_size(file: &File) -> Result<u64, std::io::Error> {
     let mut size: libc::off_t = 0;
     let ret = unsafe {
-        libc::ioctl(file.as_raw_fd(), libc::DIOCGMEDIASIZE, &mut size)
+        libc::ioctl(file.as_raw_fd(), DIOCGMEDIASIZE, &mut size)
     };
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
@@ -26,11 +35,14 @@ fn device_size(file: &File) -> Result<u64, std::io::Error> {
     Ok(size as u64)
 }
 
+/// Linux `BLKGETSIZE64` ioctl number.
+const BLKGETSIZE64: u64 = 0x8008_1272;
+
 #[cfg(target_os = "linux")]
 fn device_size(file: &File) -> Result<u64, std::io::Error> {
     let mut size: u64 = 0;
     let ret = unsafe {
-        libc::ioctl(file.as_raw_fd(), 0x80081272u64, &mut size as *mut u64)
+        libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size as *mut u64)
     };
     if ret < 0 {
         return Err(std::io::Error::last_os_error());

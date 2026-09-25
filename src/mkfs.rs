@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use crate::storage::{BLOCK_SIZE, MemoryStorage, Storage};
 use crate::types::{
-    self, BMAP_I, FILESYSTEM_I, FM_CLEAN, JFS_MAGIC, LOGREDONE, LogSuper, LOGMAGIC,
-    LOGPSIZE, LOGPAGES, LOGVERSION, PSIZE, ROOT_I, SUPER1_OFF,
+    self, BMAP_I, FILESYSTEM_I, FM_CLEAN, JFS_MAGIC, LOGMAGIC, LOGPAGES, LOGPSIZE, LOGREDONE,
+    LOGVERSION, LogSuper, PSIZE, ROOT_I, SUPER1_OFF,
 };
 
 /// Number of 4 KiB blocks used by the inline journal.

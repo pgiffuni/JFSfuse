@@ -14,10 +14,10 @@
 use std::sync::Arc;
 
 use jfsfuse::fuse::{
-    EACCES, EAGAIN, EINVAL, ENOENT, EROFS, EOPNOTSUPP, FuseFs, F_RDLCK, F_UNLCK, F_WRLCK,
-    FUSE_BIG_WRITES, FUSE_ASYNC_READ, FUSE_DO_READDIRPLUS, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO,
-    InterruptManager, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, SEEK_SET,
-    F_OK, R_OK, W_OK, X_OK,
+    EACCES, EAGAIN, EINVAL, ENOENT, EOPNOTSUPP, EROFS, F_OK, F_RDLCK, F_UNLCK, F_WRLCK,
+    FUSE_ASYNC_READ, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS, FUSE_PARALLEL_DIROPS,
+    FUSE_READDIRPLUS_AUTO, FuseFs, InterruptManager, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, R_OK,
+    SEEK_SET, W_OK, X_OK,
 };
 use jfsfuse::mkfs;
 use jfsfuse::storage::Storage;
@@ -65,7 +65,11 @@ fn test_setlk_grants_exclusive_lock() {
 
     let fl = make_flock(F_WRLCK, 0, 100);
     let result = fs.setlk(ino, &fl, 1);
-    assert!(result.is_ok(), "exclusive lock should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "exclusive lock should succeed: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -95,7 +99,8 @@ fn test_setlk_blocks_conflicting_exclusive() {
 
     // Owner 1 takes a write lock.
     let wr = make_flock(F_WRLCK, 0, 100);
-    fs.setlk(ino, &wr, 1).expect("owner 1 should get write lock");
+    fs.setlk(ino, &wr, 1)
+        .expect("owner 1 should get write lock");
 
     // Owner 2 tries a write lock — should be blocked.
     let result = fs.setlk(ino, &wr, 2);
@@ -135,7 +140,10 @@ fn test_shared_locks_coexist() {
 
     let rd = make_flock(F_RDLCK, 0, 100);
     assert!(fs.setlk(ino, &rd, 1).is_ok(), "owner 1 read lock");
-    assert!(fs.setlk(ino, &rd, 2).is_ok(), "owner 2 read lock should coexist");
+    assert!(
+        fs.setlk(ino, &rd, 2).is_ok(),
+        "owner 2 read lock should coexist"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -155,7 +163,10 @@ fn test_unlock_releases_lock() {
     fs.setlk(ino, &unl, 1).expect("release write lock");
 
     // Owner 2 should now get the lock.
-    assert!(fs.setlk(ino, &wr, 2).is_ok(), "lock should be available after unlock");
+    assert!(
+        fs.setlk(ino, &wr, 2).is_ok(),
+        "lock should be available after unlock"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -234,7 +245,11 @@ fn test_non_overlapping_locks() {
     // Owner 2 locks bytes 100..200 — should succeed (no overlap).
     let wr2 = make_flock(F_WRLCK, 100, 100);
     let result = fs.setlk(ino, &wr2, 2);
-    assert!(result.is_ok(), "non-overlapping lock should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "non-overlapping lock should succeed: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -269,10 +284,16 @@ fn test_release_locks_clears_all() {
     fs.release_locks(ino, 1);
 
     // Owner 1 should be able to reacquire.
-    assert!(fs.setlk(ino, &wr1, 1).is_ok(), "owner 1 should reacquire after release");
+    assert!(
+        fs.setlk(ino, &wr1, 1).is_ok(),
+        "owner 1 should reacquire after release"
+    );
 
     // Owner 2's lock should still be held.
-    assert!(fs.setlk(ino, &wr1, 3).is_err(), "owner 2's lock should still block others");
+    assert!(
+        fs.setlk(ino, &wr1, 3).is_err(),
+        "owner 2's lock should still block others"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -333,7 +354,8 @@ fn test_flock_unlock() {
     let ino = fs.create(parent, "flockunlock", 0o100664).expect("create");
 
     fs.flock(ino, LOCK_EX, 1).expect("owner 1 exclusive");
-    fs.flock(ino, LOCK_UN, 1).expect("owner 1 unlock via LOCK_UN");
+    fs.flock(ino, LOCK_UN, 1)
+        .expect("owner 1 unlock via LOCK_UN");
     assert!(fs.flock(ino, LOCK_EX, 2).is_ok());
 }
 
@@ -414,7 +436,7 @@ fn test_flock_replaces_same_owner() {
     let ino = fs.create(parent, "flockrepl", 0o100664).expect("create");
 
     fs.flock(ino, LOCK_SH, 1).expect("owner 1 shared");
-     // Same owner replaces shared with exclusive — no conflict.
+    // Same owner replaces shared with exclusive — no conflict.
     assert!(fs.flock(ino, LOCK_EX, 1).is_ok());
 }
 
@@ -438,7 +460,11 @@ fn test_bmap_root_inode() {
     // Root inode (ino 2) is a directory — its xtree maps metadir blocks.
     // bmap should succeed and return a physical block.
     let result = fs.bmap(fs.volume.root_ino, 0);
-    assert!(result.is_ok(), "bmap on root directory should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "bmap on root directory should succeed: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -455,12 +481,17 @@ fn test_bmap_regular_file() {
     let data = vec![0u8; 4096];
     let mgr = InterruptManager::new();
     let (_id, token) = mgr.register();
-    fs.write_interruptible(ino, 0, &data, &token).expect("write");
+    fs.write_interruptible(ino, 0, &data, &token)
+        .expect("write");
     fs.flush(ino).expect("flush");
 
     // Map file block 0 — should return a physical block > 0 (or 0 for sparse).
     let result = fs.bmap(ino, 0);
-    assert!(result.is_ok(), "bmap should succeed on written file: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "bmap should succeed on written file: {:?}",
+        result
+    );
     let (phys_block, num_blocks) = result.unwrap();
     // Physical block should be nonzero (allocated extent).
     assert!(phys_block > 0, "physical block should be allocated, got 0");
@@ -480,7 +511,11 @@ fn test_bmap_sparse_file() {
     // No data written — file is empty/sparse.
     // bmap on block 0 should return Ok((0, 0)) for the hole.
     let result = fs.bmap(ino, 0);
-    assert!(result.is_ok(), "bmap on sparse should return hole: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "bmap on sparse should return hole: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -495,7 +530,8 @@ fn test_sync_fs_writable() {
     let data = vec![42u8; 4096];
     let mgr = InterruptManager::new();
     let (_id, token) = mgr.register();
-    fs.write_interruptible(ino, 0, &data, &token).expect("write");
+    fs.write_interruptible(ino, 0, &data, &token)
+        .expect("write");
 
     // Sync should commit transactions and flush to stable storage.
     let result = fs.sync_fs();
@@ -561,12 +597,18 @@ fn test_readdirplus_lookup_reference_accounting() {
     let _entries = fs.readdirplus(parent, 0).expect("readdirplus");
     // The child should have been accounted for in readdirplus.
     let plus_count = fs.lookup_count(ino);
-    assert!(plus_count >= 2,
-        "readdirplus should increment lookup reference (was {})", plus_count);
+    assert!(
+        plus_count >= 2,
+        "readdirplus should increment lookup reference (was {})",
+        plus_count
+    );
 
     // FORGET should decrement by 1 (readdirplus added 1 ref).
     fs.forget(ino, 1);
-    assert!(fs.lookup_count(ino) >= 1, "forget after readdirplus should leave refs");
+    assert!(
+        fs.lookup_count(ino) >= 1,
+        "forget after readdirplus should leave refs"
+    );
 
     // Full forget down to 0.
     let remaining = fs.lookup_count(ino);
@@ -661,8 +703,14 @@ fn test_statfs_free_blocks_nonnegative() {
     let mut fs = FuseFs::new(vol);
     let stat = fs.statfs(fs.volume.root_ino);
 
-    assert!(stat.bfree <= stat.blocks, "free blocks should not exceed total");
-    assert!(stat.bavail <= stat.blocks, "available should not exceed total");
+    assert!(
+        stat.bfree <= stat.blocks,
+        "free blocks should not exceed total"
+    );
+    assert!(
+        stat.bavail <= stat.blocks,
+        "available should not exceed total"
+    );
 }
 
 #[test]
@@ -710,7 +758,16 @@ fn test_access_owner_permissions() {
     // Create a file owned by uid 1000, mode 0644.
     let ino = fs.create(parent, "acctest", 0o100644).expect("create");
     // Set owner to 1000:1000 and mode 0600.
-    fs.setattr(ino, Some(0o100600), Some(1000), Some(1000), None, None, None).expect("setattr");
+    fs.setattr(
+        ino,
+        Some(0o100600),
+        Some(1000),
+        Some(1000),
+        None,
+        None,
+        None,
+    )
+    .expect("setattr");
 
     // Owner has read/write.
     assert!(fs.access(ino, R_OK, 1000, 1000).is_ok());
@@ -727,7 +784,16 @@ fn test_access_other_permissions() {
 
     let parent = fs.volume.root_ino;
     let ino = fs.create(parent, "accother", 0o100644).expect("create");
-    fs.setattr(ino, Some(0o100644), Some(1000), Some(1000), None, None, None).expect("setattr");
+    fs.setattr(
+        ino,
+        Some(0o100644),
+        Some(1000),
+        Some(1000),
+        None,
+        None,
+        None,
+    )
+    .expect("setattr");
 
     // Another user (uid 2000) — other perms (r--): read ok, write denied.
     assert!(fs.access(ino, R_OK, 2000, 2000).is_ok());
@@ -745,7 +811,16 @@ fn test_access_execute_denied_without_owner_execute() {
     // Set owner to 1000:1000 and mode 0651 (owner rw, group r-x, other --x).
     // Owner does NOT have execute, but "other" does.
     // ACCESS for the owner (uid 1000) should return EACCES for X_OK.
-    fs.setattr(ino, Some(0o100651), Some(1000), Some(1000), None, None, None).expect("setattr");
+    fs.setattr(
+        ino,
+        Some(0o100651),
+        Some(1000),
+        Some(1000),
+        None,
+        None,
+        None,
+    )
+    .expect("setattr");
 
     // Owner: no execute bit → EACCES even though "other" has execute.
     assert_eq!(fs.access(ino, X_OK, 1000, 1000), Err(EACCES));
@@ -777,7 +852,10 @@ fn test_bmap_unallocated_returns_hole() {
     // Block 0 should be mapped (data is written).
     let (phys, len) = fs.bmap(ino, 0).expect("bmap");
     assert!(len > 0, "extent length should be > 0 for allocated block");
-    assert!(phys > 0, "physical block should be non-zero for mapped extent");
+    assert!(
+        phys > 0,
+        "physical block should be non-zero for mapped extent"
+    );
 
     // Block well beyond the file size should return a hole (0, 0).
     let (hole_phys, hole_len) = fs.bmap(ino, 1000).expect("bmap hole");
@@ -824,7 +902,11 @@ fn test_readdir_offset_resumption() {
     assert!(!entries2.iter().any(|(n, _, _, _)| n == "."));
     assert!(!entries2.iter().any(|(n, _, _, _)| n == ".."));
     // But should include real entries
-    assert!(entries2.iter().any(|(n, _, _, _)| n == "a" || n == "b" || n == "c" || n == "d" || n == "e"));
+    assert!(entries2.iter().any(|(n, _, _, _)| n == "a"
+        || n == "b"
+        || n == "c"
+        || n == "d"
+        || n == "e"));
 }
 
 #[cfg(feature = "writable")]
@@ -909,7 +991,10 @@ fn test_readdir_cookies_are_logical() {
     assert!(!entries2.iter().any(|(n, _, _, _)| n == "."));
     assert!(!entries2.iter().any(|(n, _, _, _)| n == ".."));
     // First entry should have cookie 2.
-    assert_eq!(entries2[0].3, 2, "first entry at offset 2 should have cookie 2");
+    assert_eq!(
+        entries2[0].3, 2,
+        "first entry at offset 2 should have cookie 2"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -923,11 +1008,15 @@ fn test_getxattr_size_query() {
     let ino = fs.create(parent, "xattrtest", 0o100644).expect("create");
 
     // Set a user xattr.
-    fs.setxattr(ino, "user.comment", b"hello", 0).expect("setxattr");
+    fs.setxattr(ino, "user.comment", b"hello", 0)
+        .expect("setxattr");
 
     // listxattr should reverse-translate the internal name to "user.comment".
     let names = fs.listxattr(ino).expect("listxattr");
-    assert!(names.iter().any(|n| n == "user.comment"), "user.comment should appear with prefix");
+    assert!(
+        names.iter().any(|n| n == "user.comment"),
+        "user.comment should appear with prefix"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -950,4 +1039,3 @@ fn test_fallocate_unsupported_flags() {
     assert!(result.is_err(), "zero range should fail");
     assert_eq!(result.unwrap_err(), EOPNOTSUPP, "should be EOPNOTSUPP");
 }
-

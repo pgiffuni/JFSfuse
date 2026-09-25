@@ -12,7 +12,9 @@ use jfsfuse::fuse::FuseFs;
 use jfsfuse::journal::LogManager;
 use jfsfuse::mkfs;
 use jfsfuse::storage::{BLOCK_SIZE, Storage};
-use jfsfuse::types::{FM_CLEAN, FM_DIRTY, LOGMAGIC, LOGREDONE, LOGWRAP, LOGVERSION, LogSuper, PSIZE};
+use jfsfuse::types::{
+    FM_CLEAN, FM_DIRTY, LOGMAGIC, LOGREDONE, LOGVERSION, LOGWRAP, LogSuper, PSIZE,
+};
 use jfsfuse::volume::Volume;
 
 fn load_image_to_memory() -> Volume {
@@ -22,7 +24,9 @@ fn load_image_to_memory() -> Volume {
 
 /// Read the inline log base from the JFS superblock.
 fn read_log_base(storage: &dyn Storage) -> u64 {
-    let sb_bytes = storage.read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE).unwrap();
+    let sb_bytes = storage
+        .read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE)
+        .unwrap();
     if sb_bytes.len() >= 80 {
         let s_ait2 = jfsfuse::types::Pxd::from_bytes(&sb_bytes[48..56]);
         let s_aim2 = jfsfuse::types::Pxd::from_bytes(&sb_bytes[56..64]);
@@ -54,7 +58,9 @@ fn test_writable_mount_marks_fs_dirty() {
     // The read-only mount should start clean.
     // We need to re-load from memory for a writable mount.
     let storage = vol.storage.clone();
-    let sb_bytes = storage.read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE).unwrap();
+    let sb_bytes = storage
+        .read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE)
+        .unwrap();
     let state_before = u32::from_le_bytes(sb_bytes[40..44].try_into().unwrap());
     // The test image should start with FM_CLEAN or FM_LOGREDO.
     assert!(
@@ -73,7 +79,11 @@ fn test_writable_mount_validates_root_inode() {
 
     // Writable mount should succeed (root inode is a valid directory).
     let result = Volume::mount_from_storage(storage);
-    assert!(result.is_ok(), "writable mount should succeed with valid root: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "writable mount should succeed with valid root: {:?}",
+        result.err()
+    );
     let vol = result.unwrap();
 
     // Verify root inode is a directory.
@@ -107,8 +117,11 @@ fn test_crash_before_data_flush_preserved_by_journal() {
     let name = "tf13crash1";
 
     // Create a file and write data.
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
-    fs.write(ino, 0, b"crash-test-data").expect("write should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
+    fs.write(ino, 0, b"crash-test-data")
+        .expect("write should succeed");
 
     // The write_at path already commits a transaction (data flush → journal → metadata flush).
     // Even if we crashed here, the next mount should recover the committed data.
@@ -131,10 +144,13 @@ fn test_crash_after_journal_commit() {
     let name = "tf13crash2";
 
     // Create a file — this goes through the journal transaction.
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Write data and commit.
-    fs.write(ino, 0, b"post-commit-data").expect("write should succeed");
+    fs.write(ino, 0, b"post-commit-data")
+        .expect("write should succeed");
 
     // The transaction has been committed (journal + metadata flushed).
     // Simulate a crash-recovery by re-mounting.
@@ -158,7 +174,9 @@ fn test_journal_wraparound_handled() {
     // This tests that the journal handles wraparound correctly.
     for i in 0..5 {
         let name = format!("tf13wrap{}", i);
-        let ino = fs.create(parent, &name, 0o100644).expect("create should succeed");
+        let ino = fs
+            .create(parent, &name, 0o100644)
+            .expect("create should succeed");
         let data = format!("data-{}", i);
         let write_result = fs.write(ino, 0, data.as_bytes());
         if write_result.is_none() {
@@ -190,7 +208,8 @@ fn test_clean_unmount_marks_fs_clean() {
     let storage = vol.storage.clone();
 
     // Perform a writable mount.
-    let mut vol = Volume::mount_from_storage(storage.clone()).expect("writable mount should succeed");
+    let mut vol =
+        Volume::mount_from_storage(storage.clone()).expect("writable mount should succeed");
 
     // Do some work.
     vol.begin_transaction().expect("begin should succeed");
@@ -200,9 +219,14 @@ fn test_clean_unmount_marks_fs_clean() {
     vol.umount().expect("umount should succeed");
 
     // Verify the filesystem state is marked clean.
-    let sb_bytes = storage.read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE).unwrap();
+    let sb_bytes = storage
+        .read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE)
+        .unwrap();
     let state = u32::from_le_bytes(sb_bytes[40..44].try_into().unwrap());
-    assert_eq!(state, FM_CLEAN, "filesystem should be marked clean after umount");
+    assert_eq!(
+        state, FM_CLEAN,
+        "filesystem should be marked clean after umount"
+    );
     drop(storage);
 }
 
@@ -215,14 +239,18 @@ fn test_write_then_crash_recovery() {
     let storage = vol.storage.clone();
 
     // Perform a writable mount.
-    let mut vol = Volume::mount_from_storage(storage.clone()).expect("writable mount should succeed");
+    let mut vol =
+        Volume::mount_from_storage(storage.clone()).expect("writable mount should succeed");
 
     let parent = vol.root_ino;
     let name = "tf13crash3";
 
     // Create + write.
-    let ino = vol.create_file(parent, name).expect("create should succeed");
-    vol.write_at(ino, 0, b"persistent-data").expect("write should succeed");
+    let ino = vol
+        .create_file(parent, name)
+        .expect("create should succeed");
+    vol.write_at(ino, 0, b"persistent-data")
+        .expect("write should succeed");
 
     // Unmount cleanly.
     vol.umount().expect("umount should succeed");
@@ -260,12 +288,20 @@ fn test_journal_recovery_replays_committed_records() {
 
     // Read the logsuper.
     let ls = LogManager::read_super(&*storage, log_base).unwrap();
-    assert_eq!(ls.magic_val(), LOGMAGIC, "log superblock should have valid magic");
+    assert_eq!(
+        ls.magic_val(),
+        LOGMAGIC,
+        "log superblock should have valid magic"
+    );
     assert_eq!(ls.version(), LOGVERSION, "log should be version 1");
 
     // State should be LOGREDONE after successful recovery in open_from_storage.
     let ls_after = LogManager::read_super(&*storage, log_base).unwrap();
-    assert_eq!(ls_after.state(), LOGREDONE, "log should be LOGREDONE after recovery");
+    assert_eq!(
+        ls_after.state(),
+        LOGREDONE,
+        "log should be LOGREDONE after recovery"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -276,9 +312,13 @@ fn test_mount_refuses_corrupt_superblock() {
     let storage = vol.storage.clone();
 
     // Corrupt the superblock magic.
-    let mut sb_bytes = storage.read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE).unwrap();
+    let mut sb_bytes = storage
+        .read_bytes(jfsfuse::types::SUPER1_OFF, PSIZE)
+        .unwrap();
     sb_bytes[0] = b'X'; // corrupt magic
-    storage.write_bytes(jfsfuse::types::SUPER1_OFF, &sb_bytes).unwrap();
+    storage
+        .write_bytes(jfsfuse::types::SUPER1_OFF, &sb_bytes)
+        .unwrap();
 
     // Mount should fail.
     let result = Volume::open_from_storage(storage);

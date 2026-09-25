@@ -48,15 +48,15 @@
     dead_code,
     unused_mut,
     unused_variables,
-    unused_must_use,
+    unused_must_use
 )]
 
-pub mod mkfs;
 pub mod alloc;
 pub mod btree;
 pub mod fuse;
 pub mod inode;
 pub mod journal;
+pub mod mkfs;
 pub mod storage;
 pub mod transaction;
 pub mod types;

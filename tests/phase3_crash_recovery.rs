@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian};
 
-use jfsfuse::journal::{LogManager, JournalRecovery};
+use jfsfuse::journal::{JournalRecovery, LogManager};
 use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
-use jfsfuse::types::{LOGMAGIC, LOGVERSION, LOGWRAP, LOGPAGES, LogSuper};
+use jfsfuse::types::{LOGMAGIC, LOGPAGES, LOGVERSION, LOGWRAP, LogSuper};
 
 const NUM_BLOCKS: u64 = 50;
 
@@ -73,7 +73,9 @@ fn test_recovery_restores_metadata_after_crash() {
     // 4. Run recovery — replay the journal.
     let ls_reloaded = LogManager::read_super(&*storage, 0).unwrap();
     let mut recovery = JournalRecovery::new(ls_reloaded);
-    recovery.replay(&*storage, &*storage, LOG_DATA_START).unwrap();
+    recovery
+        .replay(&*storage, &*storage, LOG_DATA_START)
+        .unwrap();
 
     // 5. Verify the metadata block was restored from the journal after-image.
     let restored = storage.read_block(META_BLOCK).unwrap();
@@ -83,7 +85,8 @@ fn test_recovery_restores_metadata_after_crash() {
         "metadata should be restored from journal after recovery"
     );
     assert_eq!(
-        restored[BLOCK_SIZE - 1], 0xAB,
+        restored[BLOCK_SIZE - 1],
+        0xAB,
         "restored page should contain original after-image data"
     );
 
@@ -113,13 +116,15 @@ fn test_recovery_skips_uncommitted_records() {
     LittleEndian::write_u32(&mut uncommitted_data[0..4], 0xBAADF00D);
 
     // Write a committed record.
-    lm.append_log_record(txid, META_BLOCK, &committed_data).unwrap();
+    lm.append_log_record(txid, META_BLOCK, &committed_data)
+        .unwrap();
     lm.commit_transaction(txid).unwrap();
 
     // Write an uncommitted record (no commit after append).
     let txid2 = 100u64;
     let uncommitted_block = META_BLOCK + 1;
-    lm.append_log_record(txid2, uncommitted_block, &uncommitted_data).unwrap();
+    lm.append_log_record(txid2, uncommitted_block, &uncommitted_data)
+        .unwrap();
 
     // Do NOT call commit_transaction for txid2 — simulate a crash mid-transaction.
     // But flush the journal to make data durable.
@@ -133,7 +138,9 @@ fn test_recovery_skips_uncommitted_records() {
     // Run recovery.
     let ls_reloaded = LogManager::read_super(&*storage, 0).unwrap();
     let mut recovery = JournalRecovery::new(ls_reloaded);
-    recovery.replay(&*storage, &*storage, LOG_DATA_START).unwrap();
+    recovery
+        .replay(&*storage, &*storage, LOG_DATA_START)
+        .unwrap();
 
     // Committed record should be replayed.
     let committed = storage.read_block(META_BLOCK).unwrap();

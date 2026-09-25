@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{PageCache, Storage, StorageError};
 
-pub use crate::types::{BlockNo, BlockLength, Pxd};
+pub use crate::types::{BlockLength, BlockNo, Pxd};
 
 /// A unique transaction identifier.
 pub type TransactionId = u64;
@@ -87,11 +87,7 @@ impl TransactionManager {
             Some(tx.txid)
         } else {
             let last = self.last_committed.load(Ordering::SeqCst);
-            if last > 0 {
-                Some(last)
-            } else {
-                None
-            }
+            if last > 0 { Some(last) } else { None }
         }
     }
 

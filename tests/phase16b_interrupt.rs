@@ -212,7 +212,11 @@ fn test_lock_owner_isolation() {
 
     // Owner 1 re-locking the same range should succeed (upgrade/replace).
     let result = fs.setlk(ino, &wr, 1);
-    assert!(result.is_ok(), "owner 1 re-locking should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "owner 1 re-locking should succeed: {:?}",
+        result
+    );
 
     // Owner 2 should still be blocked.
     let result = fs.setlk(ino, &wr, 2);

@@ -9,7 +9,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use jfsfuse::journal::LogManager;
 use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, Storage};
 use jfsfuse::transaction::TransactionManager;
-use jfsfuse::types::{LOGMAGIC, LOGPSIZE, LOG_REDOPAGE, LOG_INODE, LOGVERSION, LOGWRAP, LOGPAGES};
+use jfsfuse::types::{LOG_INODE, LOG_REDOPAGE, LOGMAGIC, LOGPAGES, LOGPSIZE, LOGVERSION, LOGWRAP};
 
 const NUM_BLOCKS: u64 = 20;
 
@@ -44,7 +44,11 @@ fn test_journal_survives_restart() {
 
     // Verify logsuper end was persisted.
     let ls_after = LogManager::read_super(&*storage, 0).unwrap();
-    assert_eq!(ls_after.end(), 36 + BLOCK_SIZE as u32, "end should cover LRD + data");
+    assert_eq!(
+        ls_after.end(),
+        36 + BLOCK_SIZE as u32,
+        "end should cover LRD + data"
+    );
 
     // Phase 2: simulate restart — read logsuper from storage.
     let ls_reloaded = LogManager::read_super(&*storage, 0).unwrap();
@@ -102,7 +106,11 @@ fn test_transaction_abort_leaves_no_journal_record() {
 
     // Abort should not have written anything to the journal.
     let ls_after = LogManager::read_super(&*storage, 0).unwrap();
-    assert_eq!(ls_after.end(), 0, "journal end should be unchanged after abort");
+    assert_eq!(
+        ls_after.end(),
+        0,
+        "journal end should be unchanged after abort"
+    );
 
     // Storage should still be zeros at block 18.
     let block = storage.read_block(18).unwrap();

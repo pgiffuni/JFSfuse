@@ -118,10 +118,7 @@ impl InterruptManager {
     pub fn register(&self) -> (RequestId, InterruptToken) {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let flag = InterruptFlag::new();
-        self.flags
-            .lock()
-            .unwrap()
-            .insert(id, flag.clone());
+        self.flags.lock().unwrap().insert(id, flag.clone());
         (id, InterruptToken { id, flag })
     }
 
@@ -130,11 +127,14 @@ impl InterruptManager {
     /// (which carry the same `unique` value) to target this request.
     pub fn register_at(&self, request_id: RequestId) -> (RequestId, InterruptToken) {
         let flag = InterruptFlag::new();
-        self.flags
-            .lock()
-            .unwrap()
-            .insert(request_id, flag.clone());
-        (request_id, InterruptToken { id: request_id, flag })
+        self.flags.lock().unwrap().insert(request_id, flag.clone());
+        (
+            request_id,
+            InterruptToken {
+                id: request_id,
+                flag,
+            },
+        )
     }
 
     /// Mark a request as interrupted (called when FUSE_INTERRUPT arrives).

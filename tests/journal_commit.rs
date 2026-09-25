@@ -12,12 +12,10 @@ use std::sync::Arc;
 use byteorder::{ByteOrder, LittleEndian};
 
 use jfsfuse::journal::LogManager;
-use jfsfuse::storage::{
-    BLOCK_SIZE, MemoryStorage, PageCache, Storage,
-};
+use jfsfuse::storage::{BLOCK_SIZE, MemoryStorage, PageCache, Storage};
 use jfsfuse::transaction::TransactionManager;
 use jfsfuse::types::{
-    LogSuper, LOGMAGIC, LOGPSIZE, LOG_INODE, LOG_REDOPAGE, LOGVERSION, LOGWRAP, LOGPAGES,
+    LOG_INODE, LOG_REDOPAGE, LOGMAGIC, LOGPAGES, LOGPSIZE, LOGVERSION, LOGWRAP, LogSuper,
 };
 
 /// Build a valid LogSuper for a 16-page inline log in a MemoryStorage.
@@ -88,8 +86,14 @@ fn test_transaction_commit_writes_journal_and_metadata() {
 
     // 7. Verify the logsuper end was advanced.
     let ls_after = LogManager::read_super(&*storage, 0).unwrap();
-    assert!(ls_after.end() > 0, "log end should be advanced after commit");
-    assert!(ls_after.end() as usize <= 2 * 36 + BLOCK_SIZE, "log end should contain REDOPAGE LRD + data + COMMIT LRD");
+    assert!(
+        ls_after.end() > 0,
+        "log end should be advanced after commit"
+    );
+    assert!(
+        ls_after.end() as usize <= 2 * 36 + BLOCK_SIZE,
+        "log end should contain REDOPAGE LRD + data + COMMIT LRD"
+    );
 
     // 8. Verify a log record (LRD) was written at the start of the log data area.
     //    The full record (LRD 36 bytes + 4096-byte page) is 4132 bytes and
@@ -99,7 +103,10 @@ fn test_transaction_commit_writes_journal_and_metadata() {
 
     // LRD layout (36 bytes), first field is logtid (u32 LE):
     let logtid = LittleEndian::read_u32(&log_data[0..4]);
-    assert_eq!(logtid, txid as u32, "LRD logtid should match committed txid");
+    assert_eq!(
+        logtid, txid as u32,
+        "LRD logtid should match committed txid"
+    );
 
     // backchain should be 0 (single record in this transaction).
     let backchain = LittleEndian::read_u32(&log_data[4..8]);
@@ -111,16 +118,25 @@ fn test_transaction_commit_writes_journal_and_metadata() {
 
     // length field at offset 10 (u16 LE) should match data.len() = BLOCK_SIZE.
     let length = LittleEndian::read_u16(&log_data[10..12]);
-    assert_eq!(length as usize, BLOCK_SIZE, "LRD length should match page data size");
+    assert_eq!(
+        length as usize, BLOCK_SIZE,
+        "LRD length should match page data size"
+    );
 
     // redopage_type at offset 24 (u16 LE) should be LOG_INODE.
     let redopage_type = LittleEndian::read_u16(&log_data[24..26]);
-    assert_eq!(redopage_type, LOG_INODE, "LRD redopage_type should be LOG_INODE");
+    assert_eq!(
+        redopage_type, LOG_INODE,
+        "LRD redopage_type should be LOG_INODE"
+    );
 
     // Block number is stored in the redopage_pxd (PXD address field).
     // PXD addr2 is at LRD offset 32..36.
     let pxd_addr2 = LittleEndian::read_u32(&log_data[32..36]);
-    assert_eq!(pxd_addr2, META_BLOCK as u32, "LRD pxd should reference the metadata block");
+    assert_eq!(
+        pxd_addr2, META_BLOCK as u32,
+        "LRD pxd should reference the metadata block"
+    );
 
     // 9. Verify the page data follows immediately after the LRD (at offset 36).
     let page_data = &log_data[36..36 + BLOCK_SIZE];

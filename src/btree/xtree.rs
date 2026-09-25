@@ -364,7 +364,13 @@ impl Xtree {
     }
 
     /// Replace an extent at the given index.
-    pub fn set_extent(&mut self, idx: usize, logical_offset: i64, length: u32, physical_addr: u64) -> bool {
+    pub fn set_extent(
+        &mut self,
+        idx: usize,
+        logical_offset: i64,
+        length: u32,
+        physical_addr: u64,
+    ) -> bool {
         if idx < XTENTRYSTART || idx >= XTROOTMAXSLOT {
             return false;
         }
@@ -628,11 +634,7 @@ impl Xtree {
                 // Starts before take range, extends into it — keep left part.
                 let keep_len = (start_fsb - ext_offset) as u32;
                 let take_len = ext_length - keep_len;
-                taken.push((
-                    start_fsb,
-                    take_len,
-                    ext_addr + keep_len as u64,
-                ));
+                taken.push((start_fsb, take_len, ext_addr + keep_len as u64));
 
                 let mut xad_copy = *xad;
                 xad_copy.set_length(keep_len);
@@ -666,7 +668,6 @@ impl Xtree {
 
         taken
     }
-
 
     /// order with no overlapping ranges.
     ///
@@ -931,7 +932,11 @@ mod tests {
         let ext = xt.lookup(0).unwrap().unwrap();
         assert_eq!(ext.length, 5, "kept extent should be 5 blocks");
         assert_eq!(ext.address, 100, "kept extent should keep original address");
-        assert_eq!(xt.next_index(), 3, "nextindex should be 3 (XTENTRYSTART + 1)");
+        assert_eq!(
+            xt.next_index(),
+            3,
+            "nextindex should be 3 (XTENTRYSTART + 1)"
+        );
     }
 
     #[test]
@@ -999,7 +1004,10 @@ mod tests {
         data[60..64].copy_from_slice(&200u32.to_le_bytes()); // loc.addr2 = address 200
 
         let xt = Xtree::from_inode_data(&data).unwrap();
-        assert!(xt.validate().is_ok(), "non-overlapping extents should validate");
+        assert!(
+            xt.validate().is_ok(),
+            "non-overlapping extents should validate"
+        );
     }
 
     #[test]

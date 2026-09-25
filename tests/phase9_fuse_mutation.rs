@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use jfsfuse::fuse::FuseFs;
-use jfsfuse::fuse::{EEXIST, ENOENT, ENOTEMPTY, EROFS, R_OK, W_OK, X_OK, EACCES};
+use jfsfuse::fuse::{EACCES, EEXIST, ENOENT, ENOTEMPTY, EROFS, R_OK, W_OK, X_OK};
 use jfsfuse::mkfs;
 use jfsfuse::storage::Storage;
 use jfsfuse::volume::Volume;
@@ -67,7 +67,9 @@ fn test_mkdir_creates_dotdot_entries() {
     let parent = fs.volume.root_ino;
     let name = "tf9dd";
 
-    let new_ino = fs.mkdir(parent, name, 0o040755).expect("mkdir should succeed");
+    let new_ino = fs
+        .mkdir(parent, name, 0o040755)
+        .expect("mkdir should succeed");
 
     // readdir should show `.` and `..` entries.
     let entries = fs.readdir(new_ino, 0).expect("readdir should succeed");
@@ -87,7 +89,9 @@ fn test_mkdir_duplicate_fails() {
     let parent = fs.volume.root_ino;
     let name = "tf9dup";
 
-    let ino1 = fs.mkdir(parent, name, 0o040755).expect("first mkdir should succeed");
+    let ino1 = fs
+        .mkdir(parent, name, 0o040755)
+        .expect("first mkdir should succeed");
     assert!(ino1 > 0);
 
     // Creating the same name again should fail with EEXIST.
@@ -108,7 +112,9 @@ fn test_rmdir_removes_directory() {
     let parent = fs.volume.root_ino;
     let name = "tf9rm";
 
-    let ino = fs.mkdir(parent, name, 0o040755).expect("mkdir should succeed");
+    let ino = fs
+        .mkdir(parent, name, 0o040755)
+        .expect("mkdir should succeed");
 
     // Verify it exists.
     assert_eq!(fs.lookup(parent, name), Some(ino));
@@ -118,7 +124,11 @@ fn test_rmdir_removes_directory() {
     assert!(result.is_ok(), "rmdir should succeed: {:?}", result.err());
 
     // Verify it's gone.
-    assert_eq!(fs.lookup(parent, name), None, "directory should be gone after rmdir");
+    assert_eq!(
+        fs.lookup(parent, name),
+        None,
+        "directory should be gone after rmdir"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -145,14 +155,21 @@ fn test_rmdir_nonempty_fails() {
     let file_name = "tf9ne_inner";
 
     // Create a directory.
-    let dir_ino = fs.mkdir(parent, dir_name, 0o040755).expect("mkdir should succeed");
+    let dir_ino = fs
+        .mkdir(parent, dir_name, 0o040755)
+        .expect("mkdir should succeed");
 
     // Create a file inside it.
-    let _ = fs.create(dir_ino, file_name, 0o100644).expect("create should succeed");
+    let _ = fs
+        .create(dir_ino, file_name, 0o100644)
+        .expect("create should succeed");
 
     // Try to rmdir the non-empty directory — should fail with ENOTEMPTY.
     let err = fs.rmdir(parent, dir_name).unwrap_err();
-    assert_eq!(err, ENOTEMPTY, "rmdir of non-empty dir should return ENOTEMPTY");
+    assert_eq!(
+        err, ENOTEMPTY,
+        "rmdir of non-empty dir should return ENOTEMPTY"
+    );
 
     // Clean up: remove the file first, then the directory.
     let _ = fs.unlink(dir_ino, file_name);
@@ -169,7 +186,9 @@ fn test_setattr_mode() {
     let parent = fs.volume.root_ino;
     let name = "tf9attr";
 
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Change mode to 0600.
     let result = fs.setattr(ino, Some(0o100600), None, None, None, None, None);
@@ -195,7 +214,9 @@ fn test_setattr_uid_gid() {
     let parent = fs.volume.root_ino;
     let name = "tf9ug";
 
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Change uid and gid.
     let result = fs.setattr(ino, None, Some(1000), Some(2000), None, None, None);
@@ -230,7 +251,9 @@ fn test_open_succeeds_for_existing_inode() {
     let parent = fs.volume.root_ino;
     let name = "tf9open";
 
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     let result = fs.open(ino);
     assert!(result.is_ok(), "open should succeed for existing inode");
@@ -248,7 +271,9 @@ fn test_release_is_noop() {
     let parent = fs.volume.root_ino;
     let name = "tf9rel";
 
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     let result = fs.release(ino);
     assert!(result.is_ok(), "release should succeed");
@@ -292,7 +317,9 @@ fn test_rename_file_in_same_directory() {
     let parent = fs.volume.root_ino;
 
     // Create a file named "foo".
-    let ino = fs.create(parent, "foo", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "foo", 0o100644)
+        .expect("create should succeed");
 
     // Rename "foo" to "bar" in the same directory.
     let result = fs.rename(parent, "foo", parent, "bar");
@@ -313,8 +340,12 @@ fn test_rename_to_existing_overwrites_file() {
 
     let parent = fs.volume.root_ino;
 
-    let ino_a = fs.create(parent, "a", 0o100644).expect("create should succeed");
-    let _ino_b = fs.create(parent, "b", 0o100644).expect("create should succeed");
+    let ino_a = fs
+        .create(parent, "a", 0o100644)
+        .expect("create should succeed");
+    let _ino_b = fs
+        .create(parent, "b", 0o100644)
+        .expect("create should succeed");
 
     // Rename "a" to "b", overwriting "b".
     let result = fs.rename(parent, "a", parent, "b");
@@ -361,7 +392,9 @@ fn test_rename_directory_same_parent() {
     let parent = fs.volume.root_ino;
 
     // Create a directory named "mydir".
-    let ino = fs.mkdir(parent, "mydir", 0o040755).expect("mkdir should succeed");
+    let ino = fs
+        .mkdir(parent, "mydir", 0o040755)
+        .expect("mkdir should succeed");
 
     // Rename "mydir" to "yourdir" in the same directory.
     let result = fs.rename(parent, "mydir", parent, "yourdir");
@@ -387,14 +420,17 @@ fn test_mkdir_increments_parent_nlink() {
     let parent_before = fs.getattr(parent).expect("should getattr parent");
     let nlink_before = u32::from_le_bytes(parent_before.di_nlink);
 
-    let _ = fs.mkdir(parent, name, 0o040755).expect("mkdir should succeed");
+    let _ = fs
+        .mkdir(parent, name, 0o040755)
+        .expect("mkdir should succeed");
 
     // Get parent's nlink after mkdir.
     let parent_after = fs.getattr(parent).expect("should getattr parent");
     let nlink_after = u32::from_le_bytes(parent_after.di_nlink);
 
     assert_eq!(
-        nlink_after, nlink_before + 1,
+        nlink_after,
+        nlink_before + 1,
         "mkdir should increment parent's link count"
     );
 
@@ -412,7 +448,9 @@ fn test_rmdir_decrements_parent_nlink() {
     let parent = fs.volume.root_ino;
     let name = "tf9dl";
 
-    let _ = fs.mkdir(parent, name, 0o040755).expect("mkdir should succeed");
+    let _ = fs
+        .mkdir(parent, name, 0o040755)
+        .expect("mkdir should succeed");
 
     let parent_after_mkdir = fs.getattr(parent).expect("should getattr parent");
     let nlink_after_mkdir = u32::from_le_bytes(parent_after_mkdir.di_nlink);
@@ -423,7 +461,8 @@ fn test_rmdir_decrements_parent_nlink() {
     let nlink_after_rmdir = u32::from_le_bytes(parent_after_rmdir.di_nlink);
 
     assert_eq!(
-        nlink_after_rmdir, nlink_after_mkdir - 1,
+        nlink_after_rmdir,
+        nlink_after_mkdir - 1,
         "rmdir should decrement parent's link count"
     );
 }
@@ -446,7 +485,9 @@ fn test_copy_file_range_basic() {
     assert_eq!(written, data.len());
 
     // Read back from source to verify write worked.
-    let src_read = fs.read(src_ino, 0, data.len()).expect("read src for verify");
+    let src_read = fs
+        .read(src_ino, 0, data.len())
+        .expect("read src for verify");
     assert_eq!(&src_read, data, "source data should match after write");
 
     // Create destination file.
@@ -454,7 +495,11 @@ fn test_copy_file_range_basic() {
 
     // Copy from src to dst.
     let copied = fs.copy_file_range(src_ino, 0, dst_ino, 0, data.len(), 0);
-    assert!(copied.is_ok(), "copy_file_range should succeed: {:?}", copied.err());
+    assert!(
+        copied.is_ok(),
+        "copy_file_range should succeed: {:?}",
+        copied.err()
+    );
     assert_eq!(copied.unwrap(), data.len(), "should copy all bytes");
 
     // Verify destination content.
@@ -478,7 +523,12 @@ fn test_copy_file_range_with_move() {
 
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
     let copied = fs.copy_file_range(
-        src_ino, 0, dst_ino, 0, data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+        src_ino,
+        0,
+        dst_ino,
+        0,
+        data.len(),
+        FUSE_COPY_FILE_RANGE_MOVE,
     );
     assert!(copied.is_ok(), "copy with MOVE should succeed");
 
@@ -487,7 +537,9 @@ fn test_copy_file_range_with_move() {
     assert_eq!(&read_dst[..], data, "destination content should match");
 
     // Source should have a hole (zero-filled).
-    let read_src = fs.read(src_ino, 0, data.len()).expect("read src after move");
+    let read_src = fs
+        .read(src_ino, 0, data.len())
+        .expect("read src after move");
     assert!(
         read_src.iter().all(|&b| b == 0),
         "source should be zeroed after MOVE"
@@ -533,9 +585,18 @@ fn test_copy_file_range_large_copy() {
     // Copy the full 200KB — should use internal looping, not just one 64KB chunk.
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
     let copied = fs.copy_file_range(
-        src_ino, 0, dst_ino, 0, large_data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+        src_ino,
+        0,
+        dst_ino,
+        0,
+        large_data.len(),
+        FUSE_COPY_FILE_RANGE_MOVE,
     );
-    assert!(copied.is_ok(), "copy_file_range should succeed: {:?}", copied.err());
+    assert!(
+        copied.is_ok(),
+        "copy_file_range should succeed: {:?}",
+        copied.err()
+    );
     assert_eq!(
         copied.unwrap(),
         large_data.len(),
@@ -543,8 +604,14 @@ fn test_copy_file_range_large_copy() {
     );
 
     // Verify destination content matches.
-    let read_back = fs.read(dst_ino, 0, large_data.len()).expect("should read dst");
-    assert_eq!(&read_back[..], &large_data[..], "destination content should match source");
+    let read_back = fs
+        .read(dst_ino, 0, large_data.len())
+        .expect("should read dst");
+    assert_eq!(
+        &read_back[..],
+        &large_data[..],
+        "destination content should match source"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -571,17 +638,32 @@ fn test_copy_file_range_move_overwrites_destination() {
     // MOVE data from src to dst (overwriting dst content).
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
     let copied = fs.copy_file_range(
-        src_ino, 0, dst_ino, 0, src_data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+        src_ino,
+        0,
+        dst_ino,
+        0,
+        src_data.len(),
+        FUSE_COPY_FILE_RANGE_MOVE,
     );
-    assert!(copied.is_ok(), "copy_file_range MOVE should succeed: {:?}", copied.err());
+    assert!(
+        copied.is_ok(),
+        "copy_file_range MOVE should succeed: {:?}",
+        copied.err()
+    );
     assert_eq!(copied.unwrap(), src_data.len());
 
     // Destination should now contain source data.
     let read_dst = fs.read(dst_ino, 0, src_data.len()).expect("read dst");
-    assert_eq!(&read_dst[..], src_data, "destination should contain source data after MOVE");
+    assert_eq!(
+        &read_dst[..],
+        src_data,
+        "destination should contain source data after MOVE"
+    );
 
     // Source should have holes (data was moved, not copied).
-    let read_src = fs.read(src_ino, 0, src_data.len()).expect("read src after MOVE");
+    let read_src = fs
+        .read(src_ino, 0, src_data.len())
+        .expect("read src after MOVE");
     assert!(
         read_src.iter().all(|&b| b == 0),
         "source should be zeroed after MOVE, got: {:?}",
@@ -613,7 +695,12 @@ fn test_copy_file_range_move_preserves_source_size() {
     // MOVE — should preserve source file size (data moved, not deleted).
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
     let copied = fs.copy_file_range(
-        src_ino, 0, dst_ino, 0, data.len(), FUSE_COPY_FILE_RANGE_MOVE,
+        src_ino,
+        0,
+        dst_ino,
+        0,
+        data.len(),
+        FUSE_COPY_FILE_RANGE_MOVE,
     );
     assert!(copied.is_ok(), "MOVE should succeed: {:?}", copied.err());
 
@@ -645,15 +732,21 @@ fn test_copy_file_range_block_aligned_move() {
 
     // Block-aligned MOVE — should use the optimized extent-stealing path.
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
-    let copied = fs.copy_file_range(
-        src_ino, 0, dst_ino, 0, 4096, FUSE_COPY_FILE_RANGE_MOVE,
+    let copied = fs.copy_file_range(src_ino, 0, dst_ino, 0, 4096, FUSE_COPY_FILE_RANGE_MOVE);
+    assert!(
+        copied.is_ok(),
+        "aligned MOVE should succeed: {:?}",
+        copied.err()
     );
-    assert!(copied.is_ok(), "aligned MOVE should succeed: {:?}", copied.err());
     assert_eq!(copied.unwrap(), 4096);
 
     // Verify destination data matches.
     let read_dst = fs.read(dst_ino, 0, 4096).expect("read dst");
-    assert_eq!(&read_dst[..], &block_data[..], "destination data should match");
+    assert_eq!(
+        &read_dst[..],
+        &block_data[..],
+        "destination data should match"
+    );
 
     // Source should have holes.
     let read_src = fs.read(src_ino, 0, 4096).expect("read src after MOVE");
@@ -686,7 +779,11 @@ fn test_copy_file_range_non_move_does_not_punch_source() {
 
     // Destination should contain the data.
     let read_dst = fs.read(dst_ino, 0, data.len()).expect("read dst");
-    assert_eq!(&read_dst[..], data, "destination should contain source data");
+    assert_eq!(
+        &read_dst[..],
+        data,
+        "destination should contain source data"
+    );
 
     // Source should still have its original data (copy, not move).
     let read_src = fs.read(src_ino, 0, data.len()).expect("read src");
@@ -713,15 +810,17 @@ fn test_copy_file_range_partial_offset_copy() {
     // Copy from offset 5, length 10 (non-block-aligned) — should fall back
     // to read/write path and copy exactly the right bytes.
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
-    let copied = fs.copy_file_range(
-        src_ino, 5, dst_ino, 0, 10, FUSE_COPY_FILE_RANGE_MOVE,
-    );
+    let copied = fs.copy_file_range(src_ino, 5, dst_ino, 0, 10, FUSE_COPY_FILE_RANGE_MOVE);
     assert!(copied.is_ok(), "copy should succeed: {:?}", copied.err());
     assert_eq!(copied.unwrap(), 10);
 
     // Destination should contain bytes 5..15 from source.
     let read_dst = fs.read(dst_ino, 0, 10).expect("read dst");
-    assert_eq!(&read_dst[..], &data[5..15], "destination should contain partial source data");
+    assert_eq!(
+        &read_dst[..],
+        &data[5..15],
+        "destination should contain partial source data"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -744,18 +843,35 @@ fn test_copy_file_range_move_destination_extends_size() {
 
     // MOVE to destination at a non-zero offset — extends destination size.
     const FUSE_COPY_FILE_RANGE_MOVE: u32 = 1;
-    let copied = fs.copy_file_range(src_ino, 0, dst_ino, 100, data.len(), FUSE_COPY_FILE_RANGE_MOVE);
+    let copied = fs.copy_file_range(
+        src_ino,
+        0,
+        dst_ino,
+        100,
+        data.len(),
+        FUSE_COPY_FILE_RANGE_MOVE,
+    );
     assert!(copied.is_ok(), "MOVE should succeed: {:?}", copied.err());
     assert_eq!(copied.unwrap(), data.len());
 
     // Destination size should reflect the offset + data length.
     let dst_attr = fs.getattr(dst_ino).expect("getattr dst");
     let dst_size = u64::from_le_bytes(dst_attr.di_size);
-    assert_eq!(dst_size, 100 + data.len() as u64, "destination size should be 100 + data len");
+    assert_eq!(
+        dst_size,
+        100 + data.len() as u64,
+        "destination size should be 100 + data len"
+    );
 
     // Data at offset 100 should match source.
-    let read_dst = fs.read(dst_ino, 100, data.len()).expect("read dst at offset");
-    assert_eq!(&read_dst[..], data, "destination data at offset should match");
+    let read_dst = fs
+        .read(dst_ino, 100, data.len())
+        .expect("read dst at offset");
+    assert_eq!(
+        &read_dst[..],
+        data,
+        "destination data at offset should match"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -768,7 +884,9 @@ fn test_mknod_creates_fifo() {
     let parent = fs.volume.root_ino;
 
     // S_IFIFO | 0644 = 0x1000 | 0x1A4 = 0x11A4
-    let ino = fs.mknod(parent, "fifo", 0x11A4, 0).expect("mknod should succeed");
+    let ino = fs
+        .mknod(parent, "fifo", 0x11A4, 0)
+        .expect("mknod should succeed");
 
     // The inode should exist and be a FIFO.
     let dinode = fs.getattr(ino).expect("should getattr fifo");
@@ -922,7 +1040,16 @@ fn test_access_directory_search_permission() {
 
     let parent = fs.volume.root_ino;
     let ino = fs.mkdir(parent, "dir", 0o040700).expect("mkdir");
-    fs.setattr(ino, Some(0o040700), Some(1000), Some(1000), None, None, None).expect("setattr");
+    fs.setattr(
+        ino,
+        Some(0o040700),
+        Some(1000),
+        Some(1000),
+        None,
+        None,
+        None,
+    )
+    .expect("setattr");
 
     // Owner has execute (search) permission on directory.
     assert!(fs.access(ino, X_OK, 1000, 1000).is_ok());
@@ -954,7 +1081,11 @@ fn test_rename_cross_directory_with_overwrite() {
 
     // Cross-directory rename: dir1/source -> dir2/target (overwrite).
     let result = fs.rename(dir1, "source", dir2, "target");
-    assert!(result.is_ok(), "cross-dir rename should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cross-dir rename should succeed: {:?}",
+        result.err()
+    );
 
     // "source" should be gone from dir1.
     assert_eq!(fs.lookup(dir1, "source"), None);
@@ -964,7 +1095,11 @@ fn test_rename_cross_directory_with_overwrite() {
 
     // src_ino should have its original data (not the target's data).
     let data = fs.read(src_ino, 0, 100).expect("read renamed file");
-    assert_eq!(&data[..], b"moved data", "renamed file should retain source data");
+    assert_eq!(
+        &data[..],
+        b"moved data",
+        "renamed file should retain source data"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -985,7 +1120,11 @@ fn test_rename_cross_directory_simple_move() {
 
     // Move from dir1 to dir2 (no existing target).
     let result = fs.rename(dir1, "file", dir2, "moved");
-    assert!(result.is_ok(), "cross-dir rename should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cross-dir rename should succeed: {:?}",
+        result.err()
+    );
 
     // Source name gone from dir1.
     assert_eq!(fs.lookup(dir1, "file"), None);
@@ -994,7 +1133,11 @@ fn test_rename_cross_directory_simple_move() {
 
     // Data preserved.
     let read_back = fs.read(src_ino, 0, data.len()).expect("read after rename");
-    assert_eq!(&read_back[..], data, "data should be preserved after cross-dir rename");
+    assert_eq!(
+        &read_back[..],
+        data,
+        "data should be preserved after cross-dir rename"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -1011,11 +1154,17 @@ fn test_rename_cross_directory_directory() {
 
     // Create a subdirectory in dir1 with a file inside.
     let subdir = fs.mkdir(dir1, "subdir", 0o040755).expect("mkdir subdir");
-    let _ = fs.create(subdir, "inner", 0o100644).expect("create inner file");
+    let _ = fs
+        .create(subdir, "inner", 0o100644)
+        .expect("create inner file");
 
     // Rename the subdirectory across directories.
     let result = fs.rename(dir1, "subdir", dir2, "subdir2");
-    assert!(result.is_ok(), "cross-dir dir rename should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cross-dir dir rename should succeed: {:?}",
+        result.err()
+    );
 
     // Should be gone from dir1.
     assert_eq!(fs.lookup(dir1, "subdir"), None);
@@ -1023,5 +1172,8 @@ fn test_rename_cross_directory_directory() {
     assert_eq!(fs.lookup(dir2, "subdir2"), Some(subdir));
 
     // Inner file should still exist.
-    assert!(fs.lookup(subdir, "inner").is_some(), "inner file should survive dir move");
+    assert!(
+        fs.lookup(subdir, "inner").is_some(),
+        "inner file should survive dir move"
+    );
 }

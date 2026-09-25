@@ -12,7 +12,7 @@ use jfsfuse::volume::Volume;
 
 /// Read the inline log base from the JFS superblock.
 fn read_inline_log_base(storage: &dyn Storage) -> Option<u64> {
-    use jfsfuse::types::{PSIZE, SUPER1_OFF, JfsSuperblock};
+    use jfsfuse::types::{JfsSuperblock, PSIZE, SUPER1_OFF};
     let sb_bytes = storage.read_bytes(SUPER1_OFF, PSIZE).unwrap();
     let mut sb = JfsSuperblock::default();
     if sb_bytes.len() >= 80 {
@@ -37,7 +37,8 @@ fn test_volume_mount_runs_recovery_on_dirty_log() {
     let log_base = read_inline_log_base(&*storage).expect("image should have inline log");
     let ls_clean = LogManager::read_super(&*storage, log_base).unwrap();
     assert_eq!(
-        ls_clean.state(), LOGREDONE,
+        ls_clean.state(),
+        LOGREDONE,
         "generated image should start with LOGREDONE state"
     );
 

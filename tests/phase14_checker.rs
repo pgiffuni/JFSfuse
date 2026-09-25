@@ -34,7 +34,9 @@ fn test_check_consistent_clean_image() {
 fn test_check_consistent_after_create() {
     let vol = load_image_to_memory();
     let mut vol = vol;
-    let _ = vol.create_file(vol.root_ino, "tf14chk").expect("create should succeed");
+    let _ = vol
+        .create_file(vol.root_ino, "tf14chk")
+        .expect("create should succeed");
 
     let report = vol.check_consistent().expect("check should succeed");
     // New file may still be consistent.
@@ -42,7 +44,10 @@ fn test_check_consistent_after_create() {
         // At most should be warnings about xattr or mode flags, not hard errors.
         let errors: Vec<_> = report.issues.iter().filter(|i| i.level >= 2).collect();
         // The new file has mode 0x81a4 which doesn't set INLINEEA, so no xattr issues.
-        assert!(errors.is_empty(), "create should not cause consistency errors");
+        assert!(
+            errors.is_empty(),
+            "create should not cause consistency errors"
+        );
     }
 }
 

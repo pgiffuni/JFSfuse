@@ -16,16 +16,16 @@ use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+#[cfg(feature = "writable")]
+use crate::alloc::dmap::BlockAllocMap;
 use crate::journal::{JournalRecovery, LogManager};
 use crate::storage::{
     BLOCK_SIZE, FileStorage, PageCache, Result as StorageResult, Storage, StorageError,
 };
 use crate::transaction::{CommitResult, TransactionId, TransactionManager};
-#[cfg(feature = "writable")]
-use crate::alloc::dmap::BlockAllocMap;
 use crate::types::{
-    self, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JfsSuperblock,
-    LOGMAGIC, LOGREDONE, LOGVERSION, PSIZE, ROOT_I, SUPER1_OFF,
+    self, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JfsSuperblock, LOGMAGIC, LOGREDONE, LOGVERSION,
+    PSIZE, ROOT_I, SUPER1_OFF,
 };
 
 /// A mounted JFS volume.
@@ -443,7 +443,11 @@ impl Volume {
 
     /// Mark a cached page dirty under the current transaction (writable builds only).
     #[cfg(feature = "writable")]
-    pub fn mark_page_dirty(&mut self, inode: u32, block: crate::types::BlockNo) -> StorageResult<()> {
+    pub fn mark_page_dirty(
+        &mut self,
+        inode: u32,
+        block: crate::types::BlockNo,
+    ) -> StorageResult<()> {
         self.tx_mgr.mark_dirty(&mut self.page_cache, inode, block)
     }
 
@@ -458,12 +462,7 @@ impl Volume {
     /// 6. Journal metadata (inode page) via TransactionManager
     /// 7. Commit transaction (journal flush + metadata flush)
     #[cfg(feature = "writable")]
-    pub fn write_at(
-        &mut self,
-        ino: u32,
-        offset: u64,
-        data: &[u8],
-    ) -> StorageResult<usize> {
+    pub fn write_at(&mut self, ino: u32, offset: u64, data: &[u8]) -> StorageResult<usize> {
         self.write_at_with_interrupt(ino, offset, data, None)
     }
 
@@ -530,15 +529,13 @@ impl Volume {
                                 if remaining_in_hole == 0 {
                                     break;
                                 }
-                                let to_copy = std::cmp::min(
-                                    BLOCK_SIZE - cur_offset,
-                                    remaining_in_hole,
-                                );
+                                let to_copy =
+                                    std::cmp::min(BLOCK_SIZE - cur_offset, remaining_in_hole);
                                 let mut block_data = vec![0u8; BLOCK_SIZE as usize];
                                 if data_pos_in_hole + to_copy <= data.len() {
-                                    block_data[cur_offset..cur_offset + to_copy]
-                                        .copy_from_slice(&data[data_pos_in_hole
-                                        ..data_pos_in_hole + to_copy]);
+                                    block_data[cur_offset..cur_offset + to_copy].copy_from_slice(
+                                        &data[data_pos_in_hole..data_pos_in_hole + to_copy],
+                                    );
                                 }
                                 self.storage.write_block(new_addr + blk, &block_data)?;
 
@@ -549,11 +546,7 @@ impl Volume {
                             }
 
                             // Insert the new extent into the xtree.
-                            if xtree.insert_extent(
-                                next_logical as i64,
-                                new_len as u32,
-                                new_addr,
-                            ) {
+                            if xtree.insert_extent(next_logical as i64, new_len as u32, new_addr) {
                                 xtree_modified = true;
                             }
 
@@ -724,21 +717,17 @@ impl Volume {
     /// `FALLOC_FL_COLLAPSE_RANGE`, `FALLOC_FL_INSERT_RANGE`,
     /// `FALLOC_FL_ZERO_RANGE`, and `FALLOC_FL_NOCACHE` are not supported.
     #[cfg(feature = "writable")]
-    pub fn fallocate(
-        &mut self,
-        ino: u32,
-        offset: u64,
-        len: u64,
-        mode: u32,
-    ) -> StorageResult<()> {
+    pub fn fallocate(&mut self, ino: u32, offset: u64, len: u64, mode: u32) -> StorageResult<()> {
         const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
         const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
         const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
         const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
         const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
         const FALLOC_FL_NOCACHE: u32 = 0x40;
-        const FALLOC_FL_UNSUPPORTED: u32 =
-            FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE | FALLOC_FL_INSERT_RANGE | FALLOC_FL_NOCACHE;
+        const FALLOC_FL_UNSUPPORTED: u32 = FALLOC_FL_COLLAPSE_RANGE
+            | FALLOC_FL_ZERO_RANGE
+            | FALLOC_FL_INSERT_RANGE
+            | FALLOC_FL_NOCACHE;
 
         if mode & FALLOC_FL_UNSUPPORTED != 0 {
             return Err(StorageError::Other(format!(
@@ -802,14 +791,9 @@ impl Volume {
                 inode.size()
             };
             if new_size != inode.size() {
-                self.update_inode_page(
-                    ino,
-                    inode.page_block,
-                    inode.page_offset,
-                    |dinode_bytes| {
-                        LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size);
-                    },
-                )?;
+                self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
+                    LittleEndian::write_u64(&mut dinode_bytes[24..32], new_size);
+                })?;
             }
         }
 
@@ -818,8 +802,7 @@ impl Volume {
             self.update_inode_page(ino, inode.page_block, inode.page_offset, |dinode_bytes| {
                 let xt_off = crate::types::Dinode::size() - xt_bytes.len();
                 dinode_bytes[xt_off..xt_off + xt_bytes.len()].copy_from_slice(&xt_bytes);
-                let total_blocks =
-                    xtree.iter_extents().map(|e| e.length as u64).sum::<u64>();
+                let total_blocks = xtree.iter_extents().map(|e| e.length as u64).sum::<u64>();
                 LittleEndian::write_u64(&mut dinode_bytes[32..40], total_blocks);
             })?;
         }
@@ -923,10 +906,7 @@ impl Volume {
             }
         }
 
-        let new_dst_size = std::cmp::max(
-            dst_inode.size(),
-            dst_offset + len as u64,
-        );
+        let new_dst_size = std::cmp::max(dst_inode.size(), dst_offset + len as u64);
         let old_dst_nblocks = dst_inode.dinode.nblocks();
         let new_dst_nblocks = self.compute_nblocks(&dst_xtree, old_dst_nblocks)?;
 
@@ -1087,7 +1067,9 @@ impl Volume {
     ) -> StorageResult<()> {
         let dinode_size = crate::types::Dinode::size();
         // Ensure the page is in the cache.
-        let _ = self.page_cache.get_or_load(&*self.storage, ino, page_block, 0)?;
+        let _ = self
+            .page_cache
+            .get_or_load(&*self.storage, ino, page_block, 0)?;
         let page = self
             .page_cache
             .get_mut_for_write(ino, page_block)
@@ -1110,11 +1092,7 @@ impl Volume {
         fallback: u64,
     ) -> StorageResult<u64> {
         let total = xtree.iter_extents().map(|e| e.length as u64).sum::<u64>();
-        if total > 0 {
-            Ok(total)
-        } else {
-            Ok(fallback)
-        }
+        if total > 0 { Ok(total) } else { Ok(fallback) }
     }
 
     /// Find the first free inode in the aggregate inode table.
@@ -1136,14 +1114,15 @@ impl Volume {
                 Some(page) => page.data,
                 None => self.storage.read_block(block_num)?,
             };
-             for i in 0..crate::types::INOSPERPAGE {
+            for i in 0..crate::types::INOSPERPAGE {
                 let off = (i as usize) * crate::types::DISIZE;
                 if off + crate::types::DISIZE > data.len() {
                     break;
                 }
                 let mode = LittleEndian::read_u32(&data[off + 52..off + 56]);
                 if mode == 0 {
-                    let ino = FILESYSTEM_I + (block_offset * crate::types::INOSPERPAGE as u64 + i as u64) as u32;
+                    let ino = FILESYSTEM_I
+                        + (block_offset * crate::types::INOSPERPAGE as u64 + i as u64) as u32;
                     // Skip inode numbers that collide with known special inodes
                     // (e.g. root inode has ino = FILESYSTEM_I + ROOT_I).
                     if ino == FILESYSTEM_I + crate::types::ROOT_I {
@@ -1175,10 +1154,15 @@ impl Volume {
 
         if inserted {
             let dt_bytes = dtree.to_bytes().to_vec();
-            self.update_inode_page(parent_ino, inode.page_block, inode.page_offset, |dinode_bytes| {
-                let dt_off = crate::types::Dinode::size() - dt_bytes.len();
-                dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
-            })?;
+            self.update_inode_page(
+                parent_ino,
+                inode.page_block,
+                inode.page_offset,
+                |dinode_bytes| {
+                    let dt_off = crate::types::Dinode::size() - dt_bytes.len();
+                    dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
+                },
+            )?;
         }
 
         Ok(inserted)
@@ -1208,11 +1192,15 @@ impl Volume {
         // Validate name lengths.
         if old_name_u16.is_empty() || old_name_u16.len() > 11 {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid source filename length".to_string()));
+            return Err(StorageError::Other(
+                "invalid source filename length".to_string(),
+            ));
         }
         if new_name_u16.is_empty() || new_name_u16.len() > 11 {
             self.abort_transaction();
-            return Err(StorageError::Other("invalid destination filename length".to_string()));
+            return Err(StorageError::Other(
+                "invalid destination filename length".to_string(),
+            ));
         }
 
         // Look up the source entry to get its inode number and type.
@@ -1250,8 +1238,9 @@ impl Volume {
                         ));
                     }
                     if child_is_dir && dest.is_dir() {
-                        let dest_entries = crate::btree::dtree::Dtree::from_inode_data(dest.dtroot_bytes())?
-                            .entries()?;
+                        let dest_entries =
+                            crate::btree::dtree::Dtree::from_inode_data(dest.dtroot_bytes())?
+                                .entries()?;
                         if !dest_entries.is_empty() {
                             self.abort_transaction();
                             return Err(StorageError::Other(
@@ -1268,10 +1257,12 @@ impl Volume {
             // Insert into new parent.
             let num_entries = {
                 let new_parent_data = crate::inode::Inode::read(self, new_parent)?;
-                let dtree = crate::btree::dtree::Dtree::from_inode_data(new_parent_data.dtroot_bytes())?;
+                let dtree =
+                    crate::btree::dtree::Dtree::from_inode_data(new_parent_data.dtroot_bytes())?;
                 dtree.entries().map(|e| e.len() as u32).unwrap_or(0)
             };
-            let inserted = self.insert_dir_entry(new_parent, &new_name_u16, child_ino, num_entries)?;
+            let inserted =
+                self.insert_dir_entry(new_parent, &new_name_u16, child_ino, num_entries)?;
             if !inserted {
                 self.abort_transaction();
                 return Err(StorageError::Other(
@@ -1294,29 +1285,47 @@ impl Volume {
             if child_is_dir {
                 // Update `..` in child to point to new parent.
                 let child_data = crate::inode::Inode::read(self, child_ino)?;
-                self.update_inode_page(child_ino, child_data.page_block, child_data.page_offset, |dinode_bytes| {
-                    let dt_start = crate::types::Dinode::size() - 288;
-                    let parent_off = dt_start + 20;
-                    if parent_off + 4 <= dinode_bytes.len() {
-                        LittleEndian::write_u32(&mut dinode_bytes[parent_off..parent_off + 4], new_parent);
-                    }
-                })?;
+                self.update_inode_page(
+                    child_ino,
+                    child_data.page_block,
+                    child_data.page_offset,
+                    |dinode_bytes| {
+                        let dt_start = crate::types::Dinode::size() - 288;
+                        let parent_off = dt_start + 20;
+                        if parent_off + 4 <= dinode_bytes.len() {
+                            LittleEndian::write_u32(
+                                &mut dinode_bytes[parent_off..parent_off + 4],
+                                new_parent,
+                            );
+                        }
+                    },
+                )?;
                 self.mark_page_dirty(child_ino, child_data.page_block)?;
 
                 // Decrement old parent's link count.
                 let old_parent_data = crate::inode::Inode::read(self, old_parent)?;
-                self.update_inode_page(old_parent, old_parent_data.page_block, old_parent_data.page_offset, |dinode_bytes| {
-                    let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
-                    LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink.saturating_sub(1));
-                })?;
+                self.update_inode_page(
+                    old_parent,
+                    old_parent_data.page_block,
+                    old_parent_data.page_offset,
+                    |dinode_bytes| {
+                        let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+                        LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink.saturating_sub(1));
+                    },
+                )?;
                 self.mark_page_dirty(old_parent, old_parent_data.page_block)?;
 
                 // Increment new parent's link count.
                 let new_parent_data = crate::inode::Inode::read(self, new_parent)?;
-                self.update_inode_page(new_parent, new_parent_data.page_block, new_parent_data.page_offset, |dinode_bytes| {
-                    let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
-                    LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
-                })?;
+                self.update_inode_page(
+                    new_parent,
+                    new_parent_data.page_block,
+                    new_parent_data.page_offset,
+                    |dinode_bytes| {
+                        let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+                        LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
+                    },
+                )?;
                 self.mark_page_dirty(new_parent, new_parent_data.page_block)?;
             }
         } else {
@@ -1340,8 +1349,9 @@ impl Volume {
                         ));
                     }
                     if child_is_dir && dest.is_dir() {
-                        let dest_entries = crate::btree::dtree::Dtree::from_inode_data(dest.dtroot_bytes())?
-                            .entries()?;
+                        let dest_entries =
+                            crate::btree::dtree::Dtree::from_inode_data(dest.dtroot_bytes())?
+                                .entries()?;
                         if !dest_entries.is_empty() {
                             self.abort_transaction();
                             return Err(StorageError::Other(
@@ -1370,10 +1380,15 @@ impl Volume {
 
             // Write updated dtroot back to the parent's page.
             let dt_bytes = dtree.to_bytes().to_vec();
-            self.update_inode_page(old_parent, parent.page_block, parent.page_offset, |dinode_bytes| {
-                let dt_off = crate::types::Dinode::size() - dt_bytes.len();
-                dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
-            })?;
+            self.update_inode_page(
+                old_parent,
+                parent.page_block,
+                parent.page_offset,
+                |dinode_bytes| {
+                    let dt_off = crate::types::Dinode::size() - dt_bytes.len();
+                    dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
+                },
+            )?;
             self.mark_page_dirty(old_parent, parent.page_block)?;
         }
 
@@ -1394,14 +1409,18 @@ impl Volume {
         if removed.is_some() {
             let dt_bytes = dtree.to_bytes().to_vec();
             let dt_off = crate::types::Dinode::size() - dt_bytes.len();
-            self.update_inode_page(parent_ino, inode.page_block, inode.page_offset, |dinode_bytes| {
-                dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
-            })?;
+            self.update_inode_page(
+                parent_ino,
+                inode.page_block,
+                inode.page_offset,
+                |dinode_bytes| {
+                    dinode_bytes[dt_off..dt_off + dt_bytes.len()].copy_from_slice(&dt_bytes);
+                },
+            )?;
         }
 
         Ok(removed)
     }
-
 
     /// Create a regular file in a directory.
     ///
@@ -1438,7 +1457,10 @@ impl Volume {
             LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
             // Set fileset and inode number.
             LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
-            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(
+                &mut dinode_bytes[8..12],
+                child_ino - crate::types::FILESYSTEM_I,
+            );
         })?;
         self.mark_page_dirty(child_ino, _child_block)?;
 
@@ -1500,7 +1522,10 @@ impl Volume {
             LittleEndian::write_u32(&mut dinode_bytes[40..44], 2);
             // Set fileset and ino number for the child.
             LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
-            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(
+                &mut dinode_bytes[8..12],
+                child_ino - crate::types::FILESYSTEM_I,
+            );
 
             // Initialize the dtroot (inline directory B+-tree root, 288 bytes).
             // The dtroot is at u[96..] which maps to dinode offset 224 (128+96).
@@ -1563,10 +1588,15 @@ impl Volume {
 
         // 5. Increment parent's link count (directories have subdirectory link count).
         let parent = crate::inode::Inode::read(self, parent_ino)?;
-        self.update_inode_page(parent_ino, parent.page_block, parent.page_offset, |dinode_bytes| {
-            let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
-            LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
-        })?;
+        self.update_inode_page(
+            parent_ino,
+            parent.page_block,
+            parent.page_offset,
+            |dinode_bytes| {
+                let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+                LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink + 1);
+            },
+        )?;
         self.mark_page_dirty(parent_ino, parent.page_block)?;
 
         // 6. Commit.
@@ -1585,7 +1615,13 @@ impl Volume {
     /// 4. Insert directory entry in parent.
     /// 5. Commit.
     #[cfg(feature = "writable")]
-    pub fn mknod(&mut self, parent_ino: u32, name: &str, mode: u32, rdev: u64) -> StorageResult<u32> {
+    pub fn mknod(
+        &mut self,
+        parent_ino: u32,
+        name: &str,
+        mode: u32,
+        rdev: u64,
+    ) -> StorageResult<u32> {
         let _ = self.begin_transaction()?;
 
         // Validate name length.
@@ -1620,7 +1656,10 @@ impl Volume {
             LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
             // Set fileset and inode number.
             LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
-            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(
+                &mut dinode_bytes[8..12],
+                child_ino - crate::types::FILESYSTEM_I,
+            );
 
             // For device files, store rdev in the PXD field (bytes 16-24).
             // This is non-standard for JDS but works for our FUSE implementation
@@ -1694,20 +1733,30 @@ impl Volume {
         }
 
         // 4. Free the child inode (set mode to 0 = unused).
-        self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
-            // Zero out the mode to mark as free.
-            LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
-            LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
-            LittleEndian::write_u32(&mut dinode_bytes[40..44], 0);
-        })?;
+        self.update_inode_page(
+            child_ino,
+            child.page_block,
+            child.page_offset,
+            |dinode_bytes| {
+                // Zero out the mode to mark as free.
+                LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
+                LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+                LittleEndian::write_u32(&mut dinode_bytes[40..44], 0);
+            },
+        )?;
         self.mark_page_dirty(child_ino, child.page_block)?;
 
         // 5. Decrement parent's link count.
         let parent = crate::inode::Inode::read(self, parent_ino)?;
-        self.update_inode_page(parent_ino, parent.page_block, parent.page_offset, |dinode_bytes| {
-            let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
-            LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink - 1);
-        })?;
+        self.update_inode_page(
+            parent_ino,
+            parent.page_block,
+            parent.page_offset,
+            |dinode_bytes| {
+                let nlink = LittleEndian::read_u32(&dinode_bytes[40..44]);
+                LittleEndian::write_u32(&mut dinode_bytes[40..44], nlink - 1);
+            },
+        )?;
         self.mark_page_dirty(parent_ino, parent.page_block)?;
 
         // 6. Commit.
@@ -1770,12 +1819,17 @@ impl Volume {
                 Vec::new()
             };
 
-            self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
-                // Zero out the mode to mark as free.
-                LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
-                LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
-                LittleEndian::write_u32(&mut dinode_bytes[40..44], 0);
-            })?;
+            self.update_inode_page(
+                child_ino,
+                child.page_block,
+                child.page_offset,
+                |dinode_bytes| {
+                    // Zero out the mode to mark as free.
+                    LittleEndian::write_u32(&mut dinode_bytes[52..56], 0);
+                    LittleEndian::write_u64(&mut dinode_bytes[24..32], 0);
+                    LittleEndian::write_u32(&mut dinode_bytes[40..44], 0);
+                },
+            )?;
 
             // Free the blocks.
             if let Some(bmap) = self.bmap.as_mut() {
@@ -1790,9 +1844,14 @@ impl Volume {
             // Still has open handles or nlink > 0 — just decrement nlink.
             // This implements the open-unlinked semantics: the inode persists
             // in the inode table until the last open handle is released.
-            self.update_inode_page(child_ino, child.page_block, child.page_offset, |dinode_bytes| {
-                LittleEndian::write_u32(&mut dinode_bytes[40..44], new_nlink);
-            })?;
+            self.update_inode_page(
+                child_ino,
+                child.page_block,
+                child.page_offset,
+                |dinode_bytes| {
+                    LittleEndian::write_u32(&mut dinode_bytes[40..44], new_nlink);
+                },
+            )?;
         }
         self.mark_page_dirty(child_ino, child.page_block)?;
 
@@ -1815,7 +1874,12 @@ impl Volume {
     /// 4. Update parent directory metadata.
     /// 5. Commit.
     #[cfg(feature = "writable")]
-    pub fn link_file(&mut self, parent_ino: u32, name: &str, target_ino: u32) -> StorageResult<u32> {
+    pub fn link_file(
+        &mut self,
+        parent_ino: u32,
+        name: &str,
+        target_ino: u32,
+    ) -> StorageResult<u32> {
         let _ = self.begin_transaction()?;
 
         // 1. Read the target inode.
@@ -1848,9 +1912,14 @@ impl Volume {
 
         // 5. Increment target's nlink.
         let new_nlink = target.dinode.nlink() + 1;
-        self.update_inode_page(target_ino, target.page_block, target.page_offset, |dinode_bytes| {
-            LittleEndian::write_u32(&mut dinode_bytes[40..44], new_nlink);
-        })?;
+        self.update_inode_page(
+            target_ino,
+            target.page_block,
+            target.page_offset,
+            |dinode_bytes| {
+                LittleEndian::write_u32(&mut dinode_bytes[40..44], new_nlink);
+            },
+        )?;
         self.mark_page_dirty(target_ino, target.page_block)?;
 
         // 6. Mark parent dirty.
@@ -1923,7 +1992,10 @@ impl Volume {
             LittleEndian::write_u32(&mut dinode_bytes[40..44], 1);
             // Set fileset and ino number.
             LittleEndian::write_u32(&mut dinode_bytes[4..8], crate::types::FILESYSTEM_I);
-            LittleEndian::write_u32(&mut dinode_bytes[8..12], child_ino - crate::types::FILESYSTEM_I);
+            LittleEndian::write_u32(
+                &mut dinode_bytes[8..12],
+                child_ino - crate::types::FILESYSTEM_I,
+            );
 
             // Store the target path inline in the union area (u[0..target_len]).
             // The union starts at offset 128 in the dinode.
@@ -1976,7 +2048,9 @@ impl Volume {
             return Ok(target.to_vec());
         }
 
-        Err(StorageError::Other("symlink target not available".to_string()))
+        Err(StorageError::Other(
+            "symlink target not available".to_string(),
+        ))
     }
 
     /// Release an open file handle — decrements the open-handle count.
@@ -2143,7 +2217,10 @@ impl Volume {
         let inode = crate::inode::Inode::read(self, ino)?;
         let ea_data = self.read_inline_xattr_data(&inode);
         let parsed = Self::parse_xattr_list(&ea_data);
-        Ok(parsed.iter().map(|(n, _)| String::from_utf8_lossy(n).to_string()).collect())
+        Ok(parsed
+            .iter()
+            .map(|(n, _)| String::from_utf8_lossy(n).to_string())
+            .collect())
     }
 
     /// Remove an extended attribute (Phase 12).
@@ -2352,7 +2429,9 @@ impl Volume {
 
             if let Ok(child) = crate::inode::Inode::read(self, entry.inumber) {
                 if child.is_regular() {
-                    if let Ok(xt) = crate::btree::xtree::Xtree::from_inode_data(child.xtroot_bytes()) {
+                    if let Ok(xt) =
+                        crate::btree::xtree::Xtree::from_inode_data(child.xtroot_bytes())
+                    {
                         if let Err(e) = xt.validate() {
                             report.add_error_ino(
                                 format!("xtree validation failed: {}", e),
@@ -2428,18 +2507,38 @@ impl CheckReport {
     }
 
     pub fn add_error(&mut self, msg: String) {
-        self.issues.push(CheckIssue { level: 2, message: msg, block: None, ino: None });
+        self.issues.push(CheckIssue {
+            level: 2,
+            message: msg,
+            block: None,
+            ino: None,
+        });
     }
 
     pub fn add_warning(&mut self, msg: String) {
-        self.issues.push(CheckIssue { level: 1, message: msg, block: None, ino: None });
+        self.issues.push(CheckIssue {
+            level: 1,
+            message: msg,
+            block: None,
+            ino: None,
+        });
     }
 
     pub fn add_error_block(&mut self, msg: String, block: u64) {
-        self.issues.push(CheckIssue { level: 2, message: msg, block: Some(block), ino: None });
+        self.issues.push(CheckIssue {
+            level: 2,
+            message: msg,
+            block: Some(block),
+            ino: None,
+        });
     }
 
     pub fn add_error_ino(&mut self, msg: String, ino: u32) {
-        self.issues.push(CheckIssue { level: 2, message: msg, block: None, ino: Some(ino) });
+        self.issues.push(CheckIssue {
+            level: 2,
+            message: msg,
+            block: None,
+            ino: Some(ino),
+        });
     }
 }

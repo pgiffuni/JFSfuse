@@ -12,9 +12,7 @@
 use std::sync::Arc;
 
 use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
-use crate::types::{
-    LOGMAGIC, LOGPSIZE, LOGREDONE, LOGVERSION, LOGWRAP, LogSuper, MAX_ACTIVE,
-};
+use crate::types::{LOGMAGIC, LOGPSIZE, LOGREDONE, LOGVERSION, LOGWRAP, LogSuper, MAX_ACTIVE};
 /// Log page flags
 pub const TBLK_LOG_START: u32 = 1;
 pub const TBLK_LOG_TAIL: u32 = 2;
@@ -150,7 +148,8 @@ impl LogManager {
 
     /// Read a log page at the given page index (0-based, after logsuper).
     pub fn read_page(&self, page_num: u32) -> StorageResult<Vec<u8>> {
-        let offset = self.log_base + (BLOCK_SIZE as u64) * 2 + (page_num as u64) * (LOGPSIZE as u64);
+        let offset =
+            self.log_base + (BLOCK_SIZE as u64) * 2 + (page_num as u64) * (LOGPSIZE as u64);
         self.storage.read_bytes(offset, LOGPSIZE)
     }
 
@@ -231,8 +230,7 @@ impl LogManager {
             let bytes_per_page = LOGPSIZE as u64;
             // The buffer holds one buffer-unit (LOG_BUFFER_SIZE bytes) of data.
             // Compute how much is actually in the current buffer.
-            let buffer_start =
-                self.write_offset - (self.write_offset % (LOG_BUFFER_SIZE as u64));
+            let buffer_start = self.write_offset - (self.write_offset % (LOG_BUFFER_SIZE as u64));
             let bytes_in_buffer = self.write_offset - buffer_start;
             // Number of pages (complete or partial) with buffered data.
             let dirty_pages = (bytes_in_buffer + bytes_per_page - 1) / bytes_per_page;
@@ -266,12 +264,7 @@ impl LogManager {
     ///
     /// If the current buffer is full, it is flushed and a new buffer
     /// segment is started.
-    pub fn append_log_record(
-        &mut self,
-        txid: u64,
-        block: u64,
-        data: &[u8],
-    ) -> StorageResult<()> {
+    pub fn append_log_record(&mut self, txid: u64, block: u64, data: &[u8]) -> StorageResult<()> {
         use byteorder::{ByteOrder, LittleEndian};
 
         let buf_size = LOG_BUFFER_SIZE as u64;
@@ -284,8 +277,7 @@ impl LogManager {
             self.log_buffer.fill(0);
             self.buffer_dirty = false;
             // Align write_offset to the next buffer-unit boundary.
-            self.write_offset =
-                ((self.write_offset + buf_size - 1) / buf_size) * buf_size;
+            self.write_offset = ((self.write_offset + buf_size - 1) / buf_size) * buf_size;
         }
 
         let offset_in_buf = self.write_offset % buf_size;
@@ -342,8 +334,7 @@ impl LogManager {
             self.flush_journal()?;
             self.log_buffer.fill(0);
             self.buffer_dirty = false;
-            self.write_offset =
-                ((self.write_offset + buf_size - 1) / buf_size) * buf_size;
+            self.write_offset = ((self.write_offset + buf_size - 1) / buf_size) * buf_size;
         }
 
         let offset_in_buf = self.write_offset % buf_size;

@@ -7,7 +7,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 
 use crate::storage::{Result as StorageResult, StorageError};
-use crate::types::{Dinode, DISIZE, FILESYSTEM_I, INOSPERPAGE};
+use crate::types::{DISIZE, Dinode, FILESYSTEM_I, INOSPERPAGE};
 
 /// Runtime inode representation.
 ///
@@ -61,10 +61,7 @@ impl Inode {
     /// The scan starts at the `s_ait2` PXD address and extends through
     /// `s_ait2.length()` blocks, plus additional blocks that may belong
     /// to different filesets' inode tables.
-    fn find_inode_page(
-        volume: &crate::volume::Volume,
-        ino: u32,
-    ) -> StorageResult<(u64, usize)> {
+    fn find_inode_page(volume: &crate::volume::Volume, ino: u32) -> StorageResult<(u64, usize)> {
         // Map VFS inode number to (fileset, number) pair.
         let (target_fs, target_num) = if ino >= FILESYSTEM_I {
             (FILESYSTEM_I, ino - FILESYSTEM_I)

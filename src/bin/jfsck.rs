@@ -23,9 +23,9 @@ use std::process;
 use jfsfuse::storage::{BLOCK_SIZE, FileStorage};
 #[cfg(feature = "writable")]
 use jfsfuse::types::FM_CLEAN;
-use jfsfuse::volume::Volume;
 #[cfg(feature = "writable")]
 use jfsfuse::types::FM_DIRTY;
+use jfsfuse::volume::Volume;
 
 const USAGE: &str = "usage: fsck_jfs --read-only `image`\n\
                      fsck_jfs --repair `image`\n\
@@ -100,9 +100,7 @@ fn cmd_read_only(image: &str) -> Result<(), Box<dyn std::error::Error>> {
                 warnings += 1;
                 "WARNING"
             }
-            _ => {
-                "INFO"
-            }
+            _ => "INFO",
         };
         let location = match (&issue.ino, &issue.block) {
             (Some(ino), _) => format!(" inode {}", ino),
@@ -138,8 +136,14 @@ fn cmd_repair(image: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     for issue in &report.issues {
         let prefix = match issue.level {
-            2 => { errors += 1; "ERROR" }
-            1 => { warnings += 1; "WARNING" }
+            2 => {
+                errors += 1;
+                "ERROR"
+            }
+            1 => {
+                warnings += 1;
+                "WARNING"
+            }
             _ => "INFO",
         };
         let location = match (&issue.ino, &issue.block) {
@@ -223,7 +227,10 @@ fn cmd_dump_inode(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error
         let xt = jfsfuse::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
         println!("  xtree next_index: {}", xt.next_index());
         for ext in xt.iter_extents() {
-            println!("    extent: off={} len={} addr={}", ext.offset, ext.length, ext.address);
+            println!(
+                "    extent: off={} len={} addr={}",
+                ext.offset, ext.length, ext.address
+            );
         }
     }
 
@@ -276,7 +283,9 @@ fn cmd_dump_dtree(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error
     println!("  entries: {}", dt.len_entries());
 
     for entry in dt.entries()? {
-        let name = String::from_utf16_lossy(&entry.name).trim_end_matches('\0').to_string();
+        let name = String::from_utf16_lossy(&entry.name)
+            .trim_end_matches('\0')
+            .to_string();
         println!("    name={} ino={}", name, entry.inumber);
     }
 

@@ -26,9 +26,7 @@ const DIOCGMEDIASIZE: u64 = 0x8008_6481;
 #[cfg(target_os = "freebsd")]
 fn device_size(file: &File) -> Result<u64, std::io::Error> {
     let mut size: libc::off_t = 0;
-    let ret = unsafe {
-        libc::ioctl(file.as_raw_fd(), DIOCGMEDIASIZE, &mut size)
-    };
+    let ret = unsafe { libc::ioctl(file.as_raw_fd(), DIOCGMEDIASIZE, &mut size) };
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -41,9 +39,7 @@ const BLKGETSIZE64: u64 = 0x8008_1272;
 #[cfg(target_os = "linux")]
 fn device_size(file: &File) -> Result<u64, std::io::Error> {
     let mut size: u64 = 0;
-    let ret = unsafe {
-        libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size as *mut u64)
-    };
+    let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size as *mut u64) };
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }

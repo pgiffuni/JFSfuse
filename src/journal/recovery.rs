@@ -17,8 +17,8 @@ use crate::storage::{
     BLOCK_SIZE, BlockNo, BufferPool, Result as StorageResult, Storage, StorageError,
 };
 use crate::types::{
-    Dinode, LOG_BTROOT, LOG_COMMIT, LOG_DATA, LOG_DTREE, LOG_INODE, LOGPSIZE,
-    LOG_SYNCPT, LOG_XTREE, LOGREDONE, LogSuper, Logpage, Lrd, Pxd,
+    Dinode, LOG_BTROOT, LOG_COMMIT, LOG_DATA, LOG_DTREE, LOG_INODE, LOG_SYNCPT, LOG_XTREE,
+    LOGPSIZE, LOGREDONE, LogSuper, Logpage, Lrd, Pxd,
 };
 
 /// Read up to `len` bytes from `storage` at `offset`.
@@ -402,7 +402,10 @@ impl<'a> LogReader<'a> {
 
             let lrd_bytes = read_bytes_eof_ok(self.log_storage, pos, 4)?;
             if lrd_bytes.len() < 4
-                || (lrd_bytes[0] == 0 && lrd_bytes[1] == 0 && lrd_bytes[2] == 0 && lrd_bytes[3] == 0)
+                || (lrd_bytes[0] == 0
+                    && lrd_bytes[1] == 0
+                    && lrd_bytes[2] == 0
+                    && lrd_bytes[3] == 0)
             {
                 break;
             }
@@ -962,7 +965,8 @@ impl JournalRecovery {
             // LRD start marker, then decode. A simpler approach: scan
             // forward from log_data_start and find all syncpt records,
             // keeping the last one before log_end.
-            let lrd_bytes = read_bytes_eof_ok(log_storage, pos.saturating_sub(lrd_size), lrd_size as usize)?;
+            let lrd_bytes =
+                read_bytes_eof_ok(log_storage, pos.saturating_sub(lrd_size), lrd_size as usize)?;
             if lrd_bytes.len() < 8 {
                 break;
             }

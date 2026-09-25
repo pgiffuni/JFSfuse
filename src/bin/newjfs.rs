@@ -24,8 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Create a JFS filesystem image.");
         eprintln!();
         eprintln!("Arguments:");
-        eprintln!("  image            Path to the output image file (will be created or truncated).");
-        eprintln!("  size_in_blocks   Number of 4 KiB blocks (default: {} = 16 MiB)", DEFAULT_NUM_BLOCKS);
+        eprintln!(
+            "  image            Path to the output image file (will be created or truncated)."
+        );
+        eprintln!(
+            "  size_in_blocks   Number of 4 KiB blocks (default: {} = 16 MiB)",
+            DEFAULT_NUM_BLOCKS
+        );
         process::exit(1);
     }
 

@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use jfsfuse::fuse::FuseFs;
 use jfsfuse::fuse::EOPNOTSUPP;
+use jfsfuse::fuse::FuseFs;
 use jfsfuse::mkfs;
 use jfsfuse::storage::{BLOCK_SIZE, Storage};
 use jfsfuse::volume::Volume;
@@ -34,7 +34,9 @@ fn test_lseek_data_at_start_of_extent() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15data", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15data", 0o100644)
+        .expect("create should succeed");
 
     // Write 2 blocks of data at offset 0.
     let data = vec![0xABu8; BLOCK_SIZE * 2];
@@ -42,13 +44,18 @@ fn test_lseek_data_at_start_of_extent() {
     assert_eq!(written, BLOCK_SIZE * 2);
 
     // SEEK_DATA at 0 should return 0 (data starts at offset 0).
-    let result = fs.lseek_data_or_hole(ino, 0, 3).expect("lseek should succeed");
+    let result = fs
+        .lseek_data_or_hole(ino, 0, 3)
+        .expect("lseek should succeed");
     assert_eq!(result, 0, "SEEK_DATA at start of extent should return 0");
 
     // SEEK_HOLE at 0 should return 2 * BLOCK_SIZE (end of data).
-    let result = fs.lseek_data_or_hole(ino, 0, 4).expect("lseek should succeed");
+    let result = fs
+        .lseek_data_or_hole(ino, 0, 4)
+        .expect("lseek should succeed");
     assert_eq!(
-        result, 2 * BLOCK_SIZE as u64,
+        result,
+        2 * BLOCK_SIZE as u64,
         "SEEK_HOLE should return end of extent"
     );
 }
@@ -61,22 +68,30 @@ fn test_lseek_data_in_hole() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15hole", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15hole", 0o100644)
+        .expect("create should succeed");
 
     // Write data at offset 0 and at offset 4*BLOCK_SIZE.
     let data = vec![0xCDu8; BLOCK_SIZE];
     fs.write(ino, 0, &data).expect("write should succeed");
-    fs.write(ino, 4 * BLOCK_SIZE as u64, &data).expect("write should succeed");
+    fs.write(ino, 4 * BLOCK_SIZE as u64, &data)
+        .expect("write should succeed");
 
     // SEEK_DATA at offset 2*BLOCK_SIZE should return 4*BLOCK_SIZE.
-    let result = fs.lseek_data_or_hole(ino, 2 * BLOCK_SIZE as u64, 3).expect("lseek should succeed");
+    let result = fs
+        .lseek_data_or_hole(ino, 2 * BLOCK_SIZE as u64, 3)
+        .expect("lseek should succeed");
     assert_eq!(
-        result, 4 * BLOCK_SIZE as u64,
+        result,
+        4 * BLOCK_SIZE as u64,
         "SEEK_DATA in hole should find next data extent"
     );
 
     // SEEK_HOLE at offset BLOCK_SIZE should return BLOCK_SIZE (end of first extent).
-    let result = fs.lseek_data_or_hole(ino, BLOCK_SIZE as u64, 4).expect("lseek should succeed");
+    let result = fs
+        .lseek_data_or_hole(ino, BLOCK_SIZE as u64, 4)
+        .expect("lseek should succeed");
     assert_eq!(
         result, BLOCK_SIZE as u64,
         "SEEK_HOLE at end of first extent should return that boundary"
@@ -101,7 +116,9 @@ fn test_lseek_data_past_eof() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15eof", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15eof", 0o100644)
+        .expect("create should succeed");
 
     let data = vec![0x77u8; BLOCK_SIZE];
     fs.write(ino, 0, &data).expect("write should succeed");
@@ -123,11 +140,17 @@ fn test_fallocate_allocates_space() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15falloc", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15falloc", 0o100644)
+        .expect("create should succeed");
 
     // Pre-allocate 4 blocks at offset 0.
     let result = fs.fallocate(ino, 0, 4 * BLOCK_SIZE as u64, 0);
-    assert!(result.is_ok(), "fallocate should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "fallocate should succeed: {:?}",
+        result.err()
+    );
 
     // File size should now be 4 * BLOCK_SIZE.
     let attr = fs.getattr(ino).expect("should getattr");
@@ -140,7 +163,10 @@ fn test_fallocate_allocates_space() {
     // Allocated blocks should be readable as zeros.
     let data = fs.read(ino, 0, BLOCK_SIZE).expect("read should succeed");
     assert_eq!(data.len(), BLOCK_SIZE);
-    assert!(data.iter().all(|&b| b == 0), "allocated blocks should be zero-filled");
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "allocated blocks should be zero-filled"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -151,14 +177,21 @@ fn test_fallocate_keep_size() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15ks", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15ks", 0o100644)
+        .expect("create should succeed");
 
     // Write 1 block.
     let data = vec![0xAAu8; BLOCK_SIZE];
     fs.write(ino, 0, &data).expect("write should succeed");
 
     // Pre-allocate 4 more blocks without changing size.
-    let result = fs.fallocate(ino, BLOCK_SIZE as u64, 4 * BLOCK_SIZE as u64, FALLOC_FL_KEEP_SIZE);
+    let result = fs.fallocate(
+        ino,
+        BLOCK_SIZE as u64,
+        4 * BLOCK_SIZE as u64,
+        FALLOC_FL_KEEP_SIZE,
+    );
     assert!(result.is_ok(), "fallocate with KEEP_SIZE should succeed");
 
     // File size should NOT change (still 1 block).
@@ -178,7 +211,9 @@ fn test_fallocate_punch_hole() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15punch", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15punch", 0o100644)
+        .expect("create should succeed");
 
     // Write 4 blocks of data.
     let data = vec![0xBBu8; BLOCK_SIZE * 4];
@@ -195,7 +230,11 @@ fn test_fallocate_punch_hole() {
         2 * BLOCK_SIZE as u64,
         FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
     );
-    assert!(result.is_ok(), "punch hole should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "punch hole should succeed: {:?}",
+        result.err()
+    );
 
     // File size should be unchanged.
     let attr = fs.getattr(ino).expect("should getattr");
@@ -224,11 +263,17 @@ fn test_fallocate_unsupported_mode() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15unsup", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15unsup", 0o100644)
+        .expect("create should succeed");
 
     // FALLOC_FL_COLLAPSE_RANGE is not supported.
     let result = fs.fallocate(ino, 0, BLOCK_SIZE as u64, FALLOC_FL_COLLAPSE_RANGE);
-    assert_eq!(result, Err(EOPNOTSUPP), "unsupported mode should return EOPNOTSUPP");
+    assert_eq!(
+        result,
+        Err(EOPNOTSUPP),
+        "unsupported mode should return EOPNOTSUPP"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -239,7 +284,9 @@ fn test_readdir_after_fallocate() {
     fs.enable_writable().unwrap();
 
     let parent = fs.volume.root_ino;
-    let ino = fs.create(parent, "tf15readdir", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf15readdir", 0o100644)
+        .expect("create should succeed");
 
     // Pre-allocate and write some data.
     let data = vec![0x55u8; BLOCK_SIZE * 2];

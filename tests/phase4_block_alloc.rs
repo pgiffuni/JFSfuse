@@ -83,8 +83,14 @@ fn test_bmap_free_and_realloc() {
     bmap.free_extent(&pxd).expect("should free");
 
     // Should be able to allocate again.
-    let pxd2 = bmap.alloc_extent(1, 0).expect("should allocate again").unwrap();
-    assert!(pxd2.address() > 0, "should get a valid block after re-allocation");
+    let pxd2 = bmap
+        .alloc_extent(1, 0)
+        .expect("should allocate again")
+        .unwrap();
+    assert!(
+        pxd2.address() > 0,
+        "should get a valid block after re-allocation"
+    );
 }
 
 #[cfg(feature = "writable")]
@@ -96,10 +102,7 @@ fn test_bmap_alloc_many_blocks() {
     let before = bmap.nfree();
 
     // Allocate a large extent (32 blocks).
-    let pxd = bmap
-        .alloc_extent(32, 0)
-        .expect("should allocate")
-        .unwrap();
+    let pxd = bmap.alloc_extent(32, 0).expect("should allocate").unwrap();
     assert_eq!(pxd.length(), 32);
     assert!(bmap.nfree() <= before - 32);
 }

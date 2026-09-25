@@ -33,11 +33,17 @@ fn test_hard_link_increments_nlink() {
     let name = "tf10src";
 
     // Create a file.
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Verify nlink is 1.
     let dinode = fs.getattr(ino).expect("should getattr");
-    assert_eq!(u32::from_le_bytes(dinode.di_nlink), 1, "file should have nlink=1");
+    assert_eq!(
+        u32::from_le_bytes(dinode.di_nlink),
+        1,
+        "file should have nlink=1"
+    );
 
     // Create a hard link.
     let link_name = "tf10link";
@@ -46,7 +52,11 @@ fn test_hard_link_increments_nlink() {
 
     // Verify nlink is now 2.
     let dinode = fs.getattr(ino).expect("should getattr");
-    assert_eq!(u32::from_le_bytes(dinode.di_nlink), 2, "file should have nlink=2 after link");
+    assert_eq!(
+        u32::from_le_bytes(dinode.di_nlink),
+        2,
+        "file should have nlink=2 after link"
+    );
 
     // Both names should resolve to the same inode.
     assert_eq!(fs.lookup(parent, name), Some(ino));
@@ -67,12 +77,18 @@ fn test_hard_link_rejects_directory() {
     let parent = fs.volume.root_ino;
 
     // Create a directory.
-    let dir_ino = fs.mkdir(parent, "tf10dir", 0o040755).expect("mkdir should succeed");
+    let dir_ino = fs
+        .mkdir(parent, "tf10dir", 0o040755)
+        .expect("mkdir should succeed");
 
     // Try to hard-link the directory — should fail with EPERM.
     let result = fs.link(parent, "tf10dir_link", dir_ino);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), EPERM, "hard-linking a directory should return EPERM");
+    assert_eq!(
+        result.unwrap_err(),
+        EPERM,
+        "hard-linking a directory should return EPERM"
+    );
 
     // Clean up.
     let _ = fs.rmdir(parent, "tf10dir");
@@ -87,7 +103,9 @@ fn test_hard_link_duplicate_name_fails() {
 
     let parent = fs.volume.root_ino;
 
-    let ino = fs.create(parent, "tf10src2", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf10src2", 0o100644)
+        .expect("create should succeed");
 
     // First link succeeds.
     assert!(fs.link(parent, "tf10link1", ino).is_ok());
@@ -95,7 +113,11 @@ fn test_hard_link_duplicate_name_fails() {
     // Second link with the same name should fail with EEXIST.
     let result = fs.link(parent, "tf10link1", ino);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), EEXIST, "duplicate link should return EEXIST");
+    assert_eq!(
+        result.unwrap_err(),
+        EEXIST,
+        "duplicate link should return EEXIST"
+    );
 
     // Clean up.
     fs.unlink(parent, "tf10src2");
@@ -112,7 +134,9 @@ fn test_unlink_decrements_nlink() {
     let parent = fs.volume.root_ino;
 
     // Create a file and a hard link.
-    let ino = fs.create(parent, "tf10uln", 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, "tf10uln", 0o100644)
+        .expect("create should succeed");
     assert!(fs.link(parent, "tf10uln2", ino).is_ok());
 
     // Verify nlink is 2.
@@ -125,7 +149,11 @@ fn test_unlink_decrements_nlink() {
     // The other name should still resolve to the same inode.
     assert_eq!(fs.lookup(parent, "tf10uln2"), Some(ino));
     let dinode = fs.getattr(ino).expect("should still getattr");
-    assert_eq!(u32::from_le_bytes(dinode.di_nlink), 1, "nlink should be 1 after one unlink");
+    assert_eq!(
+        u32::from_le_bytes(dinode.di_nlink),
+        1,
+        "nlink should be 1 after one unlink"
+    );
 
     // Clean up.
     fs.unlink(parent, "tf10uln2");
@@ -142,8 +170,11 @@ fn test_open_unlinked_retains_inode() {
     let name = "tf10oun";
 
     // Create a file and write some data.
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
-    fs.write(ino, 0, b"Hello, open-unlinked world!").expect("write should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
+    fs.write(ino, 0, b"Hello, open-unlinked world!")
+        .expect("write should succeed");
 
     // Open the file (increments open-handle count).
     fs.open(ino).expect("open should succeed");
@@ -152,15 +183,29 @@ fn test_open_unlinked_retains_inode() {
     fs.unlink(parent, name).expect("unlink should succeed");
 
     // The name should be gone.
-    assert_eq!(fs.lookup(parent, name), None, "name should be gone after unlink");
+    assert_eq!(
+        fs.lookup(parent, name),
+        None,
+        "name should be gone after unlink"
+    );
 
     // But the inode data should still be accessible via the open handle.
-    let dinode = fs.getattr(ino).expect("inode should still exist while open");
-    assert_eq!(u32::from_le_bytes(dinode.di_nlink), 0, "nlink should be 0 after unlink");
+    let dinode = fs
+        .getattr(ino)
+        .expect("inode should still exist while open");
+    assert_eq!(
+        u32::from_le_bytes(dinode.di_nlink),
+        0,
+        "nlink should be 0 after unlink"
+    );
 
     // We can still read the data.
     let data = fs.read(ino, 0, 28).expect("read should succeed");
-    assert_eq!(&data[..], b"Hello, open-unlinked world!", "data should still be readable");
+    assert_eq!(
+        &data[..],
+        b"Hello, open-unlinked world!",
+        "data should still be readable"
+    );
 
     // Release the open handle — this should free the inode.
     fs.release(ino).expect("release should succeed");
@@ -190,7 +235,9 @@ fn test_open_release_multiple_handles() {
     let parent = fs.volume.root_ino;
     let name = "tf10mul";
 
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Open twice — should increment handle count to 2.
     fs.open(ino).expect("first open should succeed");
@@ -201,7 +248,10 @@ fn test_open_release_multiple_handles() {
 
     // Release one handle — inode should persist.
     fs.release(ino).expect("first release should succeed");
-    assert!(fs.getattr(ino).is_some(), "inode should persist after partial release");
+    assert!(
+        fs.getattr(ino).is_some(),
+        "inode should persist after partial release"
+    );
 
     // Release second handle — inode should be freed.
     fs.release(ino).expect("second release should succeed");
@@ -218,8 +268,11 @@ fn test_multiple_hard_links() {
 
     let parent = fs.volume.root_ino;
 
-    let ino = fs.create(parent, "tf10mhs", 0o100644).expect("create should succeed");
-    fs.write(ino, 0, b"multi-link data").expect("write should succeed");
+    let ino = fs
+        .create(parent, "tf10mhs", 0o100644)
+        .expect("create should succeed");
+    fs.write(ino, 0, b"multi-link data")
+        .expect("write should succeed");
 
     // Create 3 hard links.
     for i in 0..3 {

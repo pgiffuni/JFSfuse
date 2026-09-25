@@ -10,7 +10,10 @@ use jfsfuse::volume::Volume;
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: {} <device> <mountpoint> [--ro] [--allow-other]", args[0]);
+        eprintln!(
+            "usage: {} <device> <mountpoint> [--ro] [--allow-other]",
+            args[0]
+        );
         return ExitCode::from(1);
     }
 
@@ -47,10 +50,9 @@ async fn main() -> ExitCode {
 
     let mut fs = FuseFs::new(vol);
     #[cfg(feature = "writable")]
-    if !read_only
-        && let Err(e) = fs.enable_writable() {
-            eprintln!("Warning: could not enable writable mode: {}", e);
-        }
+    if !read_only && let Err(e) = fs.enable_writable() {
+        eprintln!("Warning: could not enable writable mode: {}", e);
+    }
 
     let fuse_fs = Fuse3Fs::new(fs);
 

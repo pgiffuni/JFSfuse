@@ -83,9 +83,14 @@ fn test_truncate_changes_size() {
     let initial = b"this is some data for truncation testing";
     let _ = fs.write(ino, 0, initial);
 
-    let before_data = fs.read(ino, 0, jfsfuse::storage::BLOCK_SIZE).expect("should read file");
+    let before_data = fs
+        .read(ino, 0, jfsfuse::storage::BLOCK_SIZE)
+        .expect("should read file");
     let before_size = before_data.len() as u64;
-    assert!(before_size > 0, "file should have non-zero size before truncate");
+    assert!(
+        before_size > 0,
+        "file should have non-zero size before truncate"
+    );
 
     let new_size = std::cmp::max(1, before_size / 2);
     let result = fs.truncate(ino, new_size);
@@ -109,7 +114,9 @@ fn test_fsync_succeeds() {
     fs.enable_writable().unwrap();
 
     // Create a file — fsync on root.
-    let ino = fs.create(fs.volume.root_ino, "fsync_test", 0o100644).unwrap();
+    let ino = fs
+        .create(fs.volume.root_ino, "fsync_test", 0o100644)
+        .unwrap();
     let _ = fs.write(ino, 0, b"data");
 
     let result = fs.flush(ino);
@@ -117,7 +124,10 @@ fn test_fsync_succeeds() {
 
     // Verify a transaction was committed.
     let txid = fs.volume.tx_mgr.current_txid();
-    assert!(txid.is_some(), "transaction should be committed after fsync");
+    assert!(
+        txid.is_some(),
+        "transaction should be committed after fsync"
+    );
 }
 
 #[cfg(feature = "writable")]

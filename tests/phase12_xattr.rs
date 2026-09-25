@@ -26,11 +26,17 @@ fn test_setxattr_and_getxattr() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12xattr";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Set an xattr.
     let set_result = fs.setxattr(ino, "user.comment", b"hello xattr", 0);
-    assert!(set_result.is_ok(), "setxattr should succeed: {:?}", set_result.err());
+    assert!(
+        set_result.is_ok(),
+        "setxattr should succeed: {:?}",
+        set_result.err()
+    );
 
     // Get the xattr back.
     let get_result = fs.getxattr(ino, "user.comment");
@@ -48,10 +54,13 @@ fn test_setxattr_replace() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12rep";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Set initial value.
-    fs.setxattr(ino, "user.key", b"old", 0).expect("setxattr should succeed");
+    fs.setxattr(ino, "user.key", b"old", 0)
+        .expect("setxattr should succeed");
 
     // Replace with XATTR_CREATE (should fail — exists).
     let result = fs.setxattr(ino, "user.key", b"new", 1);
@@ -59,10 +68,13 @@ fn test_setxattr_replace() {
     assert_eq!(result.unwrap_err(), EEXIST);
 
     // Replace with XATTR_REPLACE (should succeed — exists).
-    fs.setxattr(ino, "user.key", b"new", 2).expect("XATTR_REPLACE should succeed");
+    fs.setxattr(ino, "user.key", b"new", 2)
+        .expect("XATTR_REPLACE should succeed");
 
     // Verify the value was replaced.
-    let value = fs.getxattr(ino, "user.key").expect("getxattr should succeed");
+    let value = fs
+        .getxattr(ino, "user.key")
+        .expect("getxattr should succeed");
     assert_eq!(value, Some(b"new".to_vec()));
 
     // XATTR_REPLACE on a non-existent xattr should fail with ENOENT.
@@ -80,12 +92,17 @@ fn test_listxattr() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12list";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Set multiple xattrs.
-    fs.setxattr(ino, "user.a", b"1", 0).expect("setxattr a should succeed");
-    fs.setxattr(ino, "user.b", b"22", 0).expect("setxattr b should succeed");
-    fs.setxattr(ino, "user.c", b"333", 0).expect("setxattr c should succeed");
+    fs.setxattr(ino, "user.a", b"1", 0)
+        .expect("setxattr a should succeed");
+    fs.setxattr(ino, "user.b", b"22", 0)
+        .expect("setxattr b should succeed");
+    fs.setxattr(ino, "user.c", b"333", 0)
+        .expect("setxattr c should succeed");
 
     // List xattr names.
     let list = fs.listxattr(ino).expect("listxattr should succeed");
@@ -104,10 +121,13 @@ fn test_removexattr() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12rm";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Set an xattr.
-    fs.setxattr(ino, "user.temp", b"data", 0).expect("setxattr should succeed");
+    fs.setxattr(ino, "user.temp", b"data", 0)
+        .expect("setxattr should succeed");
 
     // List — should have 1.
     let list = fs.listxattr(ino).expect("listxattr should succeed");
@@ -122,7 +142,9 @@ fn test_removexattr() {
     assert_eq!(list.len(), 0, "should have 0 xattrs after removal");
 
     // Getting the removed xattr should return None.
-    let value = fs.getxattr(ino, "user.temp").expect("getxattr should succeed");
+    let value = fs
+        .getxattr(ino, "user.temp")
+        .expect("getxattr should succeed");
     assert!(value.is_none(), "removed xattr should return None");
 
     // Removing a non-existent xattr should fail with ENOENT.
@@ -156,10 +178,14 @@ fn test_xattr_get_nonexistent() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12get";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Getting a non-existent xattr should return None (not an error).
-    let value = fs.getxattr(ino, "user.nonexistent").expect("getxattr should succeed");
+    let value = fs
+        .getxattr(ino, "user.nonexistent")
+        .expect("getxattr should succeed");
     assert!(value.is_none(), "non-existent xattr should return None");
 
     let _ = fs.unlink(parent, name);
@@ -174,7 +200,9 @@ fn test_xattr_long_name_rejected() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12long";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // xattr name > 255 bytes should fail (EIO fallback).
     let long_name = "user.".to_string() + &"x".repeat(300);
@@ -193,11 +221,15 @@ fn test_xattr_multiple_on_same_inode() {
 
     let parent = fs.volume.root_ino;
     let name = "tf12multi";
-    let ino = fs.create(parent, name, 0o100644).expect("create should succeed");
+    let ino = fs
+        .create(parent, name, 0o100644)
+        .expect("create should succeed");
 
     // Set multiple xattrs.
-    fs.setxattr(ino, "user.first", b"val1", 0).expect("setxattr should succeed");
-    fs.setxattr(ino, "user.second", b"val2", 0).expect("setxattr should succeed");
+    fs.setxattr(ino, "user.first", b"val1", 0)
+        .expect("setxattr should succeed");
+    fs.setxattr(ino, "user.second", b"val2", 0)
+        .expect("setxattr should succeed");
 
     // Both should be retrievable.
     assert_eq!(
@@ -210,7 +242,8 @@ fn test_xattr_multiple_on_same_inode() {
     );
 
     // Remove one, verify the other remains.
-    fs.removexattr(ino, "user.first").expect("removexattr should succeed");
+    fs.removexattr(ino, "user.first")
+        .expect("removexattr should succeed");
     assert!(fs.getxattr(ino, "user.first").unwrap().is_none());
     assert_eq!(
         fs.getxattr(ino, "user.second").unwrap(),

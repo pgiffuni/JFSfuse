@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use byteorder::{ByteOrder, LittleEndian};
 
 use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage, StorageError};
-use crate::types::{BlockLength, BlockNo, BMAP_I, DISIZE, Pxd};
+use crate::types::{BMAP_I, BlockLength, BlockNo, DISIZE, Pxd};
 
 /// Blocks managed per dmap page (8192 = 256 words × 32 bits).
 const BLOCKS_PER_DMAP: u64 = 8192;
@@ -134,7 +134,9 @@ impl BlockAllocMap {
         // xtroot starts at offset 96 in the union area (offset 128 in dinode).
         let xt_off = 128 + 96;
         if dinode.len() < xt_off + 32 {
-            return Err(StorageError::Other("dinode too short for xtroot".to_string()));
+            return Err(StorageError::Other(
+                "dinode too short for xtroot".to_string(),
+            ));
         }
         let xt = &dinode[xt_off..];
 
@@ -214,11 +216,7 @@ impl BlockAllocMap {
     pub fn num_ag(&self) -> u32 {
         // Derive from mapsize: standard AG size is 8192 blocks for 4KB blocksize.
         let ag_size = self.mapsize / 4;
-        if ag_size > 0 {
-            4
-        } else {
-            1
-        }
+        if ag_size > 0 { 4 } else { 1 }
     }
 
     /// Allocate a contiguous extent of `nblocks` blocks, starting near `hint`.
@@ -300,7 +298,9 @@ impl BlockAllocMap {
         let len = pxd.length() as u64;
 
         if addr + len > self.mapsize {
-            return Err(StorageError::Other("extent exceeds aggregate size".to_string()));
+            return Err(StorageError::Other(
+                "extent exceeds aggregate size".to_string(),
+            ));
         }
 
         for i in 0..len {

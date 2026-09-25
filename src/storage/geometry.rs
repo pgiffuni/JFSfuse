@@ -58,9 +58,7 @@ impl StorageGeometry {
 
         // Attempt platform-specific device detection.
         Self::from_device(file).or_else(|e| {
-            log::warn!(
-                "device geometry detection failed ({e}); falling back to stat()"
-            );
+            log::warn!("device geometry detection failed ({e}); falling back to stat()");
             Ok(Self {
                 media_size: meta.len(),
                 num_sectors: if meta.len() > 0 { meta.len() / 512 } else { 0 },
@@ -77,14 +75,16 @@ impl StorageGeometry {
     /// Return the geometry as `(total_bytes, block_size, sector_size)` for
     /// downstream validation.
     pub fn as_parts(&self) -> (u64, u32, u32) {
-        (self.media_size, crate::types::PSIZE as u32, self.sector_size)
+        (
+            self.media_size,
+            crate::types::PSIZE as u32,
+            self.sector_size,
+        )
     }
 
     /// Validate that a sector size is a reasonable power of two within [1, 4096].
     pub fn is_valid_sector_size(sector_size: u32) -> bool {
-        sector_size != 0
-            && sector_size.is_power_of_two()
-            && sector_size <= 4096
+        sector_size != 0 && sector_size.is_power_of_two() && sector_size <= 4096
     }
 
     /// Validate that the filesystem block size is a multiple of the device
@@ -113,7 +113,8 @@ impl StorageGeometry {
         if !self.sector_size_compatible() {
             return Err(StorageError::Other(format!(
                 "filesystem block size {} is not a multiple of sector size {}",
-                crate::types::PSIZE, self.sector_size
+                crate::types::PSIZE,
+                self.sector_size
             )));
         }
         if self.media_size < crate::types::SUPER1_OFF + (crate::types::PSIZE as u64) {
@@ -158,9 +159,7 @@ mod sys {
             }
 
             let mut sector_size: u32 = 512;
-            let ret = unsafe {
-                libc::ioctl(file.as_raw_fd(), BLKSSZGET, &mut sector_size)
-            };
+            let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKSSZGET, &mut sector_size) };
             if ret < 0 {
                 log::warn!("BLKSSZGET failed; assuming sector size 512");
                 sector_size = 512;
@@ -216,17 +215,13 @@ mod sys {
 
         if ft.is_char_device() {
             let mut size: libc::off_t = 0;
-            let ret = unsafe {
-                libc::ioctl(file.as_raw_fd(), DIOCGMEDIASIZE, &mut size)
-            };
+            let ret = unsafe { libc::ioctl(file.as_raw_fd(), DIOCGMEDIASIZE, &mut size) };
             if ret < 0 {
                 return Err(StorageError::Io(std::io::Error::last_os_error()));
             }
 
             let mut sector_size: u32 = 512;
-            let ret = unsafe {
-                libc::ioctl(file.as_raw_fd(), DIOCGSECTORSIZE, &mut sector_size)
-            };
+            let ret = unsafe { libc::ioctl(file.as_raw_fd(), DIOCGSECTORSIZE, &mut sector_size) };
             if ret < 0 {
                 log::warn!("DIOCGSECTORSIZE failed; assuming sector size 512");
                 sector_size = 512;
@@ -285,10 +280,7 @@ mod tests {
         let path = dir.path().join("geom_test");
         let data = vec![0u8; 4096 * 16];
         std::fs::write(&path, &data).unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let geom = StorageGeometry::from_file(&file).unwrap();
         assert_eq!(geom.media_size, 4096 * 16);
         assert_eq!(geom.sector_size, 512);
@@ -300,10 +292,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty_test");
         std::fs::write(&path, &[]).unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let geom = StorageGeometry::from_file(&file).unwrap();
         assert_eq!(geom.media_size, 0);
         assert_eq!(geom.num_sectors, 0);

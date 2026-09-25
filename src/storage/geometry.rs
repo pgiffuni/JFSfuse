@@ -204,15 +204,6 @@ mod sys {
     use super::*;
     use std::os::unix::fs::FileTypeExt;
 
-<<<<<<< HEAD
-/// FreeBSD `DIOCGMEDIASIZE` ioctl: `_IOR('d', 129, off_t)`
-/// = (IOC_READ << 30) | ('d' << 8) | 129 | (8 << 16) = 0x80086481
-const DIOCGMEDIASIZE: u64 = 0x8008_6481;
-
-/// FreeBSD `DIOCGSECTORSIZE` ioctl: `_IOR('d', 128, u_int)`
-/// = (IOC_READ << 30) | ('d' << 8) | 128 | (4 << 16) = 0x80046480
-const DIOCGSECTORSIZE: u64 = 0x8004_6480;
-=======
     /// FreeBSD `DIOCGMEDIASIZE` ioctl: `_IOR('d', 129, off_t)`
     /// = (IOC_READ << 30) | ('d' << 8) | 129 | (8 << 16) = 0x80086481
     const DIOCGMEDIASIZE: u64 = 0x8008_6481;
@@ -220,7 +211,6 @@ const DIOCGSECTORSIZE: u64 = 0x8004_6480;
     /// FreeBSD `DIOCGSECTORSIZE` ioctl: `_IOR('d', 128, u_int)`
     /// = (IOC_READ << 30) | ('d' << 8) | 128 | (4 << 16) = 0x80046480
     const DIOCGSECTORSIZE: u64 = 0x8004_6480;
->>>>>>> 833b379 (fix: Correct FreeBSD ioctl numbers and add DIOCGSECTORSIZE support)
 
     pub fn from_device(file: &File) -> Result<StorageGeometry, StorageError> {
         let ft = file.metadata()?.file_type();

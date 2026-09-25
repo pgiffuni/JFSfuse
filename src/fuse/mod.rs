@@ -1497,7 +1497,7 @@ impl FuseFs {
             if ok {
                 Ok(())
             } else {
-                Err(ENODATA)
+                Err(ENOENT)
             }
         })
     }
@@ -1677,7 +1677,7 @@ pub const ENAMETOOLONG: i32 = 36;
 pub fn storage_error_to_errno(e: &StorageError) -> i32 {
     use StorageError::*;
     match e {
-        XattrNotFound => ENODATA,
+        XattrNotFound | NotFound => ENOENT,
         XattrAlreadyExists | AlreadyExists => EEXIST,
         XattrNameTooLong => ENAMETOOLONG,
         XattrValueTooLarge | XattrDataTooLarge => E2BIG,
@@ -2867,7 +2867,7 @@ mod tests {
 
     #[test]
     fn test_xattr_errno_mapping() {
-        assert_eq!(storage_error_to_errno(&StorageError::XattrNotFound), ENODATA);
+        assert_eq!(storage_error_to_errno(&StorageError::XattrNotFound), ENOENT);
         assert_eq!(storage_error_to_errno(&StorageError::XattrAlreadyExists), EEXIST);
         assert_eq!(storage_error_to_errno(&StorageError::XattrNameTooLong), ENAMETOOLONG);
         assert_eq!(storage_error_to_errno(&StorageError::XattrValueTooLarge), E2BIG);

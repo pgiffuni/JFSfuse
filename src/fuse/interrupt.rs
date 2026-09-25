@@ -125,6 +125,18 @@ impl InterruptManager {
         (id, InterruptToken { id, flag })
     }
 
+    /// Register a request with a *specific* request ID, matching the `unique`
+    /// field from the FUSE in-header. This allows FUSE_INTERRUPT messages
+    /// (which carry the same `unique` value) to target this request.
+    pub fn register_at(&self, request_id: RequestId) -> (RequestId, InterruptToken) {
+        let flag = InterruptFlag::new();
+        self.flags
+            .lock()
+            .unwrap()
+            .insert(request_id, flag.clone());
+        (request_id, InterruptToken { id: request_id, flag })
+    }
+
     /// Mark a request as interrupted (called when FUSE_INTERRUPT arrives).
     /// Returns `true` if the request was found and signaled.
     pub fn interrupt(&self, id: RequestId) -> bool {
@@ -201,5 +213,32 @@ mod tests {
         for _ in 0..100 {
             token.check().unwrap();
         }
+    }
+
+    #[test]
+    fn test_register_at_uses_requested_id() {
+        let mgr = InterruptManager::new();
+        let unique = 42u64;
+        let (id, token) = mgr.register_at(unique);
+        assert_eq!(id, unique);
+        assert!(!token.is_interrupted());
+
+        // Simulate a FUSE_INTERRUPT for the request's unique ID.
+        assert!(mgr.interrupt(unique));
+        assert!(token.is_interrupted());
+        assert!(token.check().is_err());
+
+        mgr.deregister(unique);
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_register_at_replaces_existing() {
+        let mgr = InterruptManager::new();
+        let (_id1, _token1) = mgr.register_at(100);
+        let (_id2, token2) = mgr.register_at(100);
+        // Second registration should replace the first.
+        assert_eq!(mgr.pending_count(), 1);
+        assert!(!token2.is_interrupted());
     }
 }

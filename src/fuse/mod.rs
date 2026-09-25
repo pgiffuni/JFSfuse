@@ -339,6 +339,14 @@ impl FuseFs {
         self.interrupt_mgr.register()
     }
 
+    /// Register an in-flight FUSE request using a specific request ID
+    /// (the `unique` field from the FUSE header). This allows FUSE_INTERRUPT
+    /// messages, which carry the same `unique` ID, to be routed to the correct
+    /// interrupt token.
+    pub fn register_request_at(&self, request_id: RequestId) -> (RequestId, InterruptToken) {
+        self.interrupt_mgr.register_at(request_id)
+    }
+
     /// Handle a FUSE_INTERRUPT message for the given request ID.
     /// Called by the FUSE daemon thread when the kernel sends an interrupt.
     /// Returns `true` if the request was found and signaled.
@@ -637,7 +645,7 @@ impl FuseFs {
         ino: u32,
         offset: u64,
         token: &InterruptToken,
-    ) -> Result<Vec<(String, u32, u8)>, i32> {
+    ) -> Result<Vec<(String, u32, u8, u64)>, i32> {
         let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
         if !inode.is_dir() {
             return Err(ENOTDIR);
@@ -647,14 +655,14 @@ impl FuseFs {
         let cursor = DirectoryCursor::from_offset(offset);
 
         if !cursor.is_entry() {
-            result.push((".".to_string(), ino, 0x04));
+            result.push((".".to_string(), ino, 0x04, DirectoryCursor::DOT_OFFSET));
         }
 
         let dtroot = inode.dtroot_bytes();
         if dtroot.len() >= 24 {
             let parent_ino = u32::from_le_bytes(dtroot[20..24].try_into().unwrap());
             if cursor.offset <= DirectoryCursor::DOTDOT_OFFSET {
-                result.push(("..".to_string(), parent_ino, 0x04));
+                result.push(("..".to_string(), parent_ino, 0x04, DirectoryCursor::DOTDOT_OFFSET));
             }
         }
 
@@ -676,7 +684,8 @@ impl FuseFs {
                         .trim_end_matches('\0')
                         .to_string();
                     let file_type = self.infer_file_type(e.inumber);
-                    result.push((name, e.inumber, file_type));
+                    let cookie = DirectoryCursor::ENTRY_BASE + start_idx as u64 + i as u64;
+                    result.push((name, e.inumber, file_type, cookie));
                 }
             }
         }
@@ -2087,26 +2096,32 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
 
     fn read(
         &self,
-        _req: Request,
+        req: Request,
         inode: fuse3::Inode,
         fh: u64,
         offset: u64,
         size: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyData>> + Send + '_>> {
         let ino = inode as u32;
+        let req_id = req.unique;
+
         Box::pin(async move {
             self.with_inner(|fs| {
                 Self::validate_handle_static(&fs.handles, fh, ino, false)
                     .map_err(|e| errno_to_fuse3(e))?;
-                let data = fs.read(ino, offset, size as usize).ok_or(ENOENT)?;
-                Ok(ReplyData { data: data.into() })
+                let (_id, token) = fs.register_request_at(req_id);
+                let result = fs.read_interruptible(ino, offset, size as usize, &token);
+                fs.deregister_request(_id);
+                result.map(|data| ReplyData { data: data.into() }).map_err(|e| {
+                    errno_to_fuse3(e)
+                })
             })
         })
     }
 
     fn write(
         &self,
-        _req: Request,
+        req: Request,
         inode: fuse3::Inode,
         fh: u64,
         offset: u64,
@@ -2116,6 +2131,7 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyWrite>> + Send + '_>> {
         let ino = inode as u32;
         let data_vec = data.to_vec();
+        let req_id = req.unique;
         let _ = flags;
 
         Box::pin(async move {
@@ -2124,11 +2140,18 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                 {
                     Self::validate_handle_static(&fs.handles, fh, ino, false)
                         .map_err(errno_to_fuse3)?;
-                    let written = fs.write(ino, offset, &data_vec).ok_or(EIO)?;
-                    if write_flags & 1 != 0 {
-                        fs.flush(ino).ok_or(EIO)?;
+                    let (_id, token) = fs.register_request_at(req_id);
+                    let written = fs.write_interruptible(ino, offset, &data_vec, &token);
+                    fs.deregister_request(_id);
+                    match written {
+                        Ok(n) => {
+                            if write_flags & 1 != 0 {
+                                fs.flush(ino).ok_or_else(|| errno_to_fuse3(EIO))?;
+                            }
+                            Ok(ReplyWrite { written: n as u32 })
+                        }
+                        Err(e) => Err(errno_to_fuse3(e)),
                     }
-                    Ok(ReplyWrite { written: written as u32 })
                 }
                 #[cfg(not(feature = "writable"))]
                 {
@@ -2392,32 +2415,31 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
     > {
         let parent_ino = parent as u32;
         let off = offset as u64;
-        let _ = req;
+        let req_id = req.unique;
 
         Box::pin(async move {
-            let entries = self.with_inner(|fs| -> Result<_, fuse3::Errno> {
+            let entries: Vec<(String, u32, u8, u64)> = self.with_inner(|fs| -> Result<_, fuse3::Errno> {
                 Self::validate_handle_static(&fs.handles, fh, parent_ino, true)
                     .map_err(errno_to_fuse3)?;
-                Ok(fs.readdir(parent_ino, off))
-            });
+                let (_id, token) = fs.register_request_at(req_id);
+                let result = fs.readdir_interruptible(parent_ino, off, &token);
+                fs.deregister_request(_id);
+                result.map_err(errno_to_fuse3)
+            })?;
 
-            let stream_items: Vec<std::result::Result<DirectoryEntry, fuse3::Errno>> = match entries? {
-                Some(entries) => {
-                    let mut items = Vec::new();
-                    for (name, ino, kind, cookie) in entries {
-                        let file_type = Self::fuse_file_type(kind);
-                        let entry = DirectoryEntry {
-                            inode: ino as u64,
-                            kind: file_type,
-                            name: std::ffi::OsString::from(name),
-                            offset: cookie as i64,
-                        };
-                        items.push(Ok(entry));
-                    }
-                    items
-                }
-                None => vec![Err(fuse3::Errno::from(ENOENT))],
-            };
+            let stream_items: Vec<std::result::Result<DirectoryEntry, fuse3::Errno>> = entries
+                .into_iter()
+                .map(|(name, ino, kind, cookie)| {
+                    let file_type = Self::fuse_file_type(kind);
+                    let entry = DirectoryEntry {
+                        inode: ino as u64,
+                        kind: file_type,
+                        name: std::ffi::OsString::from(name),
+                        offset: cookie as i64,
+                    };
+                    Ok(entry)
+                })
+                .collect();
 
             Ok(ReplyDirectory {
                 entries: futures_util::stream::iter(stream_items),
@@ -2595,44 +2617,51 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
             >,
     > {
         let parent_ino = parent as u32;
-        let _ = (req, lock_owner);
+        let _ = lock_owner;
+        let req_id = req.unique;
         let ttl = Duration::from_secs(5);
 
          Box::pin(async move {
-            let entries = self.with_inner(|fs| -> Result<_, fuse3::Errno> {
+            let entries: Vec<(String, u32, u8, Dinode)> = self.with_inner(|fs| -> Result<_, fuse3::Errno> {
                 Self::validate_handle_static(&fs.handles, fh, parent_ino, true)
                     .map_err(errno_to_fuse3)?;
-                Ok(fs.readdirplus(parent_ino, offset))
-            });
+                let (_id, token) = fs.register_request_at(req_id);
+                let basic_entries = fs.readdir_interruptible(parent_ino, offset, &token);
+                fs.deregister_request(_id);
+                let basic_entries: Vec<(String, u32, u8, u64)> = basic_entries.map_err(errno_to_fuse3)?;
+                let mut full_entries = Vec::new();
+                for (name, ino, kind, cookie) in basic_entries {
+                    if let Some(dinode) = fs.getattr(ino) {
+                        full_entries.push((name, ino, kind, dinode));
+                    }
+                }
+                Ok(full_entries)
+            })?;
             let attr_ttl = Duration::from_secs(5);
 
-            let stream_items: Vec<std::result::Result<DirectoryEntryPlus, fuse3::Errno>> = match entries? {
-                Some(entries) => {
-                    let mut items = Vec::new();
-                    for (name, ino, kind, dinode, cookie) in entries {
-                        let file_type = match kind {
-                            0x04 => FileType::Directory,
-                            0x08 => FileType::RegularFile,
-                            0x0A | 0xA0 => FileType::Symlink,
-                            _ => FileType::RegularFile,
-                        };
-                        let attr = Self::dinode_attr_from(&dinode, ino);
-                        let entry = DirectoryEntryPlus {
-                            inode: ino as u64,
-                            generation: dinode.generation() as u64,
-                            kind: file_type,
-                            name: std::ffi::OsString::from(name),
-                            offset: cookie as i64,
-                            attr,
-                            entry_ttl: ttl,
-                            attr_ttl,
-                        };
-                        items.push(Ok(entry));
-                    }
-                    items
-                }
-                None => vec![Err(fuse3::Errno::from(ENOENT))],
-            };
+            let stream_items: Vec<std::result::Result<DirectoryEntryPlus, fuse3::Errno>> = entries
+                .into_iter()
+                .map(|(name, ino, kind, dinode)| {
+                    let file_type = match kind {
+                        0x04 => FileType::Directory,
+                        0x08 => FileType::RegularFile,
+                        0x0A | 0xA0 => FileType::Symlink,
+                        _ => FileType::RegularFile,
+                    };
+                    let attr = Self::dinode_attr_from(&dinode, ino);
+                    let entry = DirectoryEntryPlus {
+                        inode: ino as u64,
+                        generation: dinode.generation() as u64,
+                        kind: file_type,
+                        name: std::ffi::OsString::from(name),
+                        offset: 0i64,
+                        attr,
+                        entry_ttl: ttl,
+                        attr_ttl,
+                    };
+                    Ok(entry)
+                })
+                .collect();
 
             Ok(ReplyDirectoryPlus {
                 entries: futures_util::stream::iter(stream_items),

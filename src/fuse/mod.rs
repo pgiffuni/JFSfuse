@@ -2153,7 +2153,7 @@ impl Filesystem for Fuse3Fs {
         let fh_val = fh.0;
         let req_id = req.unique().0;
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             match Self::validate_handle_static(&fs.handles, fh_val, ino_val, false) {
                 Ok(()) => {}
                 Err(e) => {
@@ -2465,7 +2465,7 @@ impl Filesystem for Fuse3Fs {
         let fh_val = fh.0;
         let req_id = req.unique().0;
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
                 Ok(()) => {}
                 Err(e) => {
@@ -2495,7 +2495,7 @@ impl Filesystem for Fuse3Fs {
         let req_id = req.unique().0;
         let ttl = Duration::from_secs(5);
 
-        let entries_result: Result<Vec<(String, u32, u8, u64, Dinode)>, i32> = self.with_inner(|fs| {
+        let entries_result: Result<Vec<(String, u32, u8, u64, Dinode)>, i32> = self.with_inner_read(|fs| {
             match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
                 Ok(()) => {}
                 Err(e) => return Err(e),

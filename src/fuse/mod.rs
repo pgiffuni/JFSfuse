@@ -15,12 +15,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use fuser::{AccessFlags, Errno, FopenFlags, OpenFlags, RenameFlags, WriteFlags};
+use fuser::{BsdFileFlags, CopyFileRangeFlags, PollEvents, PollFlags, PollNotifier, TimeOrNow};
 use fuser::{FileAttr, FileType, Filesystem, INodeNo, Request};
 use fuser::{FileHandle, Generation, KernelConfig};
-use fuser::{Errno, OpenFlags, AccessFlags, RenameFlags, WriteFlags, FopenFlags};
-use fuser::{ReplyEntry, ReplyAttr, ReplyData, ReplyOpen, ReplyWrite, ReplyStatfs, ReplyEmpty};
-use fuser::{ReplyXattr, ReplyLseek, ReplyCreate, ReplyBmap, ReplyPoll};
-use fuser::{CopyFileRangeFlags, PollEvents, PollFlags, PollNotifier, TimeOrNow, BsdFileFlags};
+use fuser::{ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite};
+use fuser::{ReplyBmap, ReplyCreate, ReplyLseek, ReplyPoll, ReplyXattr};
 
 use fuser::{LockOwner, ReplyDirectory, ReplyDirectoryPlus};
 
@@ -915,10 +915,26 @@ impl FuseFs {
             ino: INodeNo(ino as u64),
             size: dinode.size_val(),
             blocks: dinode.nblocks(),
-            atime: epoch + std::time::Duration::new(dinode.di_atime.seconds() as u64, dinode.di_atime.nanoseconds()),
-            mtime: epoch + std::time::Duration::new(dinode.di_mtime.seconds() as u64, dinode.di_mtime.nanoseconds()),
-            ctime: epoch + std::time::Duration::new(dinode.di_ctime.seconds() as u64, dinode.di_ctime.nanoseconds()),
-            crtime: epoch + std::time::Duration::new(dinode.di_ctime.seconds() as u64, dinode.di_ctime.nanoseconds()),
+            atime: epoch
+                + std::time::Duration::new(
+                    dinode.di_atime.seconds() as u64,
+                    dinode.di_atime.nanoseconds(),
+                ),
+            mtime: epoch
+                + std::time::Duration::new(
+                    dinode.di_mtime.seconds() as u64,
+                    dinode.di_mtime.nanoseconds(),
+                ),
+            ctime: epoch
+                + std::time::Duration::new(
+                    dinode.di_ctime.seconds() as u64,
+                    dinode.di_ctime.nanoseconds(),
+                ),
+            crtime: epoch
+                + std::time::Duration::new(
+                    dinode.di_ctime.seconds() as u64,
+                    dinode.di_ctime.nanoseconds(),
+                ),
             kind,
             perm: (mode & 0x1fff) as u16,
             nlink: dinode.nlink(),
@@ -2140,14 +2156,12 @@ impl Filesystem for Fuse3Fs {
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino_val = ino.0 as u32;
 
-        self.with_inner(|fs| {
-            match fs.open(ino_val) {
-                Ok(()) => {
-                    let fh = fs.open_handle(ino_val, false);
-                    reply.opened(FileHandle(fh), FopenFlags::empty());
-                }
-                Err(e) => reply.error(errno_to_fuser(e)),
+        self.with_inner(|fs| match fs.open(ino_val) {
+            Ok(()) => {
+                let fh = fs.open_handle(ino_val, false);
+                reply.opened(FileHandle(fh), FopenFlags::empty());
             }
+            Err(e) => reply.error(errno_to_fuser(e)),
         });
     }
 
@@ -2295,7 +2309,14 @@ impl Filesystem for Fuse3Fs {
         });
     }
 
-    fn fsync(&self, _req: &Request, inode: INodeNo, _fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        inode: INodeNo,
+        _fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let ino = inode.0 as u32;
 
         self.with_inner(|fs| {
@@ -2356,7 +2377,14 @@ impl Filesystem for Fuse3Fs {
         });
     }
 
-    fn getxattr(&self, _req: &Request, inode: INodeNo, name: &std::ffi::OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(
+        &self,
+        _req: &Request,
+        inode: INodeNo,
+        name: &std::ffi::OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
         let ino = inode.0 as u32;
         let name_str = name.to_string_lossy().to_string();
 
@@ -2420,7 +2448,13 @@ impl Filesystem for Fuse3Fs {
         });
     }
 
-    fn removexattr(&self, _req: &Request, inode: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+    fn removexattr(
+        &self,
+        _req: &Request,
+        inode: INodeNo,
+        name: &std::ffi::OsStr,
+        reply: ReplyEmpty,
+    ) {
         let ino = inode.0 as u32;
         let name_str = name.to_string_lossy().to_string();
 
@@ -2440,7 +2474,14 @@ impl Filesystem for Fuse3Fs {
         });
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         let ino_val = ino.0 as u32;
 
         self.with_inner(|fs| {
@@ -2462,18 +2503,23 @@ impl Filesystem for Fuse3Fs {
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino_val = ino.0 as u32;
 
-        self.with_inner(|fs| {
-            match fs.open(ino_val) {
-                Ok(()) => {
-                    let fh = fs.open_handle(ino_val, true);
-                    reply.opened(FileHandle(fh), FopenFlags::empty());
-                }
-                Err(e) => reply.error(errno_to_fuser(e)),
+        self.with_inner(|fs| match fs.open(ino_val) {
+            Ok(()) => {
+                let fh = fs.open_handle(ino_val, true);
+                reply.opened(FileHandle(fh), FopenFlags::empty());
             }
+            Err(e) => reply.error(errno_to_fuser(e)),
         });
     }
 
-    fn readdir(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let parent_ino = ino.0 as u32;
         let fh_val = fh.0;
         let req_id = req.unique().0;
@@ -2502,33 +2548,41 @@ impl Filesystem for Fuse3Fs {
         });
     }
 
-    fn readdirplus(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
+    fn readdirplus(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
         let parent_ino = ino.0 as u32;
         let fh_val = fh.0;
         let req_id = req.unique().0;
         let ttl = Duration::from_secs(5);
 
-        let entries_result: Result<Vec<(String, u32, u8, u64, Dinode)>, i32> = self.with_inner_read(|fs| {
-            match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
-                Ok(()) => {}
-                Err(e) => return Err(e),
-            }
-            let (_id, token) = fs.register_request_at(req_id);
-            let result = fs.readdir_interruptible(parent_ino, offset, &token);
-            fs.deregister_request(_id);
-            match result {
-                Ok(entries) => {
-                    let mut full_entries = Vec::new();
-                    for (name, entry_ino, kind, cookie) in entries {
-                        if let Some(dinode) = fs.getattr(entry_ino) {
-                            full_entries.push((name, entry_ino, kind, cookie, dinode));
-                        }
-                    }
-                    Ok(full_entries)
+        let entries_result: Result<Vec<(String, u32, u8, u64, Dinode)>, i32> = self
+            .with_inner_read(|fs| {
+                match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
+                    Ok(()) => {}
+                    Err(e) => return Err(e),
                 }
-                Err(e) => Err(e),
-            }
-        });
+                let (_id, token) = fs.register_request_at(req_id);
+                let result = fs.readdir_interruptible(parent_ino, offset, &token);
+                fs.deregister_request(_id);
+                match result {
+                    Ok(entries) => {
+                        let mut full_entries = Vec::new();
+                        for (name, entry_ino, kind, cookie) in entries {
+                            if let Some(dinode) = fs.getattr(entry_ino) {
+                                full_entries.push((name, entry_ino, kind, cookie, dinode));
+                            }
+                        }
+                        Ok(full_entries)
+                    }
+                    Err(e) => Err(e),
+                }
+            });
 
         match entries_result {
             Ok(entries) => {
@@ -2575,7 +2629,14 @@ impl Filesystem for Fuse3Fs {
         });
     }
 
-    fn fsyncdir(&self, _req: &Request, _inode: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _inode: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         self.with_inner(|fs| {
             #[cfg(feature = "writable")]
             {
@@ -2599,11 +2660,9 @@ impl Filesystem for Fuse3Fs {
         let gid = req.gid();
         let mask_val = mask.bits() as u32;
 
-        self.with_inner_read(|fs| {
-            match fs.access(ino, mask_val, uid, gid) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(Errno::from_i32(e)),
-            }
+        self.with_inner_read(|fs| match fs.access(ino, mask_val, uid, gid) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
         });
     }
 
@@ -2633,7 +2692,13 @@ impl Filesystem for Fuse3Fs {
                                 let attr = Self::dinode_attr(fs, ino, &dinode);
                                 fs.open(ino).map_err(errno_to_fuser);
                                 let fh = fs.open_handle(ino, false);
-                                reply.created(&ttl, &attr, Generation(dinode.generation() as u64), FileHandle(fh), FopenFlags::empty());
+                                reply.created(
+                                    &ttl,
+                                    &attr,
+                                    Generation(dinode.generation() as u64),
+                                    FileHandle(fh),
+                                    FopenFlags::empty(),
+                                );
                             }
                             None => reply.error(Errno::from_i32(ENOENT)),
                         }
@@ -2806,7 +2871,9 @@ impl Filesystem for Fuse3Fs {
             }
             #[cfg(not(feature = "writable"))]
             {
-                let _ = (src_ino, fh_in_val, offset_in, dst_ino, fh_out_val, offset_out, len, flags);
+                let _ = (
+                    src_ino, fh_in_val, offset_in, dst_ino, fh_out_val, offset_out, len, flags,
+                );
                 reply.error(Errno::from_i32(EROFS));
             }
         });
@@ -2895,7 +2962,6 @@ impl Fuse3Fs {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

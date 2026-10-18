@@ -547,6 +547,7 @@ fn test_sync_fs_readonly_rejected() {
     assert_eq!(fs.sync_fs(), Err(jfsfuse::fuse::EROFS));
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_sync_fs_capability() {
     let vol = load_image_to_memory();
@@ -558,6 +559,7 @@ fn test_sync_fs_capability() {
     assert!(fs.fuse_capabilities() & jfsfuse::fuse::FUSE_DO_READDIRPLUS != 0);
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_readdirplus_returns_attrs() {
     let vol = load_image_to_memory();
@@ -580,6 +582,7 @@ fn test_readdirplus_returns_attrs() {
     assert_eq!(dot_entry.4, 0, "dot entry should have cookie 0");
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_readdirplus_lookup_reference_accounting() {
     let vol = load_image_to_memory();
@@ -616,6 +619,7 @@ fn test_readdirplus_lookup_reference_accounting() {
     assert_eq!(fs.lookup_count(ino), 0, "all refs should be released");
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_readdirplus_not_directory() {
     let vol = load_image_to_memory();
@@ -629,6 +633,7 @@ fn test_readdirplus_not_directory() {
     assert!(fs.readdirplus(ino, 0).is_none());
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_forget_evicts_page_cache() {
     let vol = load_image_to_memory();
@@ -654,6 +659,7 @@ fn test_forget_evicts_page_cache() {
     assert_eq!(fs.lookup_count(ino), 0);
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_batch_forget_multiple_inodes() {
     let vol = load_image_to_memory();
@@ -700,7 +706,7 @@ fn test_statfs_returns_valid_sizes() {
 #[test]
 fn test_statfs_free_blocks_nonnegative() {
     let vol = load_image_to_memory();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
     let stat = fs.statfs(fs.volume.root_ino);
 
     assert!(
@@ -713,6 +719,7 @@ fn test_statfs_free_blocks_nonnegative() {
     );
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_statfs_after_write() {
     let vol = load_image_to_memory();
@@ -733,7 +740,7 @@ fn test_statfs_after_write() {
 #[test]
 fn test_access_root_bypass() {
     let vol = load_image_to_memory();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
 
     let parent = fs.volume.root_ino;
     // Root (uid 0) bypasses all permission checks.
@@ -743,11 +750,12 @@ fn test_access_root_bypass() {
 #[test]
 fn test_access_nonexistent_inode() {
     let vol = load_image_to_memory();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
 
     assert_eq!(fs.access(999, F_OK, 1000, 1000), Err(ENOENT));
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_access_owner_permissions() {
     let vol = load_image_to_memory();
@@ -776,6 +784,7 @@ fn test_access_owner_permissions() {
     assert_eq!(fs.access(ino, X_OK, 1000, 1000), Err(EACCES));
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_access_other_permissions() {
     let vol = load_image_to_memory();
@@ -800,6 +809,7 @@ fn test_access_other_permissions() {
     assert_eq!(fs.access(ino, W_OK, 2000, 2000), Err(EACCES));
 }
 
+#[cfg(feature = "writable")]
 #[test]
 fn test_access_execute_denied_without_owner_execute() {
     let vol = load_image_to_memory();
@@ -829,7 +839,7 @@ fn test_access_execute_denied_without_owner_execute() {
 #[test]
 fn test_access_f_ok_existence() {
     let vol = load_image_to_memory();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
 
     let parent = fs.volume.root_ino;
     // F_OK just checks existence.

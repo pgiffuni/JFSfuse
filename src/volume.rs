@@ -2198,7 +2198,7 @@ impl Volume {
     /// Get an extended attribute value by name (Phase 12).
     /// Returns `Ok(None)` if the xattr does not exist.
     #[cfg(feature = "writable")]
-    pub fn getxattr(&mut self, ino: u32, name: &str) -> StorageResult<Option<Vec<u8>>> {
+    pub fn getxattr(&self, ino: u32, name: &str) -> StorageResult<Option<Vec<u8>>> {
         let inode = crate::inode::Inode::read(self, ino)?;
         let ea_data = self.read_inline_xattr_data(&inode);
         let parsed = Self::parse_xattr_list(&ea_data);
@@ -2213,7 +2213,7 @@ impl Volume {
 
     /// List xattr names for an inode (Phase 12).
     #[cfg(feature = "writable")]
-    pub fn listxattr(&mut self, ino: u32) -> StorageResult<Vec<String>> {
+    pub fn listxattr(&self, ino: u32) -> StorageResult<Vec<String>> {
         let inode = crate::inode::Inode::read(self, ino)?;
         let ea_data = self.read_inline_xattr_data(&inode);
         let parsed = Self::parse_xattr_list(&ea_data);

@@ -1450,7 +1450,7 @@ impl FuseFs {
     ///
     /// Returns `Ok(None)` if the attribute does not exist.
     #[cfg(feature = "writable")]
-    pub fn getxattr(&mut self, ino: u32, name: &str) -> FuseResult<Option<Vec<u8>>> {
+    pub fn getxattr(&self, ino: u32, name: &str) -> FuseResult<Option<Vec<u8>>> {
         if !self.writable {
             return Err(EROFS);
         }
@@ -1526,7 +1526,7 @@ impl FuseFs {
 
     /// List xattr names (writable builds only).
     #[cfg(feature = "writable")]
-    pub fn listxattr(&mut self, ino: u32) -> FuseResult<Vec<String>> {
+    pub fn listxattr(&self, ino: u32) -> FuseResult<Vec<String>> {
         if !self.writable {
             return Err(EROFS);
         }
@@ -2347,7 +2347,7 @@ impl Filesystem for Fuse3Fs {
         let ino = inode.0 as u32;
         let name_str = name.to_string_lossy().to_string();
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             #[cfg(feature = "writable")]
             {
                 match fs.getxattr(ino, &name_str) {
@@ -2377,7 +2377,7 @@ impl Filesystem for Fuse3Fs {
     fn listxattr(&self, _req: &Request, inode: INodeNo, size: u32, reply: ReplyXattr) {
         let ino = inode.0 as u32;
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             #[cfg(feature = "writable")]
             {
                 match fs.listxattr(ino) {

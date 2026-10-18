@@ -705,7 +705,7 @@ pub const DTSLOTDATASIZE: usize = 30;
 /// Number of u16 wchar units in a slot's data area.
 pub const DTSLOTDATALEN: usize = 15;
 
-/// First slot index for entries in a dtroot (slot[0] is the header).
+/// First slot index for entries in a dtroot (slot\[0\] is the header).
 pub const DTENTRYSTART: usize = 1;
 /// Maximum slots in a dtroot page.
 pub const DTROOTMAXSLOT: usize = 9;

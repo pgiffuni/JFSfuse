@@ -7,7 +7,7 @@
 //!
 //! The dtroot header layout (32 bytes):
 //!   DASD (16) | flag (1) | nextindex (1) | freecnt (1) | freelist (1)
-//!   | idotdot (4) | stbl[8] (8)
+//!   | idotdot (4) | stbl\[8\] (8)
 
 use byteorder::{ByteOrder, LittleEndian};
 

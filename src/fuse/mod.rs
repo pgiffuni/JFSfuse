@@ -300,7 +300,7 @@ impl FuseFs {
     ///
     /// These flags are negotiated during FUSE_INIT to enable features
     /// in the kernel FUSE client. All constants are defined in the
-    /// [`abi`](self::abi) module and match the Linux FUSE ABI.
+    /// [`abi`] module and match the Linux FUSE ABI.
     ///
     /// ## Implemented
     /// - [`FUSE_ASYNC_READ`] — asynchronous read (reads may be reordered)
@@ -321,7 +321,7 @@ impl FuseFs {
     /// - [`FUSE_SETLKW`] semantics: conflicts return `EAGAIN` instead of blocking.
     ///
     /// ## Not requested
-    /// - [`FUSE_DEFAULT_PERMISSIONS`] — access checks are performed in the
+    /// - `FUSE_DEFAULT_PERMISSIONS` — access checks are performed in the
     ///   FUSE server via `ACCESS`, not delegated to the kernel.
     ///
     /// Long-running operations are made cancellable via [`FUSE_INTERRUPT`]

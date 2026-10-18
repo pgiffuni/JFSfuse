@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: BSD-2-Clause
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use fuse3::raw::Session;
+use fuser::{Config, MountOption, SessionACL};
 use jfsfuse::fuse::{Fuse3Fs, FuseFs};
 use jfsfuse::volume::Volume;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn handle_sigint(_sig: i32) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
@@ -56,28 +63,35 @@ async fn main() -> ExitCode {
 
     let fuse_fs = Fuse3Fs::new(fs);
 
-    let mut mount_options = fuse3::MountOptions::default();
-    mount_options.fs_name("jfs");
+    let mut mount_options = Vec::new();
+    mount_options.push(MountOption::FSName("jfs".to_owned()));
     if read_only {
-        mount_options.read_only(true);
-    }
-    if allow_other {
-        mount_options.allow_other(true);
+        mount_options.push(MountOption::RO);
     }
 
-    let session = Session::new(mount_options);
+    let mut config = Config::default();
+    config.mount_options = mount_options;
+    config.acl = if allow_other { SessionACL::All } else { SessionACL::Owner };
 
-    match session.mount(fuse_fs, &mountpoint).await {
-        Ok(handle) => {
-            println!("Mounted JFS at {}", mountpoint.display());
-            eprintln!("Press Ctrl+C to unmount.");
-            let _ = tokio::signal::ctrl_c().await;
-            let _ = handle.unmount().await;
-            ExitCode::SUCCESS
-        }
+    let session = match fuser::spawn_mount(fuse_fs, &mountpoint, &config) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("Mount failed: {}", e);
-            ExitCode::from(1)
+            return ExitCode::from(1);
         }
+    };
+
+    println!("Mounted JFS at {}", mountpoint.display());
+    eprintln!("Press Ctrl+C to unmount.");
+
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
     }
+
+    while RUNNING.load(Ordering::SeqCst) {
+        std::thread::park_timeout(Duration::from_secs(1));
+    }
+
+    drop(session);
+    ExitCode::SUCCESS
 }

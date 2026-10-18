@@ -13,16 +13,16 @@
 //! use `--no-default-features --features std`.
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use fuse3::raw::Request;
-use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyCopyFileRange, ReplyCreated, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyLSeek, ReplyOpen, ReplyStatFs,
-    ReplyWrite, ReplyXAttr,
-};
-use fuse3::{FileType, Timestamp};
+use fuser::{FileAttr, FileType, Filesystem, INodeNo, Request};
+use fuser::{FileHandle, Generation, KernelConfig};
+use fuser::{Errno, OpenFlags, AccessFlags, RenameFlags, WriteFlags, FopenFlags};
+use fuser::{ReplyEntry, ReplyAttr, ReplyData, ReplyOpen, ReplyWrite, ReplyStatfs, ReplyEmpty};
+use fuser::{ReplyXattr, ReplyLseek, ReplyCreate, ReplyBmap, ReplyPoll};
+use fuser::{CopyFileRangeFlags, PollEvents, PollFlags, PollNotifier, TimeOrNow, BsdFileFlags};
+
+use fuser::{LockOwner, ReplyDirectory, ReplyDirectoryPlus};
 
 use crate::btree::dtree::{DirEntry, DirectoryCursor, Dtree};
 use crate::btree::xtree::Xtree;
@@ -896,8 +896,8 @@ impl FuseFs {
 }
 
 impl FuseFs {
-    /// Convert a `Dinode` to a `fuse3::FileAttr`.
-    pub fn dinode_to_fileattr(ino: u32, dinode: &Dinode) -> fuse3::raw::reply::FileAttr {
+    /// Convert a `Dinode` to a `fuser::FileAttr`.
+    pub fn dinode_to_fileattr(ino: u32, dinode: &Dinode) -> FileAttr {
         let mode = dinode.mode();
         let kind = match mode & 0xf000 {
             0x1000 => FileType::NamedPipe,
@@ -910,22 +910,15 @@ impl FuseFs {
             _ => FileType::RegularFile,
         };
         let block_size = crate::storage::BLOCK_SIZE as u32;
-        fuse3::raw::reply::FileAttr {
-            ino: ino as u64,
+        let epoch = std::time::UNIX_EPOCH;
+        FileAttr {
+            ino: INodeNo(ino as u64),
             size: dinode.size_val(),
             blocks: dinode.nblocks(),
-            atime: Timestamp::new(
-                dinode.di_atime.seconds() as i64,
-                dinode.di_atime.nanoseconds(),
-            ),
-            mtime: Timestamp::new(
-                dinode.di_mtime.seconds() as i64,
-                dinode.di_mtime.nanoseconds(),
-            ),
-            ctime: Timestamp::new(
-                dinode.di_ctime.seconds() as i64,
-                dinode.di_ctime.nanoseconds(),
-            ),
+            atime: epoch + std::time::Duration::new(dinode.di_atime.seconds() as u64, dinode.di_atime.nanoseconds()),
+            mtime: epoch + std::time::Duration::new(dinode.di_mtime.seconds() as u64, dinode.di_mtime.nanoseconds()),
+            ctime: epoch + std::time::Duration::new(dinode.di_ctime.seconds() as u64, dinode.di_ctime.nanoseconds()),
+            crtime: epoch + std::time::Duration::new(dinode.di_ctime.seconds() as u64, dinode.di_ctime.nanoseconds()),
             kind,
             perm: (mode & 0x1fff) as u16,
             nlink: dinode.nlink(),
@@ -933,6 +926,7 @@ impl FuseFs {
             gid: dinode.gid(),
             rdev: 0,
             blksize: block_size,
+            flags: 0,
         }
     }
 
@@ -1681,7 +1675,7 @@ impl FuseFs {
     }
 }
 
-/// Wrapper around `FuseFs` that implements the fuse3 `Filesystem` trait.
+/// Wrapper around `FuseFs` that implements the fuser `Filesystem` trait.
 ///
 /// The trait methods take `&self`, so the inner `FuseFs` is protected by a
 /// `Mutex`. All operations are dispatched through `FuseFs`'s existing
@@ -1691,9 +1685,9 @@ pub struct Fuse3Fs {
     inner: std::sync::Mutex<FuseFs>,
 }
 
-/// Convert an i32 errno to a `fuse3::Errno`.
-pub fn errno_to_fuse3(code: i32) -> fuse3::Errno {
-    fuse3::Errno::from(code)
+/// Convert an i32 errno to a `fuser::Errno`.
+pub fn errno_to_fuse3(code: i32) -> Errno {
+    Errno::from_i32(code)
 }
 
 /// FreeBSD-compatible errno constants.
@@ -1759,38 +1753,12 @@ impl Fuse3Fs {
     }
 }
 
-#[allow(refining_impl_trait_reachable)]
-impl fuse3::raw::Filesystem for Fuse3Fs {
-    type DirEntryStream<'a>
-        = futures_util::stream::Iter<
-        std::vec::IntoIter<std::result::Result<DirectoryEntry, fuse3::Errno>>,
-    >
-    where
-        Self: 'a;
-
-    type DirEntryPlusStream<'a>
-        = futures_util::stream::Iter<
-        std::vec::IntoIter<std::result::Result<DirectoryEntryPlus, fuse3::Errno>>,
-    >
-    where
-        Self: 'a;
-
-    fn init(
-        &self,
-        _req: Request,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyInit>> + Send + '_>>
-    {
-        Box::pin(async {
-            Ok(ReplyInit {
-                max_write: NonZeroU32::new(1 << 20).unwrap(),
-            })
-        })
+impl Filesystem for Fuse3Fs {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+        Ok(())
     }
 
-    fn destroy(
-        &self,
-        _req: Request,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn destroy(&mut self) {
         #[cfg(feature = "writable")]
         {
             self.with_inner(|fs| {
@@ -1799,1191 +1767,1057 @@ impl fuse3::raw::Filesystem for Fuse3Fs {
                 }
             })
         }
-        #[cfg(not(feature = "writable"))]
-        {
-            let _ = req;
-        }
-        Box::pin(async {})
     }
 
-    fn lookup(
-        &self,
-        req: Request,
-        parent: fuse3::Inode,
-        name: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyEntry>> + Send + '_>>
-    {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
         let name_str = name.to_string_lossy().to_string();
         let ttl = Duration::from_secs(5);
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                let ino = fs.lookup(parent as u32, &name_str).ok_or(ENOENT)?;
-                let dinode = fs.getattr(ino).ok_or(ENOENT)?;
-                let attr = Self::dinode_attr(fs, ino, &dinode);
-                Ok(ReplyEntry {
-                    ttl,
-                    attr,
-                    generation: dinode.generation() as u64,
-                })
-            })
-        })
-    }
-
-    fn forget(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        nlookup: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        let parent = inode as u32;
-        let n = nlookup;
-        Box::pin(async move {
-            self.with_inner(|fs| fs.forget(parent, n));
-        })
-    }
-
-    fn batch_forget(
-        &self,
-        _req: Request,
-        inodes: &[fuse3::Inode],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        let inodes_vec: Vec<u32> = inodes.iter().map(|&i| i as u32).collect();
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                for inode in &inodes_vec {
-                    fs.forget(*inode, 1);
+        self.with_inner(|fs| {
+            let ino = match fs.lookup(parent.0 as u32, &name_str) {
+                Some(ino) => ino,
+                None => {
+                    reply.error(Errno::from_i32(ENOENT));
+                    return;
                 }
-            })
-        })
+            };
+            let dinode = match fs.getattr(ino) {
+                Some(dinode) => dinode,
+                None => {
+                    reply.error(Errno::from_i32(ENOENT));
+                    return;
+                }
+            };
+            let attr = Self::dinode_attr(fs, ino, &dinode);
+            reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+        });
     }
 
-    fn getattr(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        _fh: Option<u64>,
-        _flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyAttr>> + Send + '_>>
-    {
-        let ino = inode as u32;
+    fn forget(&self, _req: &Request, inode: INodeNo, nlookup: u64) {
+        let ino = inode.0 as u32;
+        self.with_inner(|fs| fs.forget(ino, nlookup));
+    }
+
+    fn getattr(&self, _req: &Request, inode: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = inode.0 as u32;
         let ttl = Duration::from_secs(5);
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                let dinode = fs.getattr(ino).ok_or(ENOENT)?;
+
+        self.with_inner(|fs| match fs.getattr(ino) {
+            Some(dinode) => {
                 let attr = Self::dinode_attr(fs, ino, &dinode);
-                Ok(ReplyAttr { ttl, attr })
-            })
-        })
+                reply.attr(&ttl, &attr);
+            }
+            None => reply.error(Errno::from_i32(ENOENT)),
+        });
     }
 
     fn setattr(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
-        _fh: Option<u64>,
-        set_attr: fuse3::SetAttr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyAttr>> + Send + '_>>
-    {
-        let ino = inode as u32;
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let ino_val = ino.0 as u32;
         let ttl = Duration::from_secs(5);
-        let uid = set_attr.uid;
-        let gid = set_attr.gid;
-        let mode = set_attr.mode.map(|m| m as u32);
-        let atime = set_attr.atime.map(|t| t.sec as u64);
-        let mtime = set_attr.mtime.map(|t| t.sec as u64);
-        let size = set_attr.size;
-        let _ = req;
+        let atime_secs = Self::time_or_now_to_secs(atime);
+        let mtime_secs = Self::time_or_now_to_secs(mtime);
 
-        Box::pin(async move {
-            self.with_inner(
-                |fs| match fs.setattr(ino, mode, uid, gid, atime, mtime, size) {
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.setattr(ino_val, mode, uid, gid, atime_secs, mtime_secs, size) {
                     Ok(()) => {
-                        let dinode = fs.getattr(ino).ok_or(ENOENT)?;
-                        let attr = Self::dinode_attr(fs, ino, &dinode);
-                        Ok(ReplyAttr { ttl, attr })
+                        let dinode = fs.getattr(ino_val);
+                        match dinode {
+                            Some(dinode) => {
+                                let attr = Self::dinode_attr(fs, ino_val, &dinode);
+                                reply.attr(&ttl, &attr);
+                            }
+                            None => reply.error(Errno::from_i32(ENOENT)),
+                        }
                     }
-                    Err(e) => Err(e.into()),
-                },
-            )
-        })
+                    Err(e) => reply.error(errno_to_fuse3(e)),
+                }
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino_val, mode, uid, gid, atime_secs, mtime_secs, size);
+                let _ = _ctime;
+                let _ = _fh;
+                let _ = _crtime;
+                let _ = _chgtime;
+                let _ = _bkuptime;
+                let _ = _flags;
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn readlink(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyData>> + Send + '_>>
-    {
-        let ino = inode as u32;
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                let data = fs.readlink(ino).map_err(|e| {
-                    let code: i32 = e;
-                    errno_to_fuse3(code)
-                })?;
+    fn readlink(&self, _req: &Request, inode: INodeNo, reply: ReplyData) {
+        let ino = inode.0 as u32;
+
+        self.with_inner(|fs| match fs.readlink(ino) {
+            Ok(data) => {
                 let bytes = if data.len() > 128 {
                     data[..128].to_vec()
                 } else {
                     data
                 };
-                Ok(ReplyData { data: bytes.into() })
-            })
-        })
+                reply.data(&bytes);
+            }
+            Err(e) => reply.error(errno_to_fuse3(e)),
+        });
     }
 
     fn symlink(
         &self,
-        _req: Request,
-        parent: fuse3::Inode,
-        name: &std::ffi::OsStr,
-        link: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyEntry>> + Send + '_>>
-    {
-        let parent_ino = parent as u32;
-        let name_str = name.to_string_lossy().to_string();
-        let link_str = link.to_string_lossy().to_string();
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &std::ffi::OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let parent_ino = parent.0 as u32;
+        let name_str = link_name.to_string_lossy().to_string();
+        let link_str = target.to_string_lossy().to_string();
         let ttl = Duration::from_secs(5);
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                let ino = fs.symlink(parent_ino, &name_str, &link_str).map_err(|e| {
-                    let code: i32 = e;
-                    errno_to_fuse3(code)
-                })?;
-                let dinode = fs.getattr(ino).ok_or(ENOENT)?;
-                let attr = Self::dinode_attr(fs, ino, &dinode);
-                Ok(ReplyEntry {
-                    ttl,
-                    attr,
-                    generation: dinode.generation() as u64,
-                })
-            })
-        })
+        self.with_inner(|fs| {
+            match fs.symlink(parent_ino, &name_str, &link_str) {
+                Ok(ino) => {
+                    let dinode = fs.getattr(ino);
+                    match dinode {
+                        Some(dinode) => {
+                            let attr = Self::dinode_attr(fs, ino, &dinode);
+                            reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+                        }
+                        None => reply.error(Errno::from_i32(ENOENT)),
+                    }
+                }
+                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+        });
     }
 
     fn mknod(
         &self,
-        req: Request,
-        parent: fuse3::Inode,
+        _req: &Request,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
         mode: u32,
+        _umask: u32,
         rdev: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyEntry>> + Send + '_>>
-    {
-        let parent_ino = parent as u32;
+        reply: ReplyEntry,
+    ) {
+        let parent_ino = parent.0 as u32;
         let name_str = name.to_string_lossy().to_string();
         let ttl = Duration::from_secs(5);
 
-        Box::pin(async move {
-            let _ = req;
-            self.with_inner(|fs| {
-                let ino = fs
-                    .mknod(parent_ino, &name_str, mode, rdev as u64)
-                    .map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })?;
-                let dinode = fs.getattr(ino).ok_or(ENOENT)?;
-                let attr = Self::dinode_attr(fs, ino, &dinode);
-                Ok(ReplyEntry {
-                    ttl,
-                    attr,
-                    generation: dinode.generation() as u64,
-                })
-            })
-        })
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.mknod(parent_ino, &name_str, mode, rdev as u64) {
+                    Ok(ino) => {
+                        let dinode = fs.getattr(ino);
+                        match dinode {
+                            Some(dinode) => {
+                                let attr = Self::dinode_attr(fs, ino, &dinode);
+                                reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+                            }
+                            None => reply.error(Errno::from_i32(ENOENT)),
+                        }
+                    }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
+                }
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str, mode, _umask, rdev);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
     fn mkdir(
         &self,
-        req: Request,
-        parent: fuse3::Inode,
+        _req: &Request,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
         mode: u32,
         _umask: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyEntry>> + Send + '_>>
-    {
-        let parent_ino = parent as u32;
+        reply: ReplyEntry,
+    ) {
+        let parent_ino = parent.0 as u32;
         let name_str = name.to_string_lossy().to_string();
         let ttl = Duration::from_secs(5);
 
-        Box::pin(async move {
-            let _ = req;
-            let _ = _umask;
-            self.with_inner(|fs| {
-                let ino = fs.mkdir(parent_ino, &name_str, mode).map_err(|e| {
-                    let code: i32 = e;
-                    errno_to_fuse3(code)
-                })?;
-                let dinode = fs.getattr(ino).ok_or(ENOENT)?;
-                let attr = Self::dinode_attr(fs, ino, &dinode);
-                Ok(ReplyEntry {
-                    ttl,
-                    attr,
-                    generation: dinode.generation() as u64,
-                })
-            })
-        })
-    }
-
-    fn unlink(
-        &self,
-        req: Request,
-        parent: fuse3::Inode,
-        name: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let parent_ino = parent as u32;
-        let name_str = name.to_string_lossy().to_string();
-        let _ = req;
-
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    if fs.unlink(parent_ino, &name_str).unwrap_or(false) {
-                        Ok(())
-                    } else {
-                        Err(ENOENT.into())
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.mkdir(parent_ino, &name_str, mode) {
+                    Ok(ino) => {
+                        let dinode = fs.getattr(ino);
+                        match dinode {
+                            Some(dinode) => {
+                                let attr = Self::dinode_attr(fs, ino, &dinode);
+                                reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+                            }
+                            None => reply.error(Errno::from_i32(ENOENT)),
+                        }
                     }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (parent_ino, name_str);
-                    Err(EROFS.into())
-                }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str, mode, _umask);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn rmdir(
-        &self,
-        req: Request,
-        parent: fuse3::Inode,
-        name: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let parent_ino = parent as u32;
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let parent_ino = parent.0 as u32;
         let name_str = name.to_string_lossy().to_string();
-        let _ = req;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.rmdir(parent_ino, &name_str).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                if fs.unlink(parent_ino, &name_str).unwrap_or(false) {
+                    reply.ok();
+                } else {
+                    reply.error(Errno::from_i32(ENOENT));
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (parent_ino, name_str);
-                    Err(EROFS.into())
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let parent_ino = parent.0 as u32;
+        let name_str = name.to_string_lossy().to_string();
+
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.rmdir(parent_ino, &name_str) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
     fn rename(
         &self,
-        req: Request,
-        parent: fuse3::Inode,
+        _req: &Request,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
-        new_parent: fuse3::Inode,
+        new_parent: INodeNo,
         new_name: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let old_parent = parent as u32;
-        let old_name = name.to_string_lossy().to_string();
-        let new_p = new_parent as u32;
-        let new_name = new_name.to_string_lossy().to_string();
-        let _ = req;
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        const RENAME_NOREPLACE_BIT: u32 = 1 << 0;
+        const RENAME_EXCHANGE_BIT: u32 = 1 << 1;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.rename(old_parent, &old_name, new_p, &new_name)
-                        .map_err(|e| {
-                            let code: i32 = e;
-                            errno_to_fuse3(code)
-                        })
+        let old_parent = parent.0 as u32;
+        let old_name = name.to_string_lossy().to_string();
+        let new_p = new_parent.0 as u32;
+        let new_name = new_name.to_string_lossy().to_string();
+        let flags_bits = flags.bits();
+
+        if flags_bits & RENAME_EXCHANGE_BIT != 0 {
+            reply.error(Errno::from_i32(EOPNOTSUPP));
+            return;
+        }
+        if flags_bits & RENAME_NOREPLACE_BIT != 0 {
+            reply.error(Errno::from_i32(EOPNOTSUPP));
+            return;
+        }
+        if flags_bits != 0 {
+            reply.error(Errno::from_i32(EINVAL));
+            return;
+        }
+
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.rename(old_parent, &old_name, new_p, &new_name) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (old_parent, old_name, new_p, new_name);
-                    Err(EROFS.into())
-                }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (old_parent, old_name, new_p, new_name);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
     fn link(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
-        new_parent: fuse3::Inode,
+        _req: &Request,
+        inode: INodeNo,
+        new_parent: INodeNo,
         new_name: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyEntry>> + Send + '_>>
-    {
-        let target_ino = inode as u32;
-        let parent_ino = new_parent as u32;
+        reply: ReplyEntry,
+    ) {
+        let target_ino = inode.0 as u32;
+        let parent_ino = new_parent.0 as u32;
         let name_str = new_name.to_string_lossy().to_string();
         let ttl = Duration::from_secs(5);
-        let _ = req;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.link(parent_ino, &name_str, target_ino).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })?;
-                    let dinode = fs.getattr(target_ino).ok_or(ENOENT)?;
-                    let attr = Self::dinode_attr(fs, target_ino, &dinode);
-                    Ok(ReplyEntry {
-                        ttl,
-                        attr,
-                        generation: dinode.generation() as u64,
-                    })
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.link(parent_ino, &name_str, target_ino) {
+                    Ok(()) => {
+                        let dinode = fs.getattr(target_ino);
+                        match dinode {
+                            Some(dinode) => {
+                                let attr = Self::dinode_attr(fs, target_ino, &dinode);
+                                reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+                            }
+                            None => reply.error(Errno::from_i32(ENOENT)),
+                        }
+                    }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (parent_ino, name_str, target_ino);
-                    Err(EROFS.into())
-                }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str, target_ino);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn open(
-        &self,
-        req: Request,
-        inode: fuse3::Inode,
-        flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyOpen>> + Send + '_>>
-    {
-        let ino = inode as u32;
-        let _ = req;
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino_val = ino.0 as u32;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                fs.open(ino).map_err(|e| {
-                    let code: i32 = e;
-                    errno_to_fuse3(code)
-                })?;
-                let fh = fs.open_handle(ino, false);
-                let _ = flags;
-                Ok(ReplyOpen { fh, flags: 0 })
-            })
-        })
+        self.with_inner(|fs| {
+            match fs.open(ino_val) {
+                Ok(()) => {
+                    let fh = fs.open_handle(ino_val, false);
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                }
+                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+        });
     }
 
     fn read(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
-        fh: u64,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         size: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyData>> + Send + '_>>
-    {
-        let ino = inode as u32;
-        let req_id = req.unique;
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        let ino_val = ino.0 as u32;
+        let fh_val = fh.0;
+        let req_id = req.unique().0;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                Self::validate_handle_static(&fs.handles, fh, ino, false)
-                    .map_err(|e| errno_to_fuse3(e))?;
-                let (_id, token) = fs.register_request_at(req_id);
-                let result = fs.read_interruptible(ino, offset, size as usize, &token);
-                fs.deregister_request(_id);
-                result
-                    .map(|data| ReplyData { data: data.into() })
-                    .map_err(|e| errno_to_fuse3(e))
-            })
-        })
+        self.with_inner(|fs| {
+            match Self::validate_handle_static(&fs.handles, fh_val, ino_val, false) {
+                Ok(()) => {}
+                Err(e) => {
+                    reply.error(errno_to_fuse3(e));
+                    return;
+                }
+            }
+            let (_id, token) = fs.register_request_at(req_id);
+            let result = fs.read_interruptible(ino_val, offset, size as usize, &token);
+            fs.deregister_request(_id);
+            match result {
+                Ok(data) => reply.data(&data),
+                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+        });
     }
 
     fn write(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
-        fh: u64,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
-        write_flags: u32,
-        flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyWrite>> + Send + '_>>
-    {
-        let ino = inode as u32;
+        write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let ino_val = ino.0 as u32;
+        let fh_val = fh.0;
+        let req_id = req.unique().0;
         let data_vec = data.to_vec();
-        let req_id = req.unique;
-        let _ = flags;
+        let write_cache = write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    Self::validate_handle_static(&fs.handles, fh, ino, false)
-                        .map_err(errno_to_fuse3)?;
-                    let (_id, token) = fs.register_request_at(req_id);
-                    let written = fs.write_interruptible(ino, offset, &data_vec, &token);
-                    fs.deregister_request(_id);
-                    match written {
-                        Ok(n) => {
-                            if write_flags & 1 != 0 {
-                                fs.flush(ino).ok_or_else(|| errno_to_fuse3(EIO))?;
-                            }
-                            Ok(ReplyWrite { written: n as u32 })
-                        }
-                        Err(e) => Err(errno_to_fuse3(e)),
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match Self::validate_handle_static(&fs.handles, fh_val, ino_val, false) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        reply.error(errno_to_fuse3(e));
+                        return;
                     }
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, offset, data_vec);
-                    Err(EROFS.into())
+                let (_id, token) = fs.register_request_at(req_id);
+                let written = fs.write_interruptible(ino_val, offset, &data_vec, &token);
+                fs.deregister_request(_id);
+                match written {
+                    Ok(n) => {
+                        if write_cache {
+                            if fs.flush(ino_val).is_none() {
+                                reply.error(Errno::from_i32(EIO));
+                                return;
+                            }
+                        }
+                        reply.written(n as u32);
+                    }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino_val, fh_val, offset, data_vec, write_cache);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn statfs(
-        &self,
-        _req: Request,
-        _inode: fuse3::Inode,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyStatFs>> + Send + '_>>
-    {
-        Box::pin(async {
-            self.with_inner(|fs| {
-                let stat = fs.statfs(0);
-                Ok(ReplyStatFs {
-                    blocks: stat.blocks,
-                    bfree: stat.bfree,
-                    bavail: stat.bavail,
-                    files: stat.files,
-                    ffree: stat.ffree,
-                    bsize: stat.bsize,
-                    namelen: stat.namelen,
-                    frsize: stat.blksize,
-                })
-            })
-        })
+    fn statfs(&self, _req: &Request, _inode: INodeNo, reply: ReplyStatfs) {
+        self.with_inner(|fs| {
+            let stat = fs.statfs(0);
+            reply.statfs(
+                stat.blocks,
+                stat.bfree,
+                stat.bavail,
+                stat.files,
+                stat.ffree,
+                stat.bsize,
+                stat.namelen,
+                stat.blksize,
+            );
+        });
     }
 
     fn release(
         &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        fh: u64,
-        _flags: u32,
-        lock_owner: u64,
+        _req: &Request,
+        inode: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
         flush: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    if flush {
-                        fs.flush(ino).ok_or(EIO)?;
+        reply: ReplyEmpty,
+    ) {
+        let ino = inode.0 as u32;
+        let fh_val = fh.0;
+
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                if flush {
+                    if fs.flush(ino).is_none() {
+                        reply.error(Errno::from_i32(EIO));
+                        return;
                     }
-                    let _ = fs.release_handle(fh);
-                    fs.release_locks(ino, lock_owner);
-                    fs.release(ino).map_err(errno_to_fuse3)?;
-                    Ok(())
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (flush, lock_owner);
-                    let _ = fs.release_handle(fh);
-                    fs.release(ino)?;
-                    Ok(())
+                let _ = fs.release_handle(fh_val);
+                if let Some(owner) = lock_owner {
+                    fs.release_locks(ino, owner.0);
                 }
-            })
-        })
+                match fs.release(ino) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
+                }
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (flush, lock_owner, _flags);
+                let _ = fs.release_handle(fh_val);
+                match fs.release(ino) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
+                }
+            }
+        });
     }
 
-    fn fsync(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        _fh: u64,
-        datasync: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    if datasync {
-                        fs.flush(ino).ok_or(EIO)?;
-                    } else {
-                        fs.sync_fs().map_err(errno_to_fuse3)?;
-                        fs.flush(ino).ok_or(EIO)?;
+    fn fsync(&self, _req: &Request, inode: INodeNo, _fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let ino = inode.0 as u32;
+
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                if datasync {
+                    if fs.flush(ino).is_none() {
+                        reply.error(Errno::from_i32(EIO));
+                        return;
                     }
-                    Ok(())
+                } else {
+                    if let Err(e) = fs.sync_fs() {
+                        reply.error(errno_to_fuse3(e));
+                        return;
+                    }
+                    if fs.flush(ino).is_none() {
+                        reply.error(Errno::from_i32(EIO));
+                        return;
+                    }
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = ino;
-                    Ok(())
-                }
-            })
-        })
+                reply.ok();
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino, datasync);
+                reply.ok();
+            }
+        });
     }
 
     fn setxattr(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
+        _req: &Request,
+        inode: INodeNo,
         name: &std::ffi::OsStr,
         value: &[u8],
-        flags: u32,
+        flags: i32,
         _position: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
+        reply: ReplyEmpty,
+    ) {
+        let ino = inode.0 as u32;
         let name_str = name.to_string_lossy().to_string();
         let value_vec = value.to_vec();
-        let _ = req;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.setxattr(ino, &name_str, &value_vec, flags).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.setxattr(ino, &name_str, &value_vec, flags as u32) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, name_str, value_vec, flags);
-                    Err(EROFS.into())
-                }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino, name_str, value_vec, flags);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn getxattr(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        name: &std::ffi::OsStr,
-        size: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyXAttr>> + Send + '_>>
-    {
-        let ino = inode as u32;
+    fn getxattr(&self, _req: &Request, inode: INodeNo, name: &std::ffi::OsStr, size: u32, reply: ReplyXattr) {
+        let ino = inode.0 as u32;
         let name_str = name.to_string_lossy().to_string();
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    let result = fs.getxattr(ino, &name_str).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })?;
-                    match result {
-                        Some(data) => {
-                            if size == 0 {
-                                Ok(ReplyXAttr::Size(data.len() as u32))
-                            } else if (data.len() as u32) <= size {
-                                Ok(ReplyXAttr::Data(data.into()))
-                            } else {
-                                Err(fuse3::Errno::from(ERANGE))
-                            }
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.getxattr(ino, &name_str) {
+                    Ok(Some(data)) => {
+                        if size == 0 {
+                            reply.size(data.len() as u32);
+                        } else if data.len() as u32 <= size {
+                            reply.data(&data);
+                        } else {
+                            reply.error(Errno::from_i32(ERANGE));
                         }
-                        None => Err(fuse3::Errno::from(ENODATA)),
                     }
+                    Ok(None) => {
+                        reply.error(Errno::from_i32(ENODATA));
+                    }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, name_str, size);
-                    Err(EROFS.into())
-                }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino, name_str, size);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn listxattr(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        size: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyXAttr>> + Send + '_>>
-    {
-        let ino = inode as u32;
+    fn listxattr(&self, _req: &Request, inode: INodeNo, size: u32, reply: ReplyXattr) {
+        let ino = inode.0 as u32;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    let names = fs.listxattr(ino).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })?;
-                    let mut buf = Vec::new();
-                    for name in &names {
-                        let bytes = name.as_bytes();
-                        buf.extend_from_slice(bytes);
-                        buf.push(0);
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.listxattr(ino) {
+                    Ok(names) => {
+                        let mut buf = Vec::new();
+                        for name in &names {
+                            let bytes = name.as_bytes();
+                            buf.extend_from_slice(bytes);
+                            buf.push(0);
+                        }
+                        if size == 0 {
+                            reply.size(buf.len() as u32);
+                        } else if buf.len() as u32 <= size {
+                            reply.data(&buf);
+                        } else {
+                            reply.error(Errno::from_i32(ERANGE));
+                        }
                     }
-                    if size == 0 {
-                        Ok(ReplyXAttr::Size(buf.len() as u32))
-                    } else if buf.len() as u32 <= size {
-                        Ok(ReplyXAttr::Data(buf.into()))
-                    } else {
-                        Err(fuse3::Errno::from(ERANGE))
-                    }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, size);
-                    Err(EROFS.into())
-                }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino, size);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
-    fn removexattr(
-        &self,
-        req: Request,
-        inode: fuse3::Inode,
-        name: &std::ffi::OsStr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
+    fn removexattr(&self, _req: &Request, inode: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let ino = inode.0 as u32;
         let name_str = name.to_string_lossy().to_string();
-        let _ = req;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.removexattr(ino, &name_str).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.removexattr(ino, &name_str) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, name_str);
-                    Err(EROFS.into())
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino, name_str);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
+    }
+
+    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        let ino_val = ino.0 as u32;
+
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match fs.flush(ino_val) {
+                    Some(()) => reply.ok(),
+                    None => reply.error(Errno::from_i32(EIO)),
                 }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino_val, _fh, _lock_owner);
+                reply.ok();
+            }
+        });
     }
 
-    fn flush(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        _fh: u64,
-        _lock_owner: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino_val = ino.0 as u32;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.flush(ino).ok_or(EIO)?;
-                    Ok(())
+        self.with_inner(|fs| {
+            match fs.open(ino_val) {
+                Ok(()) => {
+                    let fh = fs.open_handle(ino_val, true);
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = ino;
-                    Ok(())
+                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+        });
+    }
+
+    fn readdir(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let parent_ino = ino.0 as u32;
+        let fh_val = fh.0;
+        let req_id = req.unique().0;
+
+        self.with_inner(|fs| {
+            match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
+                Ok(()) => {}
+                Err(e) => {
+                    reply.error(errno_to_fuse3(e));
+                    return;
                 }
-            })
-        })
-    }
-
-    fn opendir(
-        &self,
-        req: Request,
-        inode: fuse3::Inode,
-        flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyOpen>> + Send + '_>>
-    {
-        let ino = inode as u32;
-        let _ = (req, flags);
-
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                fs.open(ino).map_err(|e| {
-                    let code: i32 = e;
-                    errno_to_fuse3(code)
-                })?;
-                let fh = fs.open_handle(ino, true);
-                Ok(ReplyOpen { fh, flags: 0 })
-            })
-        })
-    }
-
-    fn readdir<'a>(
-        &'a self,
-        req: Request,
-        parent: fuse3::Inode,
-        fh: u64,
-        offset: i64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a>>>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let parent_ino = parent as u32;
-        let off = offset as u64;
-        let req_id = req.unique;
-
-        Box::pin(async move {
-            let entries: Vec<(String, u32, u8, u64)> =
-                self.with_inner(|fs| -> Result<_, fuse3::Errno> {
-                    Self::validate_handle_static(&fs.handles, fh, parent_ino, true)
-                        .map_err(errno_to_fuse3)?;
-                    let (_id, token) = fs.register_request_at(req_id);
-                    let result = fs.readdir_interruptible(parent_ino, off, &token);
-                    fs.deregister_request(_id);
-                    result.map_err(errno_to_fuse3)
-                })?;
-
-            let stream_items: Vec<std::result::Result<DirectoryEntry, fuse3::Errno>> = entries
-                .into_iter()
-                .map(|(name, ino, kind, cookie)| {
-                    let file_type = Self::fuse_file_type(kind);
-                    let entry = DirectoryEntry {
-                        inode: ino as u64,
-                        kind: file_type,
-                        name: std::ffi::OsString::from(name),
-                        offset: cookie as i64,
-                    };
-                    Ok(entry)
-                })
-                .collect();
-
-            Ok(ReplyDirectory {
-                entries: futures_util::stream::iter(stream_items),
-            })
-        })
-    }
-
-    fn releasedir(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        fh: u64,
-        _flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
-        Box::pin(async move {
-            self.with_inner(|fs| -> FuseResult<()> {
-                let _ = fs.release_handle(fh);
-                fs.release(ino)?;
-                Ok(())
-            })?;
-            Ok(())
-        })
-    }
-
-    fn fsyncdir(
-        &self,
-        _req: Request,
-        _inode: fuse3::Inode,
-        _fh: u64,
-        _datasync: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.sync_fs().map_err(|e| errno_to_fuse3(e))?;
-                    Ok(())
+            }
+            let (_id, token) = fs.register_request_at(req_id);
+            let result = fs.readdir_interruptible(parent_ino, offset, &token);
+            fs.deregister_request(_id);
+            match result {
+                Ok(entries) => {
+                    for (name, ino_num, kind, cookie) in entries {
+                        let file_type = Self::fuse_file_type(kind);
+                        reply.add(INodeNo(ino_num as u64), cookie, file_type, &name);
+                    }
+                    reply.ok();
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    Ok(())
-                }
-            })
-        })
+                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+        });
     }
 
-    fn access(
-        &self,
-        req: Request,
-        inode: fuse3::Inode,
-        mask: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
-        let uid = req.uid;
-        let gid = req.gid;
-
-        Box::pin(async move {
-            self.with_inner(|fs| match fs.access(ino, mask, uid, gid) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(fuse3::Errno::from(e)),
-            })
-        })
-    }
-
-    fn create(
-        &self,
-        req: Request,
-        parent: fuse3::Inode,
-        name: &std::ffi::OsStr,
-        mode: u32,
-        _flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyCreated>> + Send + '_>>
-    {
-        let parent_ino = parent as u32;
-        let name_str = name.to_string_lossy().to_string();
-        let ttl = Duration::from_secs(5);
-        let _ = req;
-
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    let ino = fs.create(parent_ino, &name_str, mode).ok_or(EIO)?;
-                    let dinode = fs.getattr(ino).ok_or(ENOENT)?;
-                    let attr = Self::dinode_attr(fs, ino, &dinode);
-                    fs.open(ino).map_err(|e| errno_to_fuse3(e))?;
-                    let fh = fs.open_handle(ino, false);
-                    Ok(ReplyCreated {
-                        ttl,
-                        attr,
-                        generation: dinode.generation() as u64,
-                        fh,
-                        flags: 0,
-                    })
-                }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (parent_ino, name_str, mode);
-                    Err(EROFS.into())
-                }
-            })
-        })
-    }
-
-    fn interrupt(
-        &self,
-        _req: Request,
-        unique: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let req_id: RequestId = unique;
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                fs.handle_interrupt(req_id);
-            });
-            Ok(())
-        })
-    }
-
-    fn bmap(
-        &self,
-        _req: Request,
-        inode: fuse3::Inode,
-        blocksize: u32,
-        idx: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = fuse3::Result<fuse3::raw::reply::ReplyBmap>>
-                + Send
-                + '_,
-        >,
-    > {
-        let ino = inode as u32;
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                let fs_block_size = crate::storage::BLOCK_SIZE as u32;
-                if blocksize != 0 && blocksize != fs_block_size {
-                    return Err(EINVAL.into());
-                }
-                let (block, _nblocks) = fs.bmap(ino, idx).map_err(|e| {
-                    let code: i32 = e;
-                    errno_to_fuse3(code)
-                })?;
-                Ok(fuse3::raw::reply::ReplyBmap { block })
-            })
-        })
-    }
-
-    fn poll(
-        &self,
-        _req: Request,
-        _inode: fuse3::Inode,
-        _fh: u64,
-        _kh: Option<u64>,
-        _flags: u32,
-        _events: u32,
-        _notify: &fuse3::notify::Notify,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = fuse3::Result<fuse3::raw::reply::ReplyPoll>>
-                + Send
-                + '_,
-        >,
-    > {
-        Box::pin(async { Err(fuse3::Errno::from(EOPNOTSUPP)) })
-    }
-
-    fn fallocate(
-        &self,
-        req: Request,
-        inode: fuse3::Inode,
-        fh: u64,
-        offset: u64,
-        length: u64,
-        mode: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        let ino = inode as u32;
-        let _ = req;
-
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    Self::validate_handle_static(&fs.handles, fh, ino, false)
-                        .map_err(errno_to_fuse3)?;
-                    fs.fallocate(ino, offset, length, mode).map_err(|e| {
-                        let code: i32 = e;
-                        errno_to_fuse3(code)
-                    })?;
-                    Ok(())
-                }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (ino, offset, length, mode);
-                    Err(EROFS.into())
-                }
-            })
-        })
-    }
-
-    fn readdirplus<'a>(
-        &'a self,
-        req: Request,
-        parent: fuse3::Inode,
-        fh: u64,
-        offset: u64,
-        lock_owner: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let parent_ino = parent as u32;
-        let _ = lock_owner;
-        let req_id = req.unique;
+    fn readdirplus(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
+        let parent_ino = ino.0 as u32;
+        let fh_val = fh.0;
+        let req_id = req.unique().0;
         let ttl = Duration::from_secs(5);
 
-        Box::pin(async move {
-            let entries: Vec<(String, u32, u8, Dinode)> =
-                self.with_inner(|fs| -> Result<_, fuse3::Errno> {
-                    Self::validate_handle_static(&fs.handles, fh, parent_ino, true)
-                        .map_err(errno_to_fuse3)?;
-                    let (_id, token) = fs.register_request_at(req_id);
-                    let basic_entries = fs.readdir_interruptible(parent_ino, offset, &token);
-                    fs.deregister_request(_id);
-                    let basic_entries: Vec<(String, u32, u8, u64)> =
-                        basic_entries.map_err(errno_to_fuse3)?;
+        let entries_result: Result<Vec<(String, u32, u8, u64, Dinode)>, i32> = self.with_inner(|fs| {
+            match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+            let (_id, token) = fs.register_request_at(req_id);
+            let result = fs.readdir_interruptible(parent_ino, offset, &token);
+            fs.deregister_request(_id);
+            match result {
+                Ok(entries) => {
                     let mut full_entries = Vec::new();
-                    for (name, ino, kind, cookie) in basic_entries {
-                        if let Some(dinode) = fs.getattr(ino) {
-                            full_entries.push((name, ino, kind, dinode));
+                    for (name, entry_ino, kind, cookie) in entries {
+                        if let Some(dinode) = fs.getattr(entry_ino) {
+                            full_entries.push((name, entry_ino, kind, cookie, dinode));
                         }
                     }
                     Ok(full_entries)
-                })?;
-            let attr_ttl = Duration::from_secs(5);
+                }
+                Err(e) => Err(e),
+            }
+        });
 
-            let stream_items: Vec<std::result::Result<DirectoryEntryPlus, fuse3::Errno>> = entries
-                .into_iter()
-                .map(|(name, ino, kind, dinode)| {
+        match entries_result {
+            Ok(entries) => {
+                for (name, entry_ino, kind, cookie, dinode) in entries {
                     let file_type = match kind {
                         0x04 => FileType::Directory,
                         0x08 => FileType::RegularFile,
                         0x0A | 0xA0 => FileType::Symlink,
                         _ => FileType::RegularFile,
                     };
-                    let attr = Self::dinode_attr_from(&dinode, ino);
-                    let entry = DirectoryEntryPlus {
-                        inode: ino as u64,
-                        generation: dinode.generation() as u64,
-                        kind: file_type,
-                        name: std::ffi::OsString::from(name),
-                        offset: 0i64,
-                        attr,
-                        entry_ttl: ttl,
-                        attr_ttl,
-                    };
-                    Ok(entry)
-                })
-                .collect();
-
-            Ok(ReplyDirectoryPlus {
-                entries: futures_util::stream::iter(stream_items),
-            })
-        })
+                    let attr = Self::dinode_attr_from(&dinode, entry_ino);
+                    reply.add(
+                        INodeNo(entry_ino as u64),
+                        cookie,
+                        &name,
+                        &ttl,
+                        &attr,
+                        Generation(dinode.generation() as u64),
+                    );
+                }
+                reply.ok();
+            }
+            Err(e) => reply.error(errno_to_fuse3(e)),
+        }
     }
 
-    fn rename2(
+    fn releasedir(
         &self,
-        req: Request,
-        parent: fuse3::Inode,
+        _req: &Request,
+        inode: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        let ino = inode.0 as u32;
+        let fh_val = fh.0;
+
+        self.with_inner(|fs| {
+            let _ = fs.release_handle(fh_val);
+            match fs.release(ino) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+        });
+    }
+
+    fn fsyncdir(&self, _req: &Request, _inode: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                if let Err(e) = fs.sync_fs() {
+                    reply.error(errno_to_fuse3(e));
+                    return;
+                }
+                reply.ok();
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (_inode, _fh, _datasync);
+                reply.ok();
+            }
+        });
+    }
+
+    fn access(&self, req: &Request, inode: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let ino = inode.0 as u32;
+        let uid = req.uid();
+        let gid = req.gid();
+        let mask_val = mask.bits() as u32;
+
+        self.with_inner(|fs| {
+            match fs.access(ino, mask_val, uid, gid) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
-        new_parent: fuse3::Inode,
-        new_name: &std::ffi::OsStr,
-        flags: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<()>> + Send + '_>> {
-        const RENAME_NOREPLACE: u32 = 1 << 0;
-        const RENAME_EXCHANGE: u32 = 1 << 1;
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let parent_ino = parent.0 as u32;
+        let name_str = name.to_string_lossy().to_string();
+        let ttl = Duration::from_secs(5);
 
-        let old_parent = parent as u32;
-        let old_name = name.to_string_lossy().to_string();
-        let new_p = new_parent as u32;
-        let new_name = new_name.to_string_lossy().to_string();
-        let _ = req;
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                let ino = fs.create(parent_ino, &name_str, mode);
+                match ino {
+                    Some(ino) => {
+                        let dinode = fs.getattr(ino);
+                        match dinode {
+                            Some(dinode) => {
+                                let attr = Self::dinode_attr(fs, ino, &dinode);
+                                fs.open(ino).map_err(errno_to_fuse3);
+                                let fh = fs.open_handle(ino, false);
+                                reply.created(&ttl, &attr, Generation(dinode.generation() as u64), FileHandle(fh), FopenFlags::empty());
+                            }
+                            None => reply.error(Errno::from_i32(ENOENT)),
+                        }
+                    }
+                    None => reply.error(Errno::from_i32(EIO)),
+                }
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str, mode, _umask, _flags);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
+    }
 
-        Box::pin(async move {
-            if flags & RENAME_EXCHANGE != 0 {
-                return Err(EOPNOTSUPP.into());
+    fn bmap(&self, _req: &Request, inode: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
+        let ino = inode.0 as u32;
+
+        self.with_inner(|fs| {
+            let fs_block_size = crate::storage::BLOCK_SIZE as u32;
+            if blocksize != 0 && blocksize != fs_block_size {
+                reply.error(Errno::from_i32(EINVAL));
+                return;
             }
-            if flags & RENAME_NOREPLACE != 0 {
-                return Err(EOPNOTSUPP.into());
+            match fs.bmap(ino, idx) {
+                Ok((block, _nblocks)) => reply.bmap(block),
+                Err(e) => reply.error(errno_to_fuse3(e)),
             }
-            if flags != 0 {
-                return Err(EINVAL.into());
-            }
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    fs.rename(old_parent, &old_name, new_p, &new_name)
-                        .map_err(|e| {
-                            let code: i32 = e;
-                            errno_to_fuse3(code)
-                        })
+        });
+    }
+
+    fn poll(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _ph: PollNotifier,
+        _events: PollEvents,
+        _flags: PollFlags,
+        reply: ReplyPoll,
+    ) {
+        reply.error(Errno::from_i32(EOPNOTSUPP));
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        inode: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let ino = inode.0 as u32;
+        let fh_val = fh.0;
+
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                match Self::validate_handle_static(&fs.handles, fh_val, ino, false) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        reply.error(errno_to_fuse3(e));
+                        return;
+                    }
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (old_parent, old_name, new_p, new_name);
-                    Err(EROFS.into())
+                match fs.fallocate(ino, offset, length, mode as u32) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-            })
-        })
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (ino, fh_val, offset, length, mode);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 
     fn lseek(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
-        fh: u64,
-        offset: u64,
-        whence: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = fuse3::Result<ReplyLSeek>> + Send + '_>>
-    {
-        let ino = inode as u32;
-        let _ = req;
+        _req: &Request,
+        inode: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let ino = inode.0 as u32;
+        let fh_val = fh.0;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                Self::validate_handle_static(&fs.handles, fh, ino, false)
-                    .map_err(errno_to_fuse3)?;
-                const SEEK_DATA: u32 = 3;
-                const SEEK_HOLE: u32 = 4;
-                if whence != SEEK_DATA && whence != SEEK_HOLE {
-                    return Err(EINVAL.into());
+        self.with_inner(|fs| {
+            match Self::validate_handle_static(&fs.handles, fh_val, ino, false) {
+                Ok(()) => {}
+                Err(e) => {
+                    reply.error(errno_to_fuse3(e));
+                    return;
                 }
-                match fs.lseek_data_or_hole(ino, offset, whence as i32) {
-                    Some(result) => Ok(ReplyLSeek { offset: result }),
-                    None => Err(ENXIO.into()),
-                }
-            })
-        })
+            }
+            const SEEK_DATA: i32 = 3;
+            const SEEK_HOLE: i32 = 4;
+            if whence != SEEK_DATA && whence != SEEK_HOLE {
+                reply.error(Errno::from_i32(EINVAL));
+                return;
+            }
+            match fs.lseek_data_or_hole(ino, offset as u64, whence) {
+                Some(result) => reply.offset(result as i64),
+                None => reply.error(Errno::from_i32(ENXIO)),
+            }
+        });
     }
 
     fn copy_file_range(
         &self,
-        req: Request,
-        inode: fuse3::Inode,
-        fh_in: u64,
-        off_in: u64,
-        inode_out: fuse3::Inode,
-        fh_out: u64,
-        off_out: u64,
-        length: u64,
-        flags: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = fuse3::Result<ReplyCopyFileRange>> + Send + '_>,
-    > {
-        let src_ino = inode as u32;
-        let dst_ino = inode_out as u32;
-        let _ = req;
+        _req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        let src_ino = ino_in.0 as u32;
+        let dst_ino = ino_out.0 as u32;
+        let fh_in_val = fh_in.0;
+        let fh_out_val = fh_out.0;
+        let _ = _req;
 
-        Box::pin(async move {
-            self.with_inner(|fs| {
-                #[cfg(feature = "writable")]
-                {
-                    if src_ino == dst_ino && off_in == off_out {
-                        return Err(EINVAL.into());
-                    }
-                    // FreeBSD sends flags=0. Reject all unknown flag
-                    // combinations rather than inventing behavior.
-                    if flags != 0 {
-                        return Err(EOPNOTSUPP.into());
-                    }
-                    Self::validate_handle_static(&fs.handles, fh_in, src_ino, false)
-                        .map_err(errno_to_fuse3)?;
-                    Self::validate_handle_static(&fs.handles, fh_out, dst_ino, false)
-                        .map_err(errno_to_fuse3)?;
-                    let copied = fs
-                        .copy_file_range(
-                            src_ino,
-                            off_in,
-                            dst_ino,
-                            off_out,
-                            length as usize,
-                            flags as u32,
-                        )
-                        .map_err(|e| {
-                            let code: i32 = e;
-                            errno_to_fuse3(code)
-                        })?;
-                    Ok(ReplyCopyFileRange {
-                        copied: copied as u64,
-                    })
+        self.with_inner(|fs| {
+            #[cfg(feature = "writable")]
+            {
+                if src_ino == dst_ino && offset_in == offset_out {
+                    reply.error(Errno::from_i32(EINVAL));
+                    return;
                 }
-                #[cfg(not(feature = "writable"))]
-                {
-                    let _ = (
-                        src_ino, fh_in, off_in, dst_ino, fh_out, off_out, length, flags,
-                    );
-                    Err(EROFS.into())
+                // FreeBSD sends flags=0. Reject all unknown flag combinations.
+                if flags.bits() != 0 {
+                    reply.error(Errno::from_i32(EOPNOTSUPP));
+                    return;
                 }
-            })
-        })
+                match Self::validate_handle_static(&fs.handles, fh_in_val, src_ino, false) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        reply.error(errno_to_fuse3(e));
+                        return;
+                    }
+                }
+                match Self::validate_handle_static(&fs.handles, fh_out_val, dst_ino, false) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        reply.error(errno_to_fuse3(e));
+                        return;
+                    }
+                }
+                match fs.copy_file_range(
+                    src_ino,
+                    offset_in,
+                    dst_ino,
+                    offset_out,
+                    len as usize,
+                    flags.bits() as u32,
+                ) {
+                    Ok(copied) => reply.written(copied as u32),
+                    Err(e) => reply.error(errno_to_fuse3(e)),
+                }
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (src_ino, fh_in_val, offset_in, dst_ino, fh_out_val, offset_out, len, flags);
+                reply.error(Errno::from_i32(EROFS));
+            }
+        });
     }
 }
 
 impl Fuse3Fs {
+    /// Convert `Option<TimeOrNow>` to `Option<u64>` (Unix seconds), mapping `Now` to the
+    /// current wall-clock time.
+    fn time_or_now_to_secs(t: Option<TimeOrNow>) -> Option<u64> {
+        t.map(|t| match t {
+            TimeOrNow::Now => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            TimeOrNow::SpecificTime(time) => time
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        })
+    }
+
     /// Build a `FileAttr` from an inode's dinode and number.
-    fn dinode_attr(fs: &mut FuseFs, ino: u32, dinode: &Dinode) -> fuse3::raw::reply::FileAttr {
+    fn dinode_attr(fs: &mut FuseFs, ino: u32, dinode: &Dinode) -> FileAttr {
         FuseFs::dinode_to_fileattr(ino, dinode)
     }
 
     /// Build a `FileAttr` from a raw `Dinode` without needing a `FuseFs` reference.
-    fn dinode_attr_from(dinode: &Dinode, ino: u32) -> fuse3::raw::reply::FileAttr {
+    fn dinode_attr_from(dinode: &Dinode, ino: u32) -> FileAttr {
         FuseFs::dinode_to_fileattr(ino, dinode)
     }
 
-    /// Map a FUSE DT_* type byte to a `fuse3::FileType`.
+    /// Map a FUSE DT_* type byte to a `fuser::FileType`.
     fn fuse_file_type(dt: u8) -> FileType {
         match dt {
             0x04 => FileType::Directory,
@@ -3039,6 +2873,7 @@ impl Fuse3Fs {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

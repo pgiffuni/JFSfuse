@@ -179,7 +179,7 @@ fn test_symlink_duplicate_name_fails() {
 #[test]
 fn test_symlink_readlink_works_in_readonly() {
     let vol = load_image_to_memory();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
     // Don't enable writable.
 
     let result = fs.readlink(1);

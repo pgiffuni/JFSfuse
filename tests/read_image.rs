@@ -35,7 +35,7 @@ fn test_read_root_inode() {
 #[test]
 fn test_readdir_root() {
     let vol = load_test_volume();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
 
     let entries = fs
         .readdir(fs.volume.root_ino, 0)

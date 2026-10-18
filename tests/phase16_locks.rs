@@ -693,7 +693,7 @@ fn test_batch_forget_multiple_inodes() {
 #[test]
 fn test_statfs_returns_valid_sizes() {
     let vol = load_image_to_memory();
-    let mut fs = FuseFs::new(vol);
+    let fs = FuseFs::new(vol);
     let stat = fs.statfs(fs.volume.root_ino);
 
     assert_eq!(stat.bsize, 4096, "block size should be 4096");

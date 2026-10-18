@@ -87,9 +87,9 @@ fn test_writable_mount_validates_root_inode() {
     let vol = result.unwrap();
 
     // Verify root inode is a directory.
-    let mut vol_clone = vol;
+    let vol_clone = vol;
     let root_ino = vol_clone.root_ino;
-    let root = jfsfuse::inode::Inode::read(&mut vol_clone, root_ino);
+    let root = jfsfuse::inode::Inode::read(&vol_clone, root_ino);
     assert!(root.is_ok(), "root inode should be readable");
     assert!(root.unwrap().is_dir(), "root should be a directory");
 }

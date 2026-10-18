@@ -8,6 +8,20 @@
 //! The dtroot header layout (32 bytes):
 //!   DASD (16) | flag (1) | nextindex (1) | freecnt (1) | freelist (1)
 //!   | idotdot (4) | stbl\[8\] (8)
+//!
+//! ## Directory B+ tree properties
+//!
+//! - Keyed by filename (unlike xtree, which is keyed by logical offset).
+//! - Suffix compression on internal nodes: entries are stored compressed to
+//!   just enough characters to distinguish from the previous entry.
+//! - Directories do NOT store "." or ".." entries. Self (dotdot) is the
+//!   directory's own inode number; parent is stored in the `idotdot` field.
+//! - 32-byte fixed-size slots avoid shifting entries on deletion, preventing
+//!   internal fragmentation when entries are removed.
+//! - `di_size` for a directory = leaf page size (256 when root is inline).
+//! - Initial leaf node starts at aggregate block size, doubling to 4K.
+//!
+//! Source: JFS Layout spec, Section "Directory"
 
 use byteorder::{ByteOrder, LittleEndian};
 

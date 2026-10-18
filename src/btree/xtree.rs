@@ -4,7 +4,30 @@
 //! Mirrors the kernel JFS xtree code — manages the extent allocation
 //! descriptor B+-tree. Maps file offsets (in fsblocks) to disk block addresses.
 //!
-//! Root can be inline in the inode (`xtroot_t`) or in external pages (`xtpage_t`).
+//! ## B+ tree structure
+//!
+//! An extent is a contiguous sequence of aggregate blocks allocated to a file,
+//! described by `<logical offset, length, physical address>`. The xtree B+ tree
+//! is keyed by logical offset, enabling fast lookup of the extent containing
+//! a given file offset.
+//!
+//! ## Root inline vs external pages
+//!
+//! - If the file has ≤8 extents, the xad entries in the inode (`XtRoot`) serve
+//!   as both root and leaf (no external pages allocated).
+//! - When the inode xad slots fill, the root splits to external 4K `xtpage_t`
+//!   pages. Initially the first xad points to a leaf node; internal nodes are
+//!   created later as the tree grows deeper.
+//! - Max extent size: 2^24−1 aggregate blocks (≈64 GB at 4 KB blocks). Files
+//!   larger than this (even if contiguous) require multiple xad entries.
+//!
+//! ## Commit strategy
+//!
+//! Data blocks are flushed (writeback) before the journal commit of the xtree
+//! metadata, implementing ordered-data journaling: the tree may reference data
+//! on disk but data is guaranteed to be present before metadata is durable.
+//!
+//! Source: JFS Layout spec, Sections "Extents", "B+ trees", "Inodes"
 
 use crate::storage::{BLOCK_SIZE, Result as StorageResult, Storage};
 use crate::types::{BlockLength, BlockNo, XTENTRYSTART, XTROOTMAXSLOT, Xad, XadFlag, XtRoot};

@@ -4,12 +4,39 @@
 //! Mirrors the kernel JFS mount code — superblock validation, inline log
 //! detection, allocation map setup, and journal recovery orchestration.
 //!
-//! The mount flow:
+//! ## Aggregate layout
+//!
+//! A JFS file system is built on a partition, which is divided into an
+//! aggregate (the allocation pool) and one or more filesets (mountable
+//! sub-trees). This implementation supports a single fileset per aggregate,
+//! but the on-disk structures are designed for the general case.
+//!
+//! Key layout elements:
+//! - **32K reserved area** at the front of the partition.
+//! - **Primary Aggregate Superblock** at byte offset 0x8000 (block 64).
+//! - **Secondary (backup) superblock** at a fixed offset — used if primary
+//!   is corrupted.
+//! - **Aggregate Inode Table**: inode 1 ("self") is at 4K past the primary
+//!   superblock; its B+ tree locates the rest of the table.
+//! - **Block Allocation Map** (inode 2) and **Inode Allocation Map** (inode 1)
+//!   track free blocks and free inode slots.
+//!
+//! ## Allocation groups
+//!
+//! Aggregate space is divided into allocation groups (AGs) for locality and
+//! distribution. Maximum 128 AGs per aggregate; minimum AG size is 8192
+//! aggregate blocks; AG size must be a power-of-2 multiple of dmap pages.
+//!
+//! ## Mount flow
+//!
 //! 1. Read and validate the primary superblock (`chkSuper`)
 //! 2. Read the log superblock (`logsuper`)
 //! 3. If log state is not `LOGREDONE`, run journal recovery (`logredo`)
 //! 4. Initialize block/inode allocation maps
-//! 5. Open the root inode
+//! 5. Open the root inode (`ROOT_I` = inode 2)
+//!
+//! Source: JFS Layout spec, Sections "Partitions, aggregates, AGs, filesets"
+//! and "Inode allocations".
 
 use std::path::Path;
 use std::sync::Arc;

@@ -75,7 +75,10 @@ pub const MAX_ACTIVE: usize = 128;
 pub const JFS_MAGIC: &[u8; 4] = b"JFS1";
 pub const JFS_VERSION: u32 = 2;
 
-// Superblock locations (from JFS filesystem constants): fixed at block offsets 64–112.
+// Superblock and metadata locations are at fixed offsets within the aggregate.
+// The 32K reserved area comes first, then the primary superblock at byte 0x8000.
+// Secondary (backup) superblock is at a fixed offset from primary; if primary is
+// corrupted, JFS uses the backup. Source: JFS Layout spec, Section 4.1.
 pub const SUPER1_B: u64 = 64;
 pub const AIMAP_B: u64 = SUPER1_B + 8;
 pub const AITBL_B: u64 = AIMAP_B + 16;
@@ -83,27 +86,40 @@ pub const SUPER2_B: u64 = AITBL_B + 32;
 pub const BMAP_B: u64 = SUPER2_B + 8;
 
 // Superblock byte offsets within the aggregate.
+// All fixed locations relative to the start of the aggregate.
 pub const SUPER1_OFF: u64 = 0x8000;
 pub const AIMAP_OFF: u64 = SUPER1_OFF + (PSIZE as u64);
 pub const AITBL_OFF: u64 = AIMAP_OFF + (PSIZE as u64) * 2;
 pub const SUPER2_OFF: u64 = AITBL_OFF + (IXSIZE as u64);
 pub const BMAP_OFF: u64 = SUPER2_OFF + (PSIZE as u64);
 
+/// The 32K reserved area at the front of the aggregate (32768 bytes).
 pub const AGGR_RSVD_BLOCKS: u64 = SUPER1_B;
 pub const AGGR_RSVD_BYTES: u64 = SUPER1_OFF;
+/// Aggregate Inode Table starts at this offset: 4K after the primary superblock.
+/// Inode 1 ("self") describes the Aggregate Inode Map; the rest follow its B+ tree.
 pub const AGGR_INODE_TABLE_START: u64 = AITBL_OFF;
 
-// Reserved inode numbers (from JFS filesystem constants).
+// Reserved inode numbers. Inodes 0–15 are aggregate-wide control structures.
+// Inode 16 and above are per-fileset "super-inodes" (one per fileset).
+// Source: JFS Layout spec, Section 4.1.
 pub const AGGR_RESERVED_I: u32 = 0;
+/// "Self" inode — describes the Aggregate Inode Map. Circular: it's in the file it describes.
 pub const AGGREGATE_I: u32 = 1;
+/// Block Allocation Map inode.
 pub const BMAP_I: u32 = 2;
+/// In-line Log inode (allocated at mount, no data saved to disk).
 pub const LOG_I: u32 = 3;
+/// Bad blocks list inode.
 pub const BADBLOCK_I: u32 = 4;
 pub const FILESET_RSVD_I: u32 = 0;
 pub const FILESET_EXT_I: u32 = 1;
+/// Root directory inode (preserves Unix convention: inode 2 = root).
 pub const ROOT_I: u32 = 2;
+/// ACL file inode for a fileset.
 pub const ACL_I: u32 = 3;
 pub const FILESET_OBJECT_I: u32 = 4;
+/// First fileset inode number. VFS inode numbers ≥ FILESYSTEM_I are fileset inodes.
 pub const FILESYSTEM_I: u32 = 16;
 
 // Filesystem state flags (from JFS filesystem constants: FM_*).
@@ -274,10 +290,15 @@ impl Dxd {
 }
 
 // ──────────────────────── xad_t: xtree extent descriptor ────────────────────────
-// Each entry maps a logical file offset to a physical extent.
-// 16 bytes: 1-byte flag, 2-byte reserved, 1-byte off1 + 4-byte off2 (LE) for a
-// split 40-bit extent offset, then a Pxd for the physical location.
-// The offset is split across off1 (high 8 bits) and off2 (low 32 bits).
+// Maps a logical file offset to a physical extent.
+// 16 bytes: 8-bit flag, 16-bit reserved, then a 40-bit logical offset (off1 hi 8 bits
+// + off2 low 32 bits LE), then a Pxd for the physical location.
+//
+// An extent is a contiguous sequence of aggregate blocks described by:
+//   <logical offset, length, physical address>
+// Both offset and address are in aggregate block units (multiply by BLOCK_SIZE for bytes).
+// Extent size: 1 to 2^24−1 aggregate blocks (max ~8 GB at 512B blocks, ~64 GB at 4K).
+// Source: JFS Layout spec, Section "Extents".
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
@@ -378,12 +399,19 @@ impl Timestruc {
 
 // ──────────────────────── dinode ────────────────────────
 // The on-disk inode is always 512 bytes (DISIZE).
+// All JFS metadata structures (except the superblock) are represented as "files"
+// by reusing the inode structure, making the on-disk format inherently extensible.
+// Source: JFS Layout spec, Section "Inodes".
+//
 // Layout: 128-byte base area, then a 384-byte union that varies by file type:
-//   - Directories: dtroot (B+-tree root, 9 slots × 32 bytes = 288 bytes)
+//   - Directories: dtroot (directory B+-tree root, 9 slots × 32 bytes = 288 bytes)
 //   - Regular files: xtroot (extent B+-tree root, 18 xad slots × 16 bytes = 288 bytes)
 //   - Symlinks (<128 bytes): inline fast symlink data in the _special union area
-// The `u` field is the raw union bytes; callers interpret it based on `is_dir()` /
-// `is_regular()` / `is_symlink()`.
+//
+// B+ tree root in inode: if ≤8 extents, the 8 xad entries in the inode ARE the leaf
+// nodes. When full, they split to external 4K pages (see XtRoot docs).
+// The `u` field is the raw union bytes; callers interpret it based on
+// `is_dir()` / `is_regular()` / `is_symlink()`.
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -646,6 +674,16 @@ impl XtHeader {
 /// Extent B+-tree root (xtroot_t) — stored inline in the inode's union area.
 /// A union of xtheader + xad array. For BT_ROOT pages,
 /// `bt == 0` indicates the root is in the inode (no disk I/O needed).
+///
+/// B+ tree structure:
+/// - If file has ≤8 extents, the 8 xad entries in the inode are also leaf nodes.
+/// - When full, xad entries split to external 4K pages (btpage_t / xtpage_t).
+/// - Internal nodes are created when all 8 xad slots point to other nodes.
+/// - The tree is keyed by logical offset of each xad.
+/// - Max extent size is 2^24−1 blocks; even contiguous files >16GB (at 1KB blocks)
+///   need multiple xad entries.
+///
+/// Source: JFS Layout spec, Section "B+ trees".
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct XtRoot {
@@ -1246,10 +1284,18 @@ impl JfsSuperblock {
 // pointing to the actual disk inode pages.
 
 /// On-disk IAG (Inode Allocation Group) page — 4096 bytes.
-/// Manages 128 inode extents (EXTSPERIAG = 128), each
-/// covering 32 inodes. `wmap` is the working (transient) bitmap, `pmap`
-/// is the persistent (committed) bitmap, and `inoext` holds the pxd
-/// descriptors for each extent's disk page.
+/// Manages 128 inode extents (EXTSPERIAG = 128), each covering 32 inodes (INOSPEREXT).
+/// Total: 4096 inodes per IAG (INOSPERIAG). An IAG is tied to one allocation group
+/// until all its inode extents are freed.
+///
+/// Commit strategy (reliable update):
+/// - `wmap` (working map): updated first on allocation.
+/// - `pmap` (persistent map): updated first on freeing.
+///
+/// Both maps must match after recovery (logredo or fsck).
+/// `inoext` holds pxd descriptors for each of the 128 inode extent disk pages.
+///
+/// Source: JFS Layout spec, Section "Inode allocations".
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Iag {
@@ -1269,8 +1315,20 @@ impl Default for Iag {
 }
 
 /// On-disk dmap (block allocation map page) — 4096 bytes.
-/// Manages 8192 blocks (BPERDMAP) as two 1024-word
-/// bitmaps: `wmap` (working, transient) and `pmap` (persistent, committed).
+/// Manages 8192 aggregate blocks (BPERDMAP) as two 1024-word (32-bit) bitmaps.
+/// Bit 0 = free, 1 = allocated. Each dmap covers blocks `[start .. start+8192)`.
+///
+/// The Block Allocation Map is NOT journaled: it can be repaired by logredo
+/// or reconstructed by fsck. Both `wmap` and `pmap` must match after recovery.
+///
+/// Commit strategy (reliable update):
+/// - On block allocation: `wmap` updated first (working state).
+/// - On block free: `pmap` updated first (persistent state).
+///
+/// This asymmetry prevents partial free/alloc from corrupting allocation state.
+/// Uses a binary buddy system in the summary tree to find contiguous free extents.
+///
+/// Source: JFS Layout spec, Section "Block Allocation Map".
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Dmap {

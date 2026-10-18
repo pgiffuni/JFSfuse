@@ -18,9 +18,7 @@ bitflags = "2.6"
 lru = "0.16"
 log = "0.4"
 thiserror = "1.0"
-uuid = { version = "1.10", features = ["v4"] }
 fuser = "0.18.0"
-futures-util = "0.3"
 libc = "0.2"
 
 [[bin]]

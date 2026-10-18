@@ -209,9 +209,9 @@ fn cmd_replay(_image: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_dump_inode(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error>> {
     let storage = std::sync::Arc::new(FileStorage::open_readonly(std::path::Path::new(image))?);
-    let mut vol = Volume::open_from_storage(storage)?;
+    let vol = Volume::open_from_storage(storage)?;
 
-    let inode = jfsfuse::inode::Inode::read(&mut vol, ino)?;
+    let inode = jfsfuse::inode::Inode::read(&vol, ino)?;
     println!("Inode {}:", ino);
     println!("  mode:   {:#010x}", inode.mode());
     println!("  size:   {}", inode.size());
@@ -249,9 +249,9 @@ fn cmd_dump_inode(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error
 
 fn cmd_dump_xtree(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error>> {
     let storage = std::sync::Arc::new(FileStorage::open_readonly(std::path::Path::new(image))?);
-    let mut vol = Volume::open_from_storage(storage)?;
+    let vol = Volume::open_from_storage(storage)?;
 
-    let inode = jfsfuse::inode::Inode::read(&mut vol, ino)?;
+    let inode = jfsfuse::inode::Inode::read(&vol, ino)?;
     let xt = jfsfuse::btree::xtree::Xtree::from_inode_data(inode.xtroot_bytes())?;
 
     println!("Xtree for inode {}:", ino);
@@ -274,9 +274,9 @@ fn cmd_dump_xtree(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error
 
 fn cmd_dump_dtree(image: &str, ino: u32) -> Result<(), Box<dyn std::error::Error>> {
     let storage = std::sync::Arc::new(FileStorage::open_readonly(std::path::Path::new(image))?);
-    let mut vol = Volume::open_from_storage(storage)?;
+    let vol = Volume::open_from_storage(storage)?;
 
-    let inode = jfsfuse::inode::Inode::read(&mut vol, ino)?;
+    let inode = jfsfuse::inode::Inode::read(&vol, ino)?;
     let dt = jfsfuse::btree::dtree::Dtree::from_inode_data(inode.dtroot_bytes())?;
 
     println!("Dtree for inode {}:", ino);

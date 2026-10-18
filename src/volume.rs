@@ -22,7 +22,9 @@ use crate::journal::{JournalRecovery, LogManager};
 use crate::storage::{
     BLOCK_SIZE, FileStorage, PageCache, Result as StorageResult, Storage, StorageError,
 };
-use crate::transaction::{CommitResult, TransactionId, TransactionManager};
+use crate::transaction::TransactionManager;
+#[cfg(feature = "writable")]
+use crate::transaction::{CommitResult, TransactionId};
 use crate::types::{
     self, FILESYSTEM_I, FM_DIRTY, FM_LOGREDO, JfsSuperblock, LOGMAGIC, LOGREDONE, LOGVERSION,
     PSIZE, ROOT_I, SUPER1_OFF,
@@ -172,7 +174,7 @@ impl Volume {
 
         // Step 6: Validate root inode exists and is a directory.
         let root_ino = volume.root_ino;
-        let root = crate::inode::Inode::read(&mut volume, root_ino)?;
+        let root = crate::inode::Inode::read(&volume, root_ino)?;
         if !root.is_dir() {
             return Err(StorageError::Other(
                 "root inode is not a directory".to_string(),
@@ -2033,7 +2035,6 @@ impl Volume {
     ///
     /// For inline symlinks, reads the path from the inode's union area.
     /// For block-based symlinks, reads through the xtree (not yet implemented).
-    #[cfg(feature = "writable")]
     pub fn read_symlink(&self, ino: u32) -> StorageResult<Vec<u8>> {
         let inode = crate::inode::Inode::read(self, ino)?;
 

@@ -1280,10 +1280,18 @@ impl FuseFs {
     /// for open-unlinked semantics (inode is retained while open handles exist).
     /// Available in both read-only and writable builds.
     pub fn open(&mut self, ino: u32) -> FuseResult<()> {
-        let result = self.volume.open_file(ino);
-        match result {
-            Ok(_) => Ok(()),
-            Err(_) => Err(ENOENT),
+        #[cfg(feature = "writable")]
+        {
+            let result = self.volume.open_file(ino);
+            match result {
+                Ok(_) => Ok(()),
+                Err(_) => Err(ENOENT),
+            }
+        }
+        #[cfg(not(feature = "writable"))]
+        {
+            let _ = ino;
+            Ok(())
         }
     }
 
@@ -1498,9 +1506,6 @@ impl FuseFs {
 
     /// Read the target of a symbolic link.
     pub fn readlink(&self, ino: u32) -> FuseResult<Vec<u8>> {
-        if !self.writable {
-            return Err(EROFS);
-        }
         self.volume.read_symlink(ino).map_err(|e| {
             let msg = e.to_string();
             if msg.contains("not a symbolic link") {
@@ -1747,7 +1752,7 @@ impl Fuse3Fs {
     /// Borrow the inner `FuseFs` for a synchronous read-only operation.
     fn with_inner_read<R, F: FnOnce(&FuseFs) -> R>(&self, f: F) -> R {
         let guard = self.inner.read().unwrap();
-        f(&*guard)
+        f(&guard)
     }
 
     /// Borrow the inner `FuseFs` for a synchronous (potentially mutating) operation.
@@ -1904,18 +1909,26 @@ impl Filesystem for Fuse3Fs {
         let ttl = Duration::from_secs(5);
 
         self.with_inner(|fs| {
-            match fs.symlink(parent_ino, &name_str, &link_str) {
-                Ok(ino) => {
-                    let dinode = fs.getattr(ino);
-                    match dinode {
-                        Some(dinode) => {
-                            let attr = Self::dinode_attr(fs, ino, &dinode);
-                            reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+            #[cfg(feature = "writable")]
+            {
+                match fs.symlink(parent_ino, &name_str, &link_str) {
+                    Ok(ino) => {
+                        let dinode = fs.getattr(ino);
+                        match dinode {
+                            Some(dinode) => {
+                                let attr = Self::dinode_attr(fs, ino, &dinode);
+                                reply.entry(&ttl, &attr, Generation(dinode.generation() as u64));
+                            }
+                            None => reply.error(Errno::from_i32(ENOENT)),
                         }
-                        None => reply.error(Errno::from_i32(ENOENT)),
                     }
+                    Err(e) => reply.error(errno_to_fuse3(e)),
                 }
-                Err(e) => reply.error(errno_to_fuse3(e)),
+            }
+            #[cfg(not(feature = "writable"))]
+            {
+                let _ = (parent_ino, name_str, link_str, ttl);
+                reply.error(Errno::from_i32(EROFS));
             }
         });
     }

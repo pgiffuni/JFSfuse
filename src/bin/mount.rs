@@ -55,6 +55,7 @@ fn main() -> ExitCode {
         }
     };
 
+    #[cfg_attr(not(feature = "writable"), allow(unused_mut))]
     let mut fs = FuseFs::new(vol);
     #[cfg(feature = "writable")]
     if !read_only && let Err(e) = fs.enable_writable() {

@@ -311,11 +311,11 @@ impl FuseFs {
     ///
     /// ## Not requested (incomplete)
     /// - [`FUSE_POSIX_LOCKS`] — `FuseFs` has `setlk`/`getlk`/`setlkw` methods, but
-    ///   the `file-lock` feature is not enabled in `fuse3`, so `GETLK`/`SETLK`/`SETLKW`
+    ///   the `file-lock` feature is not enabled in `fuser`, so `GETLK`/`SETLK`/`SETLKW`
     ///   are not dispatched at the FUSE protocol level. The in-memory lock table is
     ///   dead code until the feature is enabled.
-    /// - [`FUSE_FLOCK_LOCKS`] — `FuseFs` has a `flock` method, but `fuse3` 0.7 does
-    ///   not expose a `flock` callback in the `Filesystem` trait. Same dead-code caveat.
+    /// - [`FUSE_FLOCK_LOCKS`] — `FuseFs` has a `flock` method, but `fuser` 0.18
+    ///   does not expose a `flock` callback in the `Filesystem` trait. Same dead-code caveat.
     ///
     /// ## Partially implemented (see FuseFs documentation)
     /// - [`FUSE_SETLKW`] semantics: conflicts return `EAGAIN` instead of blocking.
@@ -1692,7 +1692,7 @@ pub struct Fuse3Fs {
 }
 
 /// Convert an i32 errno to a `fuser::Errno`.
-pub fn errno_to_fuse3(code: i32) -> Errno {
+pub fn errno_to_fuser(code: i32) -> Errno {
     Errno::from_i32(code)
 }
 
@@ -1700,7 +1700,7 @@ pub fn errno_to_fuse3(code: i32) -> Errno {
 ///
 /// These use Linux errno values because the FUSE protocol requires them.
 /// On FreeBSD, `ENOSYS` is preferred over `EOPNOTSUPP` for filesystem
-/// operations; we normalize via [`errno_to_fuse3`] at the call site.
+/// operations; we normalize via [`errno_to_fuser`] at the call site.
 pub const ENODATA: i32 = 61;
 pub const E2BIG: i32 = 7;
 pub const ENAMETOOLONG: i32 = 36;
@@ -1862,7 +1862,7 @@ impl Filesystem for Fuse3Fs {
                             None => reply.error(Errno::from_i32(ENOENT)),
                         }
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -1891,7 +1891,7 @@ impl Filesystem for Fuse3Fs {
                 };
                 reply.data(&bytes);
             }
-            Err(e) => reply.error(errno_to_fuse3(e)),
+            Err(e) => reply.error(errno_to_fuser(e)),
         });
     }
 
@@ -1922,7 +1922,7 @@ impl Filesystem for Fuse3Fs {
                             None => reply.error(Errno::from_i32(ENOENT)),
                         }
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -1961,7 +1961,7 @@ impl Filesystem for Fuse3Fs {
                             None => reply.error(Errno::from_i32(ENOENT)),
                         }
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -1999,7 +1999,7 @@ impl Filesystem for Fuse3Fs {
                             None => reply.error(Errno::from_i32(ENOENT)),
                         }
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2040,7 +2040,7 @@ impl Filesystem for Fuse3Fs {
             {
                 match fs.rmdir(parent_ino, &name_str) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2088,7 +2088,7 @@ impl Filesystem for Fuse3Fs {
             {
                 match fs.rename(old_parent, &old_name, new_p, &new_name) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2126,7 +2126,7 @@ impl Filesystem for Fuse3Fs {
                             None => reply.error(Errno::from_i32(ENOENT)),
                         }
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2146,7 +2146,7 @@ impl Filesystem for Fuse3Fs {
                     let fh = fs.open_handle(ino_val, false);
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
-                Err(e) => reply.error(errno_to_fuse3(e)),
+                Err(e) => reply.error(errno_to_fuser(e)),
             }
         });
     }
@@ -2170,7 +2170,7 @@ impl Filesystem for Fuse3Fs {
             match Self::validate_handle_static(&fs.handles, fh_val, ino_val, false) {
                 Ok(()) => {}
                 Err(e) => {
-                    reply.error(errno_to_fuse3(e));
+                    reply.error(errno_to_fuser(e));
                     return;
                 }
             }
@@ -2179,7 +2179,7 @@ impl Filesystem for Fuse3Fs {
             fs.deregister_request(_id);
             match result {
                 Ok(data) => reply.data(&data),
-                Err(e) => reply.error(errno_to_fuse3(e)),
+                Err(e) => reply.error(errno_to_fuser(e)),
             }
         });
     }
@@ -2208,7 +2208,7 @@ impl Filesystem for Fuse3Fs {
                 match Self::validate_handle_static(&fs.handles, fh_val, ino_val, false) {
                     Ok(()) => {}
                     Err(e) => {
-                        reply.error(errno_to_fuse3(e));
+                        reply.error(errno_to_fuser(e));
                         return;
                     }
                 }
@@ -2225,7 +2225,7 @@ impl Filesystem for Fuse3Fs {
                         }
                         reply.written(n as u32);
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2280,7 +2280,7 @@ impl Filesystem for Fuse3Fs {
                 }
                 match fs.release(ino) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2289,7 +2289,7 @@ impl Filesystem for Fuse3Fs {
                 let _ = fs.release_handle(fh_val);
                 match fs.release(ino) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
         });
@@ -2308,7 +2308,7 @@ impl Filesystem for Fuse3Fs {
                     }
                 } else {
                     if let Err(e) = fs.sync_fs() {
-                        reply.error(errno_to_fuse3(e));
+                        reply.error(errno_to_fuser(e));
                         return;
                     }
                     if fs.flush(ino).is_none() {
@@ -2345,7 +2345,7 @@ impl Filesystem for Fuse3Fs {
             {
                 match fs.setxattr(ino, &name_str, &value_vec, flags as u32) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2376,7 +2376,7 @@ impl Filesystem for Fuse3Fs {
                     Ok(None) => {
                         reply.error(Errno::from_i32(ENODATA));
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2409,7 +2409,7 @@ impl Filesystem for Fuse3Fs {
                             reply.error(Errno::from_i32(ERANGE));
                         }
                     }
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2429,7 +2429,7 @@ impl Filesystem for Fuse3Fs {
             {
                 match fs.removexattr(ino, &name_str) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2468,7 +2468,7 @@ impl Filesystem for Fuse3Fs {
                     let fh = fs.open_handle(ino_val, true);
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
-                Err(e) => reply.error(errno_to_fuse3(e)),
+                Err(e) => reply.error(errno_to_fuser(e)),
             }
         });
     }
@@ -2482,7 +2482,7 @@ impl Filesystem for Fuse3Fs {
             match Self::validate_handle_static(&fs.handles, fh_val, parent_ino, true) {
                 Ok(()) => {}
                 Err(e) => {
-                    reply.error(errno_to_fuse3(e));
+                    reply.error(errno_to_fuser(e));
                     return;
                 }
             }
@@ -2497,7 +2497,7 @@ impl Filesystem for Fuse3Fs {
                     }
                     reply.ok();
                 }
-                Err(e) => reply.error(errno_to_fuse3(e)),
+                Err(e) => reply.error(errno_to_fuser(e)),
             }
         });
     }
@@ -2551,7 +2551,7 @@ impl Filesystem for Fuse3Fs {
                 }
                 reply.ok();
             }
-            Err(e) => reply.error(errno_to_fuse3(e)),
+            Err(e) => reply.error(errno_to_fuser(e)),
         }
     }
 
@@ -2570,7 +2570,7 @@ impl Filesystem for Fuse3Fs {
             let _ = fs.release_handle(fh_val);
             match fs.release(ino) {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno_to_fuse3(e)),
+                Err(e) => reply.error(errno_to_fuser(e)),
             }
         });
     }
@@ -2580,7 +2580,7 @@ impl Filesystem for Fuse3Fs {
             #[cfg(feature = "writable")]
             {
                 if let Err(e) = fs.sync_fs() {
-                    reply.error(errno_to_fuse3(e));
+                    reply.error(errno_to_fuser(e));
                     return;
                 }
                 reply.ok();
@@ -2631,7 +2631,7 @@ impl Filesystem for Fuse3Fs {
                         match dinode {
                             Some(dinode) => {
                                 let attr = Self::dinode_attr(fs, ino, &dinode);
-                                fs.open(ino).map_err(errno_to_fuse3);
+                                fs.open(ino).map_err(errno_to_fuser);
                                 let fh = fs.open_handle(ino, false);
                                 reply.created(&ttl, &attr, Generation(dinode.generation() as u64), FileHandle(fh), FopenFlags::empty());
                             }
@@ -2660,7 +2660,7 @@ impl Filesystem for Fuse3Fs {
             }
             match fs.bmap(ino, idx) {
                 Ok((block, _nblocks)) => reply.bmap(block),
-                Err(e) => reply.error(errno_to_fuse3(e)),
+                Err(e) => reply.error(errno_to_fuser(e)),
             }
         });
     }
@@ -2697,13 +2697,13 @@ impl Filesystem for Fuse3Fs {
                 match Self::validate_handle_static(&fs.handles, fh_val, ino, false) {
                     Ok(()) => {}
                     Err(e) => {
-                        reply.error(errno_to_fuse3(e));
+                        reply.error(errno_to_fuser(e));
                         return;
                     }
                 }
                 match fs.fallocate(ino, offset, length, mode as u32) {
                     Ok(()) => reply.ok(),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]
@@ -2730,7 +2730,7 @@ impl Filesystem for Fuse3Fs {
             match Self::validate_handle_static(&fs.handles, fh_val, ino, false) {
                 Ok(()) => {}
                 Err(e) => {
-                    reply.error(errno_to_fuse3(e));
+                    reply.error(errno_to_fuser(e));
                     return;
                 }
             }
@@ -2781,14 +2781,14 @@ impl Filesystem for Fuse3Fs {
                 match Self::validate_handle_static(&fs.handles, fh_in_val, src_ino, false) {
                     Ok(()) => {}
                     Err(e) => {
-                        reply.error(errno_to_fuse3(e));
+                        reply.error(errno_to_fuser(e));
                         return;
                     }
                 }
                 match Self::validate_handle_static(&fs.handles, fh_out_val, dst_ino, false) {
                     Ok(()) => {}
                     Err(e) => {
-                        reply.error(errno_to_fuse3(e));
+                        reply.error(errno_to_fuser(e));
                         return;
                     }
                 }
@@ -2801,7 +2801,7 @@ impl Filesystem for Fuse3Fs {
                     flags.bits() as u32,
                 ) {
                     Ok(copied) => reply.written(copied as u32),
-                    Err(e) => reply.error(errno_to_fuse3(e)),
+                    Err(e) => reply.error(errno_to_fuser(e)),
                 }
             }
             #[cfg(not(feature = "writable"))]

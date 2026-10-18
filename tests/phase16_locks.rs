@@ -4,7 +4,7 @@
 //! Tests `FuseFs::setlk`, `setlkw`, `getlk` and `flock` methods on a generated
 //! JFS image loaded into MemoryStorage.
 //!
-//! Note: fuse3 0.7's `Filesystem` trait does not include `setlk`/`getlk`/`flock`
+//! Note: fuser 0.18's `Filesystem` trait does not include `setlk`/`getlk`/`flock`
 //! methods (they require the `file-lock` feature which is not enabled). These
 //! tests exercise the `FuseFs` internal lock API directly, which is used by the
 //! FUSE adapter when those features become available.
@@ -43,7 +43,7 @@ fn test_fuse_capabilities_conservative() {
     let vol = load_image_to_memory();
     let fs = FuseFs::new(vol);
     let caps = fs.fuse_capabilities();
-    // POSIX locks and flock are NOT advertised because fuse3 0.7's
+    // POSIX locks and flock are NOT advertised because fuser 0.18's
     // Filesystem trait doesn't include those methods (file-lock feature off).
     assert!(caps & FUSE_DO_READDIRPLUS != 0);
     assert!(caps & FUSE_READDIRPLUS_AUTO != 0);

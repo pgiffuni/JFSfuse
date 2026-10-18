@@ -72,6 +72,7 @@ fn main() -> ExitCode {
     let mut config = Config::default();
     config.mount_options = mount_options;
     config.acl = if allow_other { SessionACL::All } else { SessionACL::Owner };
+    config.n_threads = Some(4);
 
     let session = match fuser::spawn_mount(fuse_fs, &mountpoint, &config) {
         Ok(s) => s,

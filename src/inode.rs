@@ -31,7 +31,7 @@ impl Inode {
     /// Maps the inode number to its location on disk via the IAG/imap,
     /// then reads the dinode structure. Checks the page cache first so
     /// that reads within a transaction observe in-flight modifications.
-    pub fn read(volume: &mut crate::volume::Volume, ino: u32) -> StorageResult<Self> {
+    pub fn read(volume: &crate::volume::Volume, ino: u32) -> StorageResult<Self> {
         let (block, offset) = Self::find_inode_page(volume, ino)?;
 
         // Check the page cache first for transactional consistency: if an

@@ -425,7 +425,7 @@ impl FuseFs {
     /// Returns `EAGAIN` (EAGAIN=11) if the lock would block and `would_block`
     /// is true; returns `EACCES` (13) as a fallback blocking error.
     fn do_setlk(&mut self, ino: u32, flock: &Flock, owner: u64) -> FuseResult<()> {
-        let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
+        let inode = Inode::read(&self.volume, ino).map_err(|_| ENOENT)?;
         let file_size = inode.size();
         let (start, end) = Self::resolve_flock(flock, file_size);
 
@@ -454,7 +454,7 @@ impl FuseFs {
     /// setting it. Returns the conflicting lock info in `Flock` form,
     /// or `F_UNLCK` if no conflict.
     fn do_getlk(&mut self, ino: u32, flock: &Flock, owner: u64) -> FuseResult<Flock> {
-        let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
+        let inode = Inode::read(&self.volume, ino).map_err(|_| ENOENT)?;
         let file_size = inode.size();
         let (start, end) = Self::resolve_flock(flock, file_size);
 
@@ -490,7 +490,7 @@ impl FuseFs {
                 Some(parent_ino)
             }
             ".." => {
-                let parent = Inode::read(&mut self.volume, parent_ino).ok()?;
+                let parent = Inode::read(&self.volume, parent_ino).ok()?;
                 if !parent.is_dir() {
                     return None;
                 }
@@ -504,7 +504,7 @@ impl FuseFs {
                 }
             }
             _ => {
-                let parent = Inode::read(&mut self.volume, parent_ino).ok()?;
+                let parent = Inode::read(&self.volume, parent_ino).ok()?;
                 if !parent.is_dir() {
                     return None;
                 }
@@ -524,8 +524,8 @@ impl FuseFs {
     /// required by FUSE READDIR — the kernel passes a cookie offset to
     /// resume from a previous position.
     /// Includes `.` and `..` entries. Real entries come from the dtree stbl order.
-    pub fn readdir(&mut self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8, u64)>> {
-        let inode = Inode::read(&mut self.volume, ino).ok()?;
+    pub fn readdir(&self, ino: u32, offset: u64) -> Option<Vec<(String, u32, u8, u64)>> {
+        let inode = Inode::read(&self.volume, ino).ok()?;
         if !inode.is_dir() {
             return None;
         }
@@ -589,7 +589,7 @@ impl FuseFs {
         ino: u32,
         offset: u64,
     ) -> Option<Vec<(String, u32, u8, Dinode, u64)>> {
-        let inode = Inode::read(&mut self.volume, ino).ok()?;
+        let inode = Inode::read(&self.volume, ino).ok()?;
         if !inode.is_dir() {
             return None;
         }
@@ -663,12 +663,12 @@ impl FuseFs {
     /// each directory entry. Returns `Err(EINTR)` if interrupted.
     /// Supports offset-based resumption.
     pub fn readdir_interruptible(
-        &mut self,
+        &self,
         ino: u32,
         offset: u64,
         token: &InterruptToken,
     ) -> Result<Vec<(String, u32, u8, u64)>, i32> {
-        let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
+        let inode = Inode::read(&self.volume, ino).map_err(|_| ENOENT)?;
         if !inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -721,8 +721,8 @@ impl FuseFs {
     }
 
     /// Infer file type from an inode number by reading the target inode.
-    fn infer_file_type(&mut self, ino: u32) -> u8 {
-        if let Ok(inode) = Inode::read(&mut self.volume, ino) {
+    fn infer_file_type(&self, ino: u32) -> u8 {
+        if let Ok(inode) = Inode::read(&self.volume, ino) {
             if inode.is_symlink() {
                 0xA0 // DT_LNK
             } else if inode.is_dir() {
@@ -738,8 +738,8 @@ impl FuseFs {
     }
 
     /// Get file attributes for an inode.
-    pub fn getattr(&mut self, ino: u32) -> Option<Dinode> {
-        Inode::read(&mut self.volume, ino).ok().map(|i| i.dinode)
+    pub fn getattr(&self, ino: u32) -> Option<Dinode> {
+        Inode::read(&self.volume, ino).ok().map(|i| i.dinode)
     }
 
     /// FUSE_ACCESS — check file access permissions.
@@ -757,7 +757,7 @@ impl FuseFs {
     /// - For regular files, X_OK means execute permission
     ///
     /// Returns `EACCES` if access is denied, `ENOENT` if inode doesn't exist.
-    pub fn access(&mut self, ino: u32, mask: u32, uid: u32, gid: u32) -> FuseResult<()> {
+    pub fn access(&self, ino: u32, mask: u32, uid: u32, gid: u32) -> FuseResult<()> {
         let dinode = self.getattr(ino).ok_or(ENOENT)?;
         let mode = dinode.mode();
 
@@ -795,8 +795,8 @@ impl FuseFs {
     }
 
     /// Read file data at offset.
-    pub fn read(&mut self, ino: u32, offset: u64, length: usize) -> Option<Vec<u8>> {
-        let inode = Inode::read(&mut self.volume, ino).ok()?;
+    pub fn read(&self, ino: u32, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let inode = Inode::read(&self.volume, ino).ok()?;
         let size = inode.size();
         if offset >= size {
             return Some(vec![]);
@@ -810,13 +810,13 @@ impl FuseFs {
     /// Interruptible read — same as `read` but checks `token` at each
     /// block read boundary. Returns `Err(EINTR)` if interrupted.
     pub fn read_interruptible(
-        &mut self,
+        &self,
         ino: u32,
         offset: u64,
         length: usize,
         token: &InterruptToken,
     ) -> Result<Vec<u8>, i32> {
-        let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
+        let inode = Inode::read(&self.volume, ino).map_err(|_| ENOENT)?;
         let size = inode.size();
         if offset >= size {
             return Ok(vec![]);
@@ -838,11 +838,11 @@ impl FuseFs {
     /// Seek constants (Linux `<unistd.h>`):
     /// - `SEEK_DATA = 3` — returns the offset of the next data extent at or after `offset`
     /// - `SEEK_HOLE = 4` — returns the offset of the next hole at or after `offset`
-    pub fn lseek_data_or_hole(&mut self, ino: u32, offset: u64, seek_type: i32) -> Option<u64> {
+    pub fn lseek_data_or_hole(&self, ino: u32, offset: u64, seek_type: i32) -> Option<u64> {
         const SEEK_DATA: i32 = 3;
         const SEEK_HOLE: i32 = 4;
 
-        let inode = Inode::read(&mut self.volume, ino).ok()?;
+        let inode = Inode::read(&self.volume, ino).ok()?;
         let size = inode.size();
         let block = crate::storage::BLOCK_SIZE as u64;
 
@@ -947,7 +947,7 @@ impl FuseFs {
     ///
     /// Maps to `statvfs(2)`. Queries the JFS superblock for total blocks
     /// and the allocation map for free blocks.
-    pub fn statfs(&mut self, ino: u32) -> Statfs {
+    pub fn statfs(&self, ino: u32) -> Statfs {
         let block_size = self.volume.block_size();
         let total_blocks = self.volume.total_blocks();
         let free_blocks = self.volume.free_blocks();
@@ -979,8 +979,8 @@ impl FuseFs {
     ///
     /// Returns `ENOENT` if the inode cannot be loaded, `EIO` if the xtree
     /// cannot be parsed.
-    pub fn bmap(&mut self, ino: u32, file_block: u64) -> FuseResult<(u64, u32)> {
-        let inode = Inode::read(&mut self.volume, ino).map_err(|_| ENOENT)?;
+    pub fn bmap(&self, ino: u32, file_block: u64) -> FuseResult<(u64, u32)> {
+        let inode = Inode::read(&self.volume, ino).map_err(|_| ENOENT)?;
         let xtree = Xtree::from_inode_data(inode.xtroot_bytes()).map_err(|_| EIO)?;
         let block_no = file_block as BlockNo;
         match xtree.lookup(block_no) {
@@ -1497,7 +1497,7 @@ impl FuseFs {
     }
 
     /// Read the target of a symbolic link.
-    pub fn readlink(&mut self, ino: u32) -> FuseResult<Vec<u8>> {
+    pub fn readlink(&self, ino: u32) -> FuseResult<Vec<u8>> {
         if !self.writable {
             return Err(EROFS);
         }
@@ -1678,11 +1678,12 @@ impl FuseFs {
 /// Wrapper around `FuseFs` that implements the fuser `Filesystem` trait.
 ///
 /// The trait methods take `&self`, so the inner `FuseFs` is protected by a
-/// `Mutex`. All operations are dispatched through `FuseFs`'s existing
-/// `&mut self` methods via the lock.
+/// `RwLock`. Read-only FUSE operations (getattr, read, readdir, etc.) acquire
+/// a read lock, allowing concurrent execution across multiple worker threads.
+/// Write operations (mknod, write, unlink, etc.) acquire a write lock.
 pub struct Fuse3Fs {
-    /// Shared, mutex-protected filesystem state.
-    inner: std::sync::Mutex<FuseFs>,
+    /// Shared, read-write-protected filesystem state.
+    inner: std::sync::RwLock<FuseFs>,
 }
 
 /// Convert an i32 errno to a `fuser::Errno`.
@@ -1739,17 +1740,25 @@ impl Fuse3Fs {
     /// Create a new `Fuse3Fs` wrapping an initialized (and writable-enabled) `FuseFs`.
     pub fn new(fs: FuseFs) -> Self {
         Self {
-            inner: std::sync::Mutex::new(fs),
+            inner: std::sync::RwLock::new(fs),
         }
     }
 
-    /// Borrow the inner `FuseFs` for a synchronous operation.
-    fn with_inner<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut FuseFs) -> R,
-    {
-        let mut guard = self.inner.lock().unwrap();
+    /// Borrow the inner `FuseFs` for a synchronous read-only operation.
+    fn with_inner_read<R, F: FnOnce(&FuseFs) -> R>(&self, f: F) -> R {
+        let guard = self.inner.read().unwrap();
+        f(&*guard)
+    }
+
+    /// Borrow the inner `FuseFs` for a synchronous (potentially mutating) operation.
+    fn with_inner_write<R, F: FnOnce(&mut FuseFs) -> R>(&self, f: F) -> R {
+        let mut guard = self.inner.write().unwrap();
         f(&mut guard)
+    }
+
+    /// Alias for `with_inner_write` (backward compatibility).
+    fn with_inner<R, F: FnOnce(&mut FuseFs) -> R>(&self, f: F) -> R {
+        self.with_inner_write(f)
     }
 }
 
@@ -1802,7 +1811,7 @@ impl Filesystem for Fuse3Fs {
         let ino = inode.0 as u32;
         let ttl = Duration::from_secs(5);
 
-        self.with_inner(|fs| match fs.getattr(ino) {
+        self.with_inner_read(|fs| match fs.getattr(ino) {
             Some(dinode) => {
                 let attr = Self::dinode_attr(fs, ino, &dinode);
                 reply.attr(&ttl, &attr);
@@ -1868,7 +1877,7 @@ impl Filesystem for Fuse3Fs {
     fn readlink(&self, _req: &Request, inode: INodeNo, reply: ReplyData) {
         let ino = inode.0 as u32;
 
-        self.with_inner(|fs| match fs.readlink(ino) {
+        self.with_inner_read(|fs| match fs.readlink(ino) {
             Ok(data) => {
                 let bytes = if data.len() > 128 {
                     data[..128].to_vec()
@@ -2215,7 +2224,7 @@ impl Filesystem for Fuse3Fs {
     }
 
     fn statfs(&self, _req: &Request, _inode: INodeNo, reply: ReplyStatfs) {
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             let stat = fs.statfs(0);
             reply.statfs(
                 stat.blocks,
@@ -2577,7 +2586,7 @@ impl Filesystem for Fuse3Fs {
         let gid = req.gid();
         let mask_val = mask.bits() as u32;
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             match fs.access(ino, mask_val, uid, gid) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(Errno::from_i32(e)),
@@ -2630,7 +2639,7 @@ impl Filesystem for Fuse3Fs {
     fn bmap(&self, _req: &Request, inode: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
         let ino = inode.0 as u32;
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             let fs_block_size = crate::storage::BLOCK_SIZE as u32;
             if blocksize != 0 && blocksize != fs_block_size {
                 reply.error(Errno::from_i32(EINVAL));
@@ -2704,7 +2713,7 @@ impl Filesystem for Fuse3Fs {
         let ino = inode.0 as u32;
         let fh_val = fh.0;
 
-        self.with_inner(|fs| {
+        self.with_inner_read(|fs| {
             match Self::validate_handle_static(&fs.handles, fh_val, ino, false) {
                 Ok(()) => {}
                 Err(e) => {
@@ -2808,7 +2817,7 @@ impl Fuse3Fs {
     }
 
     /// Build a `FileAttr` from an inode's dinode and number.
-    fn dinode_attr(fs: &mut FuseFs, ino: u32, dinode: &Dinode) -> FileAttr {
+    fn dinode_attr(fs: &FuseFs, ino: u32, dinode: &Dinode) -> FileAttr {
         FuseFs::dinode_to_fileattr(ino, dinode)
     }
 

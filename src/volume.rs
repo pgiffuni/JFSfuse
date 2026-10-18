@@ -2034,7 +2034,7 @@ impl Volume {
     /// For inline symlinks, reads the path from the inode's union area.
     /// For block-based symlinks, reads through the xtree (not yet implemented).
     #[cfg(feature = "writable")]
-    pub fn read_symlink(&mut self, ino: u32) -> StorageResult<Vec<u8>> {
+    pub fn read_symlink(&self, ino: u32) -> StorageResult<Vec<u8>> {
         let inode = crate::inode::Inode::read(self, ino)?;
 
         if !inode.is_symlink() {
